@@ -21,6 +21,8 @@ CUSTOM_COLOR_KEYS = {
     "series_3", "series_4", "series_5", "series_6",
 }
 PROXY_SCHEMES = {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}
+# Accept the common "sockcs5" typo and save it as the standard SOCKS5 scheme.
+PROXY_SCHEME_ALIASES = {"sockcs5": "socks5"}
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
@@ -126,6 +128,7 @@ def normalize_proxy_url(value: str) -> str:
     except ValueError as exc:
         raise ValueError("Enter a valid proxy URL, for example socks5://127.0.0.1:1080.") from exc
     scheme = (parsed.scheme or "").lower()
+    scheme = PROXY_SCHEME_ALIASES.get(scheme, scheme)
     if scheme not in PROXY_SCHEMES:
         raise ValueError("Proxy scheme must be http, https, socks5, or socks5h.")
     host = parsed.hostname
