@@ -278,10 +278,14 @@ class Desktop:
     def inspect_media(self) -> None:
         if self.busy:
             return
+        url = self.media_url.strip()
+        if not url:
+            self.error = "Paste a page or media URL first."
+            return
+        self.media_url = url
         self.busy = "media"
         self.media_result = None
         self.error = ""
-        url = self.media_url
 
         def work():
             return self.call("media.inspect", {"url": url}, timeout=120)
@@ -646,11 +650,30 @@ class Desktop:
         self.open_dialog("delete")
 
     def paste_url(self, ctx: ui.UI) -> None:
-        """Global Ctrl+V opens the right dialog with the copied link prefilled."""
+        """Ctrl+V fills the active dialog, or opens the right one when none is open."""
         text = ctx.get_clipboard().strip()
         match = re.fullmatch(r"https?://\S+", text, re.IGNORECASE)
         if not match:
-            self.notice = "Copy a single HTTP or HTTPS link, then press Ctrl+V."
+            message = "Copy a single HTTP or HTTPS link, then press Ctrl+V."
+            if self.dialog:
+                self.error = message
+            else:
+                self.notice = message
+            return
+        if self.dialog == "media":
+            self.media_url = text
+            self.media_result = None
+            self.error = ""
+            return
+        if self.dialog == "spotify":
+            self.spotify_url = text
+            self.spotify_result = None
+            self.spotify_selected.clear()
+            self.error = ""
+            return
+        if self.dialog == "add":
+            self.url = text
+            self.error = ""
             return
         from .spotify import supported_url
         if supported_url(text) or urlsplit(text).hostname == "spotify.link":
@@ -801,8 +824,11 @@ class Desktop:
     def _media_dialog(self, ctx: ui.UI) -> None:
         with ctx.dialog("Media Grabber", True, width=740) as dialog:
             if dialog:
-                self.media_url = ctx.input("media_address", self.media_url, label="Page or media URL", width=ui.FILL, max_bytes=8192)
-                if ctx.button("Inspecting…" if self.busy == "media" else "Find Media", icon=ui.Icon.SEARCH, disabled=bool(self.busy)):
+                self.media_url = ctx.input("media_address", self.media_url, label="Page or media URL",
+                                           placeholder="https://example.com/video or direct media link",
+                                           width=ui.FILL, max_bytes=8192, autofocus=True)
+                if ctx.button("Inspecting…" if self.busy == "media" else "Find Media", icon=ui.Icon.SEARCH,
+                              variant=ui.ButtonVariant.PRIMARY, disabled=bool(self.busy)):
                     self.inspect_media()
                 self._error_in_dialog(ctx)
                 if self.media_result is None:
