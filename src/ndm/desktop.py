@@ -12,7 +12,14 @@ import nexa as ui
 
 from .daemon import is_running, start_detached
 from .ipc import request
-from .models import ACCENTS, CUSTOM_COLOR_KEYS, MEDIA_EXTENSIONS, Settings, normalize_color
+from .models import (
+    ACCENTS,
+    CUSTOM_COLOR_KEYS,
+    MEDIA_EXTENSIONS,
+    SETTINGS_SCHEMA_VERSION,
+    Settings,
+    normalize_color,
+)
 from .network import proxy_label, safe_error
 
 CATEGORY_NAMES = {"all": "All Downloads", "unfinished": "Unfinished", "finished": "Finished",
@@ -69,17 +76,18 @@ def complete_settings(settings: dict | None) -> dict:
     return Settings.model_validate(defaults).model_dump()
 
 
+OPTIONS_KEYS = [
+    "download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
+    "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
+    "spotify_format", "spotify_bitrate", "proxy_enabled", "proxy_url", "proxy_username",
+    "proxy_password", "proxy_remote_dns",
+]
+
+
 class Desktop:
     def __init__(self, *, data_dir: Path):
         self.data_dir = data_dir.expanduser().resolve()
-        if not is_running(self.data_dir):
-            start_detached(self.data_dir)
-            for _ in range(100):
-                if is_running(self.data_dir):
-                    break
-                time.sleep(0.1)
-            else:
-                raise RuntimeError(f"The native daemon did not start. See {self.data_dir / 'daemon.log'}.")
+        self._ensure_daemon()
         self.state = self._normalized_state(self.call("state"))
         self.cache_lock = threading.RLock()
         self.stop = threading.Event()
@@ -125,6 +133,81 @@ class Desktop:
 
     def call(self, operation: str, payload: dict | None = None, *, timeout: float = 30.0):
         return request(self.data_dir, operation, payload, timeout=timeout)
+
+    def _ensure_daemon(self) -> None:
+        if not is_running(self.data_dir):
+            start_detached(self.data_dir)
+            if not self._wait_for_daemon():
+                raise RuntimeError(f"The native daemon did not start. See {self.data_dir / 'daemon.log'}.")
+            return
+        try:
+            health = self.call("health", timeout=3)
+        except (OSError, ValueError, RuntimeError, EOFError):
+            return
+        if health.get("name") != "ndm":
+            return
+        state = self.call("state", timeout=3)
+        if not self._daemon_is_compatible(state):
+            self._replace_daemon()
+
+    @staticmethod
+    def _daemon_is_compatible(state: dict) -> bool:
+        schema = state.get("daemon", {}).get("settings_schema")
+        if schema is not None and schema != SETTINGS_SCHEMA_VERSION:
+            return False
+        settings = state.get("settings") or {}
+        required = set(OPTIONS_KEYS) | {"colors", "theme", "accent", "engine_running"}
+        return required.issubset(settings)
+
+    def _wait_for_daemon(self, *, compatible: bool = False, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if is_running(self.data_dir):
+                if not compatible:
+                    return True
+                try:
+                    state = self.call("state", timeout=2)
+                except (OSError, ValueError, RuntimeError, EOFError):
+                    state = None
+                if state is not None and self._daemon_is_compatible(state):
+                    return True
+            time.sleep(0.1)
+        return False
+
+    def _daemon_lock_free(self) -> bool:
+        path = self.data_dir / "daemon.lock"
+        if not path.exists():
+            return True
+        try:
+            with path.open("a+") as handle:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return True
+        except OSError:
+            return False
+
+    def _replace_daemon(self) -> None:
+        try:
+            self.call("shutdown", timeout=5)
+        except (OSError, ValueError, RuntimeError, EOFError):
+            pass
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if not is_running(self.data_dir) and self._daemon_lock_free():
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("The old background daemon did not stop. Run 'ndm stop', then start NDM again.")
+        start_detached(self.data_dir)
+        if not self._wait_for_daemon(compatible=True):
+            raise RuntimeError(f"The updated background daemon did not start. See {self.data_dir / 'daemon.log'}.")
 
     @staticmethod
     def _normalized_state(state: dict) -> dict:
@@ -247,17 +330,23 @@ class Desktop:
             self.error = safe_error(exc, self.state.get("settings", {}))
 
     def save_options(self) -> None:
-        keys = ["download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
-                "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
-                "spotify_format", "spotify_bitrate", "proxy_enabled", "proxy_url", "proxy_username",
-                "proxy_password", "proxy_remote_dns"]
+        payload = {key: self.settings_form[key] for key in OPTIONS_KEYS}
         try:
-            self.call("settings", {key: self.settings_form[key] for key in keys})
+            try:
+                self.call("settings", payload)
+            except ValueError as exc:
+                text = str(exc)
+                if "Extra inputs are not permitted" not in text and "extra_forbidden" not in text:
+                    raise
+                # An out-of-date daemon can survive an app update. Replace it and
+                # retry once instead of asking the user to restart daemons by hand.
+                self._replace_daemon()
+                self.call("settings", payload)
             self.notice = "Options saved."
             self.dialog = ""
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
-            self.error = safe_error(exc, self.state.get("settings", {}))
+            self.error = safe_error(exc, self.settings_form)
 
     def load_library(self) -> None:
         self.open_dialog("library")
@@ -591,7 +680,10 @@ class Desktop:
 
     def _error_in_dialog(self, ctx: ui.UI) -> None:
         if self.error:
-            if ctx.alert(self.error[:450], tone=ui.Tone.DANGER, dismissible=True):
+            # Keep dialog errors visible until explicitly dismissed; an auto-
+            # dismissible alert can disappear in the same click that caused it.
+            ctx.alert(self.error[:450], tone=ui.Tone.DANGER)
+            if ctx.button("Dismiss error", size=ui.ControlSize.SM):
                 self.error = ""
 
     def _dialogs(self, ctx: ui.UI, state: dict) -> None:

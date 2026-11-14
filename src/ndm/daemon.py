@@ -16,10 +16,26 @@ from . import spotify
 from .engine import DownloadManager
 from .ipc import endpoint, listener, request
 from .media import inspect_media
-from .models import CaptureRequest, NewDownload, SettingsPatch, default_data_dir
+from .models import (
+    SETTINGS_SCHEMA_VERSION,
+    CaptureRequest,
+    NewDownload,
+    SettingsPatch,
+    default_data_dir,
+)
 from .store import Store
 
 log = logging.getLogger("ndm")
+
+
+def validation_message(exc: ValidationError) -> str:
+    """Return a concise, input-free validation error for the desktop/CLI."""
+    messages = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        message = str(error.get("msg", "Invalid value."))
+        messages.append(f"{location}: {message}" if location else message)
+    return "; ".join(dict.fromkeys(messages)) or "Invalid request."
 
 
 class SpotifySearch(BaseModel):
@@ -85,7 +101,12 @@ class NativeDaemon:
                     raise ValueError("Invalid local request.")
                 result = self.dispatch(message.get("operation"), message.get("payload", {}))
                 connection.send({"ok": True, "result": result})
-            except (ValidationError, ValueError, KeyError, RuntimeError, OSError) as exc:
+            except ValidationError as exc:
+                try:
+                    connection.send({"ok": False, "error": validation_message(exc)})
+                except (OSError, EOFError):
+                    pass
+            except (ValueError, KeyError, RuntimeError, OSError) as exc:
                 try:
                     connection.send({"ok": False, "error": str(exc)})
                 except (OSError, EOFError):
@@ -103,11 +124,13 @@ class NativeDaemon:
         if not isinstance(payload, dict):
             raise ValueError("Request payload must be an object.")
         if operation == "health":
-            return {"name": "ndm", "transport": "local-ipc", "pid": os.getpid()}
+            return {"name": "ndm", "transport": "local-ipc", "pid": os.getpid(),
+                    "settings_schema": SETTINGS_SCHEMA_VERSION}
         if operation == "state":
             result = self.manager.snapshot()
             result["daemon"]["spotify"] = spotify.availability()
             result["daemon"]["transport"] = endpoint(self.data_dir)[1]
+            result["daemon"]["settings_schema"] = SETTINGS_SCHEMA_VERSION
             return result
         if operation == "add":
             return self.manager.add(**NewDownload.model_validate(payload).model_dump())
