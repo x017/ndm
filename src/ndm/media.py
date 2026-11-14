@@ -11,6 +11,7 @@ import httpx
 import yt_dlp
 
 from .models import MEDIA_EXTENSIONS, category_for, safe_filename, validate_url
+from .network import httpx_options, safe_error, ytdlp_options
 
 MEDIA_HOSTS = (
     "youtube.com", "youtu.be", "vimeo.com", "soundcloud.com", "bandcamp.com",
@@ -58,20 +59,22 @@ class LinkParser(HTMLParser):
             self.title += data
 
 
-def inspect_media(url: str, *, allow_private: bool = False) -> dict:
-    url = validate_url(url, allow_private=allow_private)
+def inspect_media(url: str, *, allow_private: bool = False, settings: dict | None = None) -> dict:
+    settings = settings or {}
+    resolve = not (settings.get("proxy_enabled") and settings.get("proxy_remote_dns", True))
+    url = validate_url(url, allow_private=allow_private, resolve=resolve)
     if spotify_link(url):
         return {"kind": "spotify", "title": "Your Spotify link", "items": [],
                 "message": "Use NDM's Spotify toolbar button to inspect this link with spotDL. It matches Spotify metadata to public audio sources; it does not extract Spotify's protected streams."}
     if uses_ytdlp(url):
         options = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
-                   "socket_timeout": 15, "extractor_retries": 1}
+                   "socket_timeout": 15, "extractor_retries": 1, **ytdlp_options(settings)}
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
         except yt_dlp.utils.DownloadError as exc:
             message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
-            raise ValueError(message[:500]) from exc
+            raise ValueError(safe_error(ValueError(message), settings)) from exc
         if info.get("is_live"):
             raise ValueError("Live streams are not supported. Try a finished recording.")
         items = []
@@ -114,7 +117,8 @@ def inspect_media(url: str, *, allow_private: bool = False) -> dict:
     size = 0
     try:
         with httpx.Client(follow_redirects=True, timeout=15, headers={"User-Agent": "NDM/0.1"},
-                          event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private)]}) as client:
+                          **httpx_options(settings),
+                          event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private, resolve=resolve)]}) as client:
             with client.stream("GET", url) as response:
                 response.raise_for_status()
                 mime = response.headers.get("content-type", "")
@@ -131,7 +135,7 @@ def inspect_media(url: str, *, allow_private: bool = False) -> dict:
                         break
                     parser.feed(chunk)
     except httpx.HTTPError as exc:
-        raise ValueError(f"Could not read this page: {exc}") from exc
+        raise ValueError(f"Could not read this page: {safe_error(exc, settings)}") from exc
     items, seen = [], set()
     for link, title in parser.links:
         absolute = urljoin(url, link)
@@ -140,7 +144,7 @@ def inspect_media(url: str, *, allow_private: bool = False) -> dict:
         if Path(urlsplit(absolute).path).suffix.lower() not in MEDIA_EXTENSIONS:
             continue
         try:
-            absolute = validate_url(absolute, allow_private=allow_private)
+            absolute = validate_url(absolute, allow_private=allow_private, resolve=resolve)
         except ValueError:
             continue
         if absolute in seen:
@@ -165,7 +169,7 @@ def quality_format(quality: str, ffmpeg: bool) -> str:
     return f"best{constraint}[acodec!=none]/best[acodec!=none]"
 
 
-def media_download(task: dict, stop, progress, rate_limit: int, connections: int) -> Path:
+def media_download(task: dict, stop, progress, rate_limit: int, connections: int, *, settings: dict | None = None) -> Path:
     """Run yt-dlp with controlled output, fragment concurrency and cooperative cancellation."""
     destination = Path(task["path"])
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +195,7 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
         "format": task.get("media_format") or quality_format(task.get("media_quality", "best"), ffmpeg),
         "progress_hooks": [hook], "postprocessor_hooks": [post_hook],
         "paths": {"home": str(destination.parent)},
+        **ytdlp_options(settings or {}),
     }
     if rate_limit:
         options["ratelimit"] = rate_limit

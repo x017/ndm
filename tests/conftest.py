@@ -95,3 +95,20 @@ def wait_for(manager, task_id, status, timeout=15):
             raise AssertionError(task["error"])
         time.sleep(0.03)
     raise AssertionError(f"Timed out waiting for {status}: {manager.tasks.get(task_id)}")
+
+
+@pytest.fixture(autouse=True)
+def restore_proxy_environment():
+    import os
+
+    from ndm import network
+    keys = network._ENV_KEYS
+    saved = {key: os.environ.get(key) for key in keys}
+    original = network._ORIGINAL_ENV
+    yield
+    network._ORIGINAL_ENV = original
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value

@@ -23,13 +23,23 @@ The background daemon communicates over an authenticated Unix domain socket
   expanded with the upstream spotDL Python API, previewed in a native track
   table, then queued individually. Audio is matched to YouTube Music and
   converted/tagged by spotDL. Formats: MP3, M4A, FLAC, Opus, Ogg.
-- **yt-dlp media grabber:** authorized media-page and direct-media inspection,
+- **yt-dlp media grabber:** media-page and direct-media inspection,
   format selection, and background extraction.
 - **Background capture:** opt-in link-inbox watching while the window is closed;
   opt-in clipboard capture while the desktop window is open. Optional host
   allowlist applies to both. Linux systemd and macOS LaunchAgent installers.
-- **Desktop preferences:** light/dark/system theme, custom accent colors,
-  connection and concurrency limits, destination folders, and audio settings.
+- **Fully custom colors:** light/dark/system base plus 34 independent semantic
+  color overrides (surfaces, text, borders, accents, status colors, controls,
+  hover/active states, focus ring, scrim, and chart series). Pick visually or enter
+  `#RRGGBB` / `#RRGGBBAA`; reset one token or the whole palette.
+- **HTTP and SOCKS5 proxy:** one daemon-wide proxy for segmented downloads,
+  media inspection/extraction, and spotDL metadata/audio. HTTP, HTTPS, SOCKS5,
+  and SOCKS5H URLs; optional username/password; remote DNS by default.
+- **Ctrl+V URL paste:** copy a link anywhere, press Ctrl+V in NDM, and the Add
+  Download dialog opens prefilled. Spotify links open the spotDL dialog instead.
+  Focused text fields retain normal clipboard paste behavior.
+- **Desktop preferences:** connection and concurrency limits, destination folders,
+  capture options, and audio settings.
 - **Files stay local:** completed files open in your desktop applications.
   The offline-audio dialog lists your music/download folders and exports M3U
   playlists. It does not run an audio streaming server.
@@ -76,7 +86,7 @@ ndm status                           # JSON queue snapshot
 ndm pause <task-id>
 ndm resume <task-id>
 ndm remove <task-id>                 # keeps completed files
-ndm spotify https://open.spotify.com/playlist/... --authorized
+ndm spotify https://open.spotify.com/playlist/...
 ndm stop                             # stop the background daemon
 ```
 
@@ -101,6 +111,20 @@ task running `ndm.exe daemon --data-dir "C:\your\state\folder"`.
 Closing the desktop window is not the same as `ndm stop`: the daemon continues.
 Use **File → Stop daemon and exit** when you want both to stop.
 
+## Proxy and appearance
+
+Open **Options → Proxy**, enable the proxy, enter a URL such as
+`http://proxy.local:8080` or `socks5://127.0.0.1:1080`, optionally add credentials,
+and click **OK**. SOCKS5 remote DNS (`socks5h`) is the default; disable it only when
+the proxy cannot resolve hostnames. An enabled NDM proxy overrides ambient proxy
+environment variables. Proxy passwords are stored in the local NDM state directory
+and masked in the UI/CLI status output; protect that directory like other secrets.
+The status bar shows the active proxy without credentials.
+
+Open **Options → Appearance** for the full palette. Changes apply immediately;
+**Reset** beside a row restores that token and **Reset palette** restores the base
+theme. The base accent presets remain available for a quick starting point.
+
 ## Using automatic media capture
 
 Open **Options → Capture**. Capture is off by default.
@@ -115,19 +139,20 @@ Example `.url` file:
 
 ```ini
 [InternetShortcut]
-URL=https://example.org/authorized/video.mp4
+URL=https://example.org/media/video.mp4
 ```
 
 The daemon marks processed files `.processed`. Spotify inbox links are rejected;
-use the Spotify dialog or CLI so the spotDL permission/queue path is explicit.
+use the Spotify dialog or CLI so the spotDL metadata/matching path is explicit.
 Clipboard monitoring requires the open desktop window and only captures direct
 media extensions. There is no browser interception extension.
 
 ## Using spotDL
 
 1. Click **Spotify** on the toolbar.
-2. Paste a public `open.spotify.com` track, album, or playlist URL.
-3. Confirm permission and click **Find Tracks**.
+2. Paste a public `open.spotify.com` track, album, or playlist URL (Ctrl+V also
+   opens this dialog automatically when the clipboard contains a Spotify link).
+3. Click **Find Tracks**.
 4. Select rows and click **Queue Selected**.
 
 The daemon processes tracks using its normal concurrency limit. Each row shows
@@ -170,7 +195,8 @@ uv build --wheel
 The test suite uses local HTTP **test fixtures only**; the application itself has
 no HTTP server. Native IPC, real-file integrity, pause/resume across daemon
 restart, validator invalidation, capture opt-in, settings validation, media
-extraction, and spotDL adapter/queue controls are covered. Tests do not contact
+extraction, spotDL adapter/queue controls, proxy transport wiring, full-palette
+rendering, and global Ctrl+V routing are covered. Tests do not contact
 Spotify or download copyrighted audio.
 
 Render the real Nexa UI without a display server:
@@ -192,7 +218,8 @@ src/ndm/
   engine.py       segmented HTTP, queue, resume, capture, media workers
   spotify.py      upstream spotDL metadata/search/download adapter
   media.py        direct media/HTML inspection and yt-dlp
-  models.py       validated settings and URL rules
+  models.py       validated settings, colors, proxy URLs, and URL rules
+  network.py      shared httpx/yt-dlp/requests proxy configuration
   store.py        SQLite persistence and exclusive state ownership
   cli.py          native desktop, daemon, queue and service commands
 ```

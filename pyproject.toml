@@ -7,7 +7,8 @@ authors = [{ name = "Parsa", email = "parsam280xyz@gmail.com" }]
 requires-python = ">=3.11,<3.16"
 dependencies = [
     "nexa-ui>=1.4.0,<2",
-    "httpx>=0.28,<1",
+    "httpx[socks]>=0.28,<1",
+    "PySocks>=1.7.1,<2",
     "pydantic>=2.9.2,<3",
     "yt-dlp>=2026.10.26,<2027",
     "spotdl>=4.6.0,<5",

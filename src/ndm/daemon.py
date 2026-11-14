@@ -30,7 +30,6 @@ class SpotifySearch(BaseModel):
 class SpotifyQueue(BaseModel):
     model_config = ConfigDict(extra="forbid")
     songs: list[dict] = Field(min_length=1, max_length=500)
-    authorized: bool = False
     start_paused: bool = False
 
 
@@ -42,7 +41,6 @@ class MediaDownload(BaseModel):
     category: str = "video"
     quality: str = "best"
     ext: str = Field(default="mp4", max_length=8)
-    authorized: bool = False
 
 
 class TaskAction(BaseModel):
@@ -124,18 +122,17 @@ class NativeDaemon:
             url = str(payload.get("url", ""))
             if spotify.supported_url(url):
                 raise ValueError("Use the Spotify toolbar button for Spotify links.")
-            if not payload.get("authorized"):
-                raise ValueError("Confirm that you own this media or have permission to save it.")
-            return inspect_media(url, allow_private=self.manager.allow_private)
+            return inspect_media(url, allow_private=self.manager.allow_private,
+                                 settings=self.manager.settings.model_dump())
         if operation == "media.download":
             return self.manager.add_media(**MediaDownload.model_validate(payload).model_dump())
         if operation == "spotify.search":
             command = SpotifySearch.model_validate(payload)
-            return spotify.search(command.url, self.data_dir)
+            return spotify.search(command.url, self.data_dir, settings=self.manager.settings.model_dump())
         if operation == "spotify.queue":
             command = SpotifyQueue.model_validate(payload)
-            return {"tasks": [self.manager.add_spotify(song, authorized=command.authorized,
-                                                     start_paused=command.start_paused) for song in command.songs]}
+            return {"tasks": [self.manager.add_spotify(song, start_paused=command.start_paused)
+                              for song in command.songs]}
         if operation == "library":
             return {"tracks": self.manager.library()}
         if operation == "playlist":

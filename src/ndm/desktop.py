@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -11,7 +12,8 @@ import nexa as ui
 
 from .daemon import is_running, start_detached
 from .ipc import request
-from .models import ACCENTS, MEDIA_EXTENSIONS
+from .models import ACCENTS, CUSTOM_COLOR_KEYS, MEDIA_EXTENSIONS, normalize_color
+from .network import proxy_label, safe_error
 
 CATEGORY_NAMES = {"all": "All Downloads", "unfinished": "Unfinished", "finished": "Finished",
                   "archive": "Compressed", "document": "Documents", "audio": "Music",
@@ -86,9 +88,6 @@ class Desktop:
         self.exit_after_stop = False
         self.url = ""
         self.filename = ""
-        self.authorized = False
-        self.spotify_authorized = False
-        self.media_authorized = False
         self.start_paused = False
         self.add_connections = self.state["settings"]["connections"]
         self.add_category = 0
@@ -103,10 +102,13 @@ class Desktop:
         self.options_tab = 0
         self.settings_form = dict(self.state["settings"])
         self.custom_color = ui.Color.hex(self.state["settings"]["accent"])
+        self.color_hex: dict[str, str] = {}
         self.last_clipboard = ""
         self.last_clipboard_check = 0.0
         self.completed_ids = {t["id"] for t in self.state["downloads"] if t["status"] == "completed"}
         self._following_system = False
+        self._theme_signature = None
+        self._base_palettes: dict[int, dict] = {}
         self.screenshot = screenshot
         if screenshot:
             os.environ["NEXA_HEADLESS"] = "1"
@@ -138,13 +140,9 @@ class Desktop:
         if name == "options":
             self.settings_form = dict(self.state["settings"])
             self.custom_color = ui.Color.hex(self.state["settings"]["accent"])
+            self.color_hex = {}
         if name == "add":
             self.add_connections = self.state["settings"]["connections"]
-            self.authorized = False
-        if name == "spotify":
-            self.spotify_authorized = False
-        if name == "media":
-            self.media_authorized = False
 
     def perform(self, operation: str, payload: dict | None = None) -> None:
         try:
@@ -152,7 +150,7 @@ class Desktop:
             self.error = ""
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
-            self.error = str(exc)
+            self.error = safe_error(exc, self.state.get("settings", {}))
 
     def targets(self) -> list[dict]:
         return [t for t in self.state["downloads"] if t["id"] in self.selected]
@@ -173,14 +171,14 @@ class Desktop:
         try:
             self.call("add", {"url": self.url.strip(), "filename": self.filename.strip() or None,
                               "category": categories[self.add_category], "connections": self.add_connections,
-                              "start_paused": self.start_paused, "authorized": self.authorized})
+                              "start_paused": self.start_paused})
             self.url = self.filename = ""
-            self.authorized = self.start_paused = False
+            self.start_paused = False
             self.dialog = ""
             self.category = "all"
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
-            self.error = str(exc)
+            self.error = safe_error(exc, self.state.get("settings", {}))
 
     def inspect_media(self) -> None:
         if self.busy:
@@ -191,9 +189,7 @@ class Desktop:
         url = self.media_url
 
         def work():
-            if not self.media_authorized:
-                raise ValueError("Confirm permission to save this media first.")
-            return self.call("media.inspect", {"url": url, "authorized": True}, timeout=120)
+            return self.call("media.inspect", {"url": url}, timeout=120)
 
         self.runner.submit(work, on_done=self._media_loaded, on_error=self._operation_error)
 
@@ -203,13 +199,10 @@ class Desktop:
 
     def _operation_error(self, exc: BaseException) -> None:
         self.busy = ""
-        self.error = str(exc)
+        self.error = safe_error(exc, self.state.get("settings", {}))
 
     def search_spotify(self) -> None:
         if self.busy:
-            return
-        if not self.spotify_authorized:
-            self.error = "Confirm permission to save the matched audio first."
             return
         self.busy = "spotify"
         self.error = ""
@@ -233,26 +226,26 @@ class Desktop:
             self.error = "Select at least one track."
             return
         try:
-            result = self.call("spotify.queue", {"songs": songs, "authorized": self.spotify_authorized,
-                                                 "start_paused": self.start_paused})
+            result = self.call("spotify.queue", {"songs": songs, "start_paused": self.start_paused})
             self.notice = f"Queued {len(result['tasks'])} tracks through spotDL."
             self.dialog = ""
             self.category = "audio"
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
-            self.error = str(exc)
+            self.error = safe_error(exc, self.state.get("settings", {}))
 
     def save_options(self) -> None:
         keys = ["download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
                 "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
-                "spotify_format", "spotify_bitrate"]
+                "spotify_format", "spotify_bitrate", "proxy_enabled", "proxy_url", "proxy_username",
+                "proxy_password", "proxy_remote_dns"]
         try:
             self.call("settings", {key: self.settings_form[key] for key in keys})
             self.notice = "Options saved."
             self.dialog = ""
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
-            self.error = str(exc)
+            self.error = safe_error(exc, self.state.get("settings", {}))
 
     def load_library(self) -> None:
         self.open_dialog("library")
@@ -261,6 +254,7 @@ class Desktop:
 
     def apply_theme(self, ctx: ui.UI, settings: dict) -> None:
         mode = settings["theme"]
+        signature = (mode, settings["accent"], tuple(sorted(settings.get("colors", {}).items())))
         if mode == "system":
             if not self._following_system:
                 try:
@@ -268,11 +262,28 @@ class Desktop:
                     self._following_system = True
                 except RuntimeError:
                     ctx.theme_mode = ui.ThemeMode.LIGHT
-        else:
-            if self._following_system:
-                self.app.follow_system_theme(False)
-                self._following_system = False
-            ctx.theme_mode = ui.ThemeMode.DARK if mode == "dark" else ui.ThemeMode.LIGHT
+        elif self._following_system:
+            self.app.follow_system_theme(False)
+            self._following_system = False
+        # Reset the base palette only when appearance settings change. Calling
+        # set_theme every frame restarts Nexa's accent animation and fights the
+        # custom ACCENT token; other frames keep the exact overridden palette.
+        if signature != self._theme_signature:
+            # Custom palettes are exact values, not a spring animation target.
+            ctx.theme.motion = 0
+            if mode != "system":
+                ctx.theme_mode = ui.ThemeMode.DARK if mode == "dark" else ui.ThemeMode.LIGHT
+            base_key = int(ctx.theme_mode)
+            if base_key not in self._base_palettes:
+                self._base_palettes[base_key] = {
+                    token: ctx.theme[token] for token in ui.Token
+                    if token not in {ui.Token.NONE, ui.Token.COUNT}
+                }
+            # Restore the pristine base before applying overrides, so resetting
+            # one token cannot leave the previous custom value behind.
+            for token, color in self._base_palettes[base_key].items():
+                ctx.theme[token] = color
+            self._theme_signature = signature
         accent = ui.Color.hex(settings["accent"])
         for token in (ui.Token.ACCENT, ui.Token.ACCENT_STRONG, ui.Token.CONTROL_ON, ui.Token.SERIES_1):
             ctx.theme[token] = accent
@@ -280,6 +291,9 @@ class Desktop:
         ctx.theme[ui.Token.FOCUS_RING] = ui.with_alpha(accent, 0.5)
         luminance = accent.r * .299 + accent.g * .587 + accent.b * .114
         ctx.theme[ui.Token.ACCENT_FOREGROUND] = ui.Color.hex("#172033" if luminance > 165 else "#ffffff")
+        for key, value in settings.get("colors", {}).items():
+            if key in CUSTOM_COLOR_KEYS:
+                ctx.theme[ui.Token[key.upper()]] = ui.Color.hex(value)
         # Dense, restrained desktop chrome rather than a dashboard theme.
         ctx.theme.radius_control = 3
         ctx.theme.radius_surface = 3
@@ -297,6 +311,20 @@ class Desktop:
                     ctx.toast("Download complete", description=task["name"], tone=ui.Tone.SUCCESS)
                     self.completed_ids.add(task["id"])
         self._capture_clipboard(ctx, settings)
+        # Handle global shortcuts before widgets consume the key event. A focused
+        # Nexa input keeps its native Ctrl+V text-pasting behavior.
+        if not ctx.wants_keyboard:
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.V) and self.dialog in {"", "add", "spotify", "media"}:
+                self.paste_url(ctx)
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.N):
+                self.open_dialog("add")
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.A):
+                self.selected = {t["id"] for t in self.visible_tasks(state)}
+            if ctx.key_pressed(ui.Key.DELETE) and self.selected:
+                self.ask_delete(list(self.selected))
+            if ctx.key_pressed(ui.Key.ENTER) and len(self.selected) == 1:
+                self.details_id = next(iter(self.selected))
+                self.open_dialog("details")
         with ctx.column(width=ui.FILL, height=ui.FILL, bg=ui.Color.BACKGROUND):
             self._menus(ctx, settings)
             self._toolbar(ctx)
@@ -321,20 +349,14 @@ class Desktop:
                 ctx.status_bar_text(f"{state['stats']['active']} downloading", icon=ui.Icon.DOWNLOAD)
                 ctx.status_bar_text(f"{state['stats']['queued']} queued", icon=ui.Icon.CLOCK)
                 ctx.status_bar_spacer()
+                ctx.status_bar_text("Proxy: " + proxy_label(settings), icon=ui.Icon.GLOBE)
                 ctx.status_bar_text(f"Speed: {format_bytes(state['stats']['speed'])}/s", icon=ui.Icon.ACTIVITY)
                 ctx.status_bar_text("Local daemon · no web server", icon=ui.Icon.SHIELD,
                                     tone=ui.Tone.SUCCESS if settings["engine_running"] else ui.Tone.WARNING)
         self._dialogs(ctx, state)
-        if not ctx.wants_keyboard:
-            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.N):
-                self.open_dialog("add")
-            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.A):
-                self.selected = {t["id"] for t in self.visible_tasks(state)}
-            if ctx.key_pressed(ui.Key.DELETE) and self.selected:
-                self.ask_delete(list(self.selected))
-            if ctx.key_pressed(ui.Key.ENTER) and len(self.selected) == 1:
-                self.details_id = next(iter(self.selected))
-                self.open_dialog("details")
+        # Nexa's theme transition can animate semantic tokens during the frame;
+        # reassert exact user overrides afterwards so the palette stays stable.
+        self.apply_theme(ctx, settings)
 
     def _menus(self, ctx: ui.UI, settings: dict) -> None:
         with ctx.menu_bar():
@@ -342,6 +364,8 @@ class Desktop:
                 if menu:
                     if ctx.menu_item("Add URL…", icon=ui.Icon.PLUS, shortcut="Ctrl+N"):
                         self.open_dialog("add")
+                    if ctx.menu_item("Paste URL from clipboard", icon=ui.Icon.CLIPBOARD, shortcut="Ctrl+V"):
+                        self.paste_url(ctx)
                     if ctx.menu_item("Download Spotify link…", icon=ui.Icon.MUSIC):
                         self.open_dialog("spotify")
                     ctx.menu_separator()
@@ -520,6 +544,24 @@ class Desktop:
         self.delete_ids = ids
         self.open_dialog("delete")
 
+    def paste_url(self, ctx: ui.UI) -> None:
+        """Global Ctrl+V opens the right dialog with the copied link prefilled."""
+        text = ctx.get_clipboard().strip()
+        match = re.fullmatch(r"https?://\S+", text, re.IGNORECASE)
+        if not match:
+            self.notice = "Copy a single HTTP or HTTPS link, then press Ctrl+V."
+            return
+        from .spotify import supported_url
+        if supported_url(text) or urlsplit(text).hostname == "spotify.link":
+            self.open_dialog("spotify")
+            self.spotify_url = text
+            self.spotify_result = None
+            self.spotify_selected.clear()
+        else:
+            self.open_dialog("add")
+            self.url = text
+        self.notice = "Clipboard link pasted. Review the destination, then start the download."
+
     def _capture_clipboard(self, ctx: ui.UI, settings: dict) -> None:
         if not (settings["auto_capture"] and settings["clipboard_capture"]):
             return
@@ -531,7 +573,7 @@ class Desktop:
             self.last_clipboard = text
             if text.startswith(("http://", "https://")) and "\n" not in text and Path(urlsplit(text).path).suffix.lower() in MEDIA_EXTENSIONS:
                 try:
-                    self.call("capture", {"url": text, "authorized": True, "source": "clipboard"})
+                    self.call("capture", {"url": text, "source": "clipboard"})
                 except (OSError, ValueError, RuntimeError, EOFError):
                     pass
 
@@ -577,7 +619,7 @@ class Desktop:
                                     self.call("shutdown")
                                     self.app.quit()
                                 except (OSError, ValueError, RuntimeError, EOFError) as exc:
-                                    self.error = str(exc)
+                                    self.error = safe_error(exc, self.state.get("settings", {}))
                     else:
                         ctx.heading("NDM 0.1.0", level=3)
                         ctx.text("Native Python download manager · Nexa UI", width=ui.FILL)
@@ -597,7 +639,6 @@ class Desktop:
                 self.add_category = ctx.select("category", ["Detect automatically", "Video", "Music", "Compressed", "Images", "Documents", "Other"], self.add_category, label="Category", width=ui.FILL)
                 self.add_connections = int(ctx.number("connections", self.add_connections, 1, 8, label="Connections for this file", width=ui.FILL))
                 self.start_paused = ctx.checkbox("Add to queue without starting", self.start_paused)
-                self.authorized = ctx.checkbox("I own this content or have permission to download it", self.authorized)
                 ctx.text("For Spotify links, use the Spotify toolbar button instead.", size=11, color=ui.Color.TEXT_SECONDARY)
                 self._error_in_dialog(ctx)
                 with ctx.dialog_footer():
@@ -614,7 +655,6 @@ class Desktop:
             if dialog:
                 ctx.text("Paste a public Spotify track, album, or playlist link. NDM previews the metadata before queuing individual tracks.", width=ui.FILL, size=12)
                 self.spotify_url = ctx.input("spotify_address", self.spotify_url, label="Spotify link", placeholder="https://open.spotify.com/track/", width=ui.FILL, max_bytes=2048, autofocus=True)
-                self.spotify_authorized = ctx.checkbox("I have permission to save the matched audio", self.spotify_authorized)
                 self.start_paused = ctx.checkbox("Add tracks without starting", self.start_paused)
                 with ctx.row(gap=10, align=ui.Align.CENTER):
                     if ctx.button("Finding tracks…" if self.busy == "spotify" else "Find Tracks", icon=ui.Icon.SEARCH,
@@ -658,7 +698,6 @@ class Desktop:
         with ctx.dialog("Media Grabber", True, width=740) as dialog:
             if dialog:
                 self.media_url = ctx.input("media_address", self.media_url, label="Page or media URL", width=ui.FILL, max_bytes=8192)
-                self.media_authorized = ctx.checkbox("I own this content or have permission to save it", self.media_authorized)
                 if ctx.button("Inspecting…" if self.busy == "media" else "Find Media", icon=ui.Icon.SEARCH, disabled=bool(self.busy)):
                     self.inspect_media()
                 self._error_in_dialog(ctx)
@@ -678,7 +717,7 @@ class Desktop:
                                 if ctx.button("Download", size=ui.ControlSize.SM):
                                     self.perform("media.download", {"url": item.get("page_url") or item["url"],
                                                  "format_id": item["id"], "name": item["name"], "category": item["category"],
-                                                 "ext": item["ext"], "authorized": True})
+                                                 "ext": item["ext"]})
                                     if not self.error:
                                         self.notice = "Media added to the download list."
                                         self.dialog = ""
@@ -688,11 +727,88 @@ class Desktop:
             if not dialog.open:
                 self.dialog = ""
 
+    def _proxy_options(self, ctx: ui.UI, form: dict) -> None:
+        form["proxy_enabled"] = ctx.switch("Use a proxy for downloads and media lookups", form["proxy_enabled"])
+        form["proxy_url"] = ctx.input("proxy_url", form["proxy_url"], label="Proxy URL",
+                                      placeholder="http://proxy.local:8080 or socks5://127.0.0.1:1080",
+                                      width=ui.FILL, max_bytes=2048, disabled=not form["proxy_enabled"])
+        form["proxy_username"] = ctx.input("proxy_username", form["proxy_username"], label="Username (optional)",
+                                           width=ui.FILL, max_bytes=256, disabled=not form["proxy_enabled"])
+        form["proxy_password"] = ctx.input("proxy_password", form["proxy_password"], label="Password (optional)",
+                                           password=True, width=ui.FILL, max_bytes=256, disabled=not form["proxy_enabled"])
+        form["proxy_remote_dns"] = ctx.checkbox("Resolve hostnames through the SOCKS5 proxy (recommended)",
+                                                form["proxy_remote_dns"], disabled=not form["proxy_enabled"])
+        ctx.text("Supports HTTP, HTTPS, SOCKS5, and SOCKS5H. An enabled proxy overrides system proxy environment variables and is used for direct downloads, yt-dlp, and spotDL.", width=ui.FILL, size=11)
+        ctx.text("Proxy credentials are stored in this local NDM state directory. Use a trusted proxy; HTTPS certificate verification stays enabled.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+
+    def _appearance_options(self, ctx: ui.UI, state: dict) -> None:
+        settings = state["settings"]
+        modes = ["light", "dark", "system"]
+        chosen = ctx.segmented("theme", ["Light", "Dark", "System"], modes.index(settings["theme"]))
+        if modes[chosen] != settings["theme"]:
+            self.perform("settings", {"theme": modes[chosen]})
+        with ctx.row(gap=8, align=ui.Align.CENTER):
+            ctx.text("Base accent", size=12)
+            self.custom_color = ctx.color_picker("accent", self.custom_color)
+            color = f"#{self.custom_color.r:02x}{self.custom_color.g:02x}{self.custom_color.b:02x}"
+            if color != settings["accent"]:
+                self.perform("settings", {"accent": color})
+            if ctx.button("Reset palette"):
+                self.color_hex = {}
+                self.perform("settings", {"colors": {}})
+        with ctx.row(gap=8, wrap=True):
+            for accent in ACCENTS:
+                if ctx.button("##" + accent, color=accent, tooltip=accent):
+                    self.perform("settings", {"accent": accent})
+                    self.custom_color = ui.Color.hex(accent)
+        ctx.text("Custom palette — every color below overrides the base theme. Changes apply immediately.", size=11, width=ui.FILL)
+        groups = [
+            ("Surfaces & text", ["background", "surface", "surface_raised", "surface_muted", "foreground", "text_secondary", "text_muted"]),
+            ("Borders & interaction", ["border", "border_subtle", "border_strong", "hover", "active", "scrim", "focus_ring"]),
+            ("Accent & status", ["accent", "accent_strong", "accent_subtle", "accent_foreground", "success", "warning", "danger", "info"]),
+            ("Controls", ["control_on", "control_glyph", "control_track", "control_track_hover", "control_thumb", "control_thumb_on"]),
+            ("Chart series", [f"series_{i}" for i in range(1, 7)]),
+        ]
+        overrides = dict(settings.get("colors", {}))
+        with ctx.scroll("custom_palette", height=235, width=ui.FILL, gap=6):
+            for title, keys in groups:
+                ctx.text(title, size=12, font=ui.FontRole.MEDIUM)
+                for key in keys:
+                    token = ui.Token[key.upper()]
+                    current = overrides.get(key)
+                    value = ui.Color.hex(current) if current else ctx.theme[token]
+                    label = key.replace("_", " ").capitalize()
+                    with ctx.id_scope(key), ctx.row(width=ui.FILL, gap=8, align=ui.Align.CENTER):
+                        ctx.text(label, size=11, width=145)
+                        picked = ctx.color_picker("picker", value)
+                        picked_hex = f"#{picked.r:02x}{picked.g:02x}{picked.b:02x}"
+                        draft = self.color_hex.get(key, current or f"#{value.r:02x}{value.g:02x}{value.b:02x}")
+                        edited = ctx.input("hex", draft, width=115, max_bytes=9)
+                        self.color_hex[key] = edited
+                        next_color = current
+                        if picked_hex != (current or f"#{value.r:02x}{value.g:02x}{value.b:02x}"):
+                            next_color = picked_hex
+                            self.color_hex[key] = picked_hex
+                        try:
+                            normalized = normalize_color(edited)
+                            if edited != current and normalized != current:
+                                next_color = normalized
+                        except ValueError:
+                            pass
+                        if next_color != current and next_color is not None:
+                            overrides[key] = next_color
+                            self.perform("settings", {"colors": overrides})
+                        if ctx.button("Reset", size=ui.ControlSize.SM, disabled=key not in overrides):
+                            overrides.pop(key, None)
+                            self.color_hex.pop(key, None)
+                            self.perform("settings", {"colors": overrides})
+        ctx.text(f"{len(overrides)} custom colors · hex values accept #RRGGBB or #RRGGBBAA", size=10, color=ui.Color.TEXT_SECONDARY)
+
     def _options_dialog(self, ctx: ui.UI, state: dict) -> None:
         form = self.settings_form
         with ctx.dialog("NDM Options", True, width=720) as dialog:
             if dialog:
-                self.options_tab = ctx.tabs("options_tabs", ["Connection", "Save To", "Capture", "Spotify", "Appearance"], self.options_tab)
+                self.options_tab = ctx.tabs("options_tabs", ["Connection", "Proxy", "Save To", "Capture", "Spotify", "Appearance"], self.options_tab)
                 with ctx.scroll("options_body", width=ui.FILL, height=355, gap=13, pad=4):
                     if self.options_tab == 0:
                         form["max_concurrent"] = int(ctx.number("max_jobs", form["max_concurrent"], 1, 8, label="Maximum simultaneous downloads", width=ui.FILL))
@@ -701,6 +817,8 @@ class Desktop:
                         form["resume_on_start"] = ctx.checkbox("Resume interrupted downloads when the daemon starts", form["resume_on_start"])
                         form["notifications"] = ctx.checkbox("Notify when a download finishes", form["notifications"])
                     elif self.options_tab == 1:
+                        self._proxy_options(ctx, form)
+                    elif self.options_tab == 2:
                         form["download_dir"] = ctx.input("download_folder", form["download_dir"], label="Default download directory", width=ui.FILL)
                         if ctx.button("Browse…", icon=ui.Icon.FOLDER):
                             path = self.app.select_folder_dialog(title="Choose download folder")
@@ -712,15 +830,15 @@ class Desktop:
                             if path:
                                 form["music_dir"] = path
                         ctx.text("Files are organized by category. Removing a completed queue entry keeps its file.", width=ui.FILL, size=11)
-                    elif self.options_tab == 2:
+                    elif self.options_tab == 3:
                         form["auto_capture"] = ctx.switch("Enable automatic media capture", form["auto_capture"])
                         form["clipboard_capture"] = ctx.checkbox("Capture copied direct media links while this window is open", form["clipboard_capture"])
                         form["watch_inbox"] = ctx.checkbox("Watch the link inbox in the background", form["watch_inbox"])
                         ctx.text("Inbox: " + state["daemon"]["inbox"], selectable=True, size=11, width=ui.FILL)
                         domains = ctx.input("capture_domains", ", ".join(form["allowed_domains"]), label="Allowed hostnames (comma-separated; empty = any)", width=ui.FILL)
                         form["allowed_domains"] = [v.strip() for v in domains.split(",") if v.strip()]
-                        ctx.text("Drop .txt or .url files containing authorized media links into the inbox. No browser extension is required.", width=ui.FILL, size=11)
-                    elif self.options_tab == 3:
+                        ctx.text("Drop .txt or .url files containing media links into the inbox. No browser extension is required.", width=ui.FILL, size=11)
+                    elif self.options_tab == 4:
                         formats = ["mp3", "m4a", "flac", "opus", "ogg"]
                         rates = ["auto", "128k", "192k", "256k", "320k", "disable"]
                         form["spotify_format"] = formats[ctx.select("spotify_format", [v.upper() for v in formats], formats.index(form["spotify_format"]), label="Audio file format", width=ui.FILL)]
@@ -730,20 +848,7 @@ class Desktop:
                         ctx.text("NDM calls the upstream spotDL Python API. Spotify supplies metadata; audio comes from a matching YouTube Music result. No spotDL web UI is launched.", width=ui.FILL, size=11)
                         ctx.text("Use only audio you own or have permission to save. Pausing a spotDL track is cooperative; conversion may finish before it stops.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                     else:
-                        modes = ["light", "dark", "system"]
-                        chosen = ctx.segmented("theme", ["Light", "Dark", "System"], modes.index(state["settings"]["theme"]))
-                        if modes[chosen] != state["settings"]["theme"]:
-                            self.perform("settings", {"theme": modes[chosen]})
-                        self.custom_color = ctx.color_picker("accent", self.custom_color)
-                        color = f"#{self.custom_color.r:02x}{self.custom_color.g:02x}{self.custom_color.b:02x}"
-                        if color != state["settings"]["accent"]:
-                            self.perform("settings", {"accent": color})
-                        with ctx.row(gap=8, wrap=True):
-                            for accent in ACCENTS:
-                                if ctx.button("##" + accent, color=accent, tooltip=accent):
-                                    self.perform("settings", {"accent": accent})
-                                    self.custom_color = ui.Color.hex(accent)
-                        ctx.text("Accent: " + state["settings"]["accent"], size=11)
+                        self._appearance_options(ctx, state)
                 self._error_in_dialog(ctx)
                 with ctx.dialog_footer():
                     if ctx.button("Cancel"):
@@ -793,7 +898,7 @@ class Desktop:
                             try:
                                 Path(path).write_text(self.call("playlist")["content"], encoding="utf-8")
                             except (OSError, ValueError, RuntimeError) as exc:
-                                self.error = str(exc)
+                                self.error = safe_error(exc, self.state.get("settings", {}))
                 self._error_in_dialog(ctx)
                 columns = [ui.TableColumn("File", width=ui.GROW(1)), ui.TableColumn("Size", width=90), ui.TableColumn("Folder", width=280)]
                 with ctx.table("local_audio", columns, height=330, compact=True, striped=True, selectable=True) as table:
@@ -805,7 +910,7 @@ class Desktop:
                                     try:
                                         os_open_path(track["path"])
                                     except OSError as exc:
-                                        self.error = str(exc)
+                                        self.error = safe_error(exc, self.state.get("settings", {}))
                                 table.cell_text(track["name"])
                                 table.cell_text(format_bytes(track["size"]))
                                 table.cell_text(track["folder"])

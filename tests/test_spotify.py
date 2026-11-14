@@ -3,8 +3,6 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-import pytest
-
 from ndm import spotify
 from ndm.models import SettingsPatch
 
@@ -23,11 +21,9 @@ def test_spotify_url_validation():
     assert not spotify.supported_url("https://open.spotify.com/artist/" + "a" * 22)
 
 
-def test_queue_requires_permission_and_deduplicates(manager):
-    with pytest.raises(ValueError, match="permission"):
-        manager.add_spotify(song_data())
-    first = manager.add_spotify(song_data(), authorized=True, start_paused=True)
-    second = manager.add_spotify(song_data(), authorized=True)
+def test_queue_deduplicates_without_permission_checkbox(manager):
+    first = manager.add_spotify(song_data(), start_paused=True)
+    second = manager.add_spotify(song_data())
     assert first["id"] == second["id"]
     assert first["source"] == "spotdl"
     assert first["provider"] == "YouTube Music via spotDL"
@@ -47,11 +43,13 @@ def test_engine_uses_spotdl_adapter_and_keeps_queue_controls(manager, monkeypatc
         return destination
 
     monkeypatch.setattr(spotify, "download", fake_download)
-    task = manager.add_spotify(song_data(), authorized=True)
+    task = manager.add_spotify(song_data())
     done = wait_for(manager, task["id"], "completed")
     assert Path(done["path"]).read_bytes() == b"authorized local fixture"
     assert done["percent"] == 100
-    assert calls[0][1] == {"audio_format": "mp3", "bitrate": "192k"}
+    assert calls[0][1]["audio_format"] == "mp3"
+    assert calls[0][1]["bitrate"] == "192k"
+    assert "settings" in calls[0][1]
     manager.update_settings(SettingsPatch(engine_running=False))
 
 
@@ -62,7 +60,7 @@ def test_spotdl_failure_is_visible_and_retryable(manager, monkeypatch):
         raise ValueError("No matching source")
 
     monkeypatch.setattr(spotify, "download", fail)
-    task = manager.add_spotify(song_data(), authorized=True)
+    task = manager.add_spotify(song_data())
     failed = wait_for(manager, task["id"], "error")
     assert failed["error"] == "No matching source"
     manager.action(task["id"], "retry")
@@ -80,7 +78,7 @@ def test_spotdl_cancellation_pauses_without_marking_complete(manager, monkeypatc
         raise spotify.SpotifyCancelled()
 
     monkeypatch.setattr(spotify, "download", cancel)
-    task = manager.add_spotify(song_data(), authorized=True)
+    task = manager.add_spotify(song_data())
     assert started.wait(3)
     manager.action(task["id"], "pause")
     paused = wait_for(manager, task["id"], "paused")
@@ -89,8 +87,6 @@ def test_spotdl_cancellation_pauses_without_marking_complete(manager, monkeypatc
 
 
 def test_search_uses_upstream_metadata_api_without_web_server(monkeypatch, tmp_path):
-    import sys
-    from types import SimpleNamespace
 
     class Song:
         song_id = "a" * 22
@@ -104,8 +100,10 @@ def test_search_uses_upstream_metadata_api_without_web_server(monkeypatch, tmp_p
 
     calls = []
     monkeypatch.setattr(spotify, "_initialize_client", lambda directory: None)
-    monkeypatch.setitem(sys.modules, "spotdl.utils.search", SimpleNamespace(
-        parse_query=lambda query, threads: calls.append((query, threads)) or [Song()]))
+    monkeypatch.setattr(spotify, "_configure_proxy", lambda settings: None)
+    from spotdl.utils import search as upstream_search
+    monkeypatch.setattr(upstream_search, "parse_query",
+                        lambda query, threads: calls.append((query, threads)) or [Song()])
     result = spotify.search(TRACK, tmp_path)
     assert calls == [([TRACK], 2)]
     assert result["items"][0]["duration"] == 123
@@ -162,3 +160,23 @@ def test_real_spotdl_package_imports():
     from spotdl.types.song import Song
     assert callable(Downloader)
     assert Song.from_missing_data(**song_data()).name == "Own recording"
+
+
+def test_spotdl_proxy_bypasses_upstream_http_ipv4_only_validator(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from spotdl.utils.config import GlobalConfig
+    settings = {"proxy_enabled": True, "proxy_url": "socks5://proxy.local:1080",
+                "proxy_remote_dns": True}
+    monkeypatch.setattr(spotify, "_CLIENT_INITIALIZED", False)
+    spotify._configure_proxy(settings)
+    expected = {"http": "socks5h://proxy.local:1080", "https": "socks5h://proxy.local:1080"}
+    assert GlobalConfig.get_parameter("proxies") == expected
+    client = SimpleNamespace(proxies=None)
+    provider = SimpleNamespace(audio_handler=SimpleNamespace(params={}), client=client)
+    spotify._configure_audio_provider(provider, settings)
+    assert provider.audio_handler.params["proxy"] == "socks5h://proxy.local:1080"
+    assert client.proxies == expected
+    assert callable(provider._create_client)
+    spotify._configure_proxy({})
+    assert GlobalConfig.get_parameter("proxies") is None

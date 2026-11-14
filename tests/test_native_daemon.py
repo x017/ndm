@@ -42,17 +42,18 @@ def test_invalid_settings_and_unknown_operations_are_rejected(daemon):
         request(daemon.data_dir, "execute", {"code": "anything"})
 
 
-def test_spotify_link_cannot_bypass_permission(daemon):
+def test_spotify_link_uses_spotdl_queue(daemon):
     url = "https://open.spotify.com/track/" + "a" * 22
     with pytest.raises(ValueError, match="Spotify"):
-        request(daemon.data_dir, "add", {"url": url, "authorized": True})
-    with pytest.raises(ValueError, match="permission"):
-        request(daemon.data_dir, "spotify.queue", {"songs": [{"url": url}], "authorized": False})
+        request(daemon.data_dir, "add", {"url": url})
+    result = request(daemon.data_dir, "spotify.queue", {"songs": [{"url": url}], "start_paused": True})
+    assert result["tasks"][0]["source"] == "spotdl"
+    assert result["tasks"][0]["status"] == "paused"
 
 
 def test_capture_is_opt_in(daemon):
     with pytest.raises(ValueError, match="off"):
-        request(daemon.data_dir, "capture", {"url": "https://example.com/a.mp4", "authorized": True})
+        request(daemon.data_dir, "capture", {"url": "https://example.com/a.mp4"})
 
 
 def test_ipc_key_is_private_and_wrong_key_rejected(daemon, monkeypatch):

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .models import safe_filename
+from .network import configure_environment, httpx_options, proxy_url, requests_proxies
 
 _INIT_LOCK = threading.RLock()
 _CLIENT_INITIALIZED = False
@@ -55,6 +56,44 @@ def _settings(data_dir: Path, output: Path, audio_format: str, bitrate: str) -> 
     }
 
 
+def _configure_proxy(settings: dict | None) -> None:
+    """Wire proxy into spotDL's separate metadata/audio clients.
+
+    spotDL 4.x validates its own proxy setting with an HTTP/IPv4-only regex.
+    Leave that setting empty and configure the underlying clients after init;
+    this preserves hostname, SOCKS5, remote-DNS, and special-character support.
+    """
+    configure_environment(settings or {})
+    proxies = requests_proxies(settings or {})
+    from spotdl.utils.config import GlobalConfig
+    GlobalConfig.set_parameter("proxies", proxies)
+    with _INIT_LOCK:
+        if _CLIENT_INITIALIZED:
+            from spotdl.utils.spotify import SpotifyClient
+            client = SpotifyClient()
+            session = getattr(client, "_session", None)
+            if session is not None:
+                session.proxies = dict(proxies or {})
+                session.trust_env = not proxies
+
+
+def _configure_audio_provider(provider, settings: dict | None) -> None:
+    url = proxy_url(settings or {})
+    if not url:
+        return
+    provider.audio_handler.params["proxy"] = url
+    client = getattr(provider, "client", None)
+    if client is not None:
+        client.proxies = requests_proxies(settings or {})
+        # Upstream retries construct a fresh YTMusic client; keep the proxy there too.
+        provider._create_client = lambda: _proxied_ytmusic(settings or {})
+
+
+def _proxied_ytmusic(settings: dict):
+    from ytmusicapi import YTMusic
+    return YTMusic(language="de", proxies=requests_proxies(settings))
+
+
 def _initialize_client(data_dir: Path) -> None:
     global _CLIENT_INITIALIZED
     with _INIT_LOCK:
@@ -76,14 +115,22 @@ def _initialize_client(data_dir: Path) -> None:
         _CLIENT_INITIALIZED = True
 
 
-def search(url: str, data_dir: Path, *, limit: int = 500) -> dict:
+def search(url: str, data_dir: Path, *, limit: int = 500, settings: dict | None = None) -> dict:
+    if urlsplit(url.strip()).hostname == "spotify.link":
+        import httpx
+        with httpx.Client(timeout=20, follow_redirects=True, **httpx_options(settings or {})) as client:
+            url = str(client.head(url.strip()).url)
     if not supported_url(url):
         raise ValueError("Paste a full Spotify track, album, or playlist link from open.spotify.com.")
     if availability()["installed"] is False:
         raise RuntimeError("spotDL is not installed. Run uv sync, or pip install -e ., to install NDM's dependencies.")
     logging.getLogger("spotdl").setLevel(logging.ERROR)
     _initialize_client(data_dir)
+    _configure_proxy(settings)
+    from spotdl.utils import search as upstream_search
     from spotdl.utils.search import parse_query
+    if proxy_url(settings or {}):
+        upstream_search.client = _proxied_ytmusic(settings or {})
 
     # parse_query is the same metadata expansion used by spotdl.Spotdl.search.
     songs = parse_query([url.strip()], threads=2)
@@ -102,7 +149,7 @@ def search(url: str, data_dir: Path, *, limit: int = 500) -> dict:
 
 
 def download(song_data: dict, destination: Path, data_dir: Path, stop, progress, *,
-             audio_format: str = "mp3", bitrate: str = "192k") -> Path:
+             audio_format: str = "mp3", bitrate: str = "192k", settings: dict | None = None) -> Path:
     """Run upstream's single-song downloader with a cooperative native progress hook."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg is required by spotDL. Install FFmpeg, then retry this track.")
@@ -111,6 +158,7 @@ def download(song_data: dict, destination: Path, data_dir: Path, stop, progress,
         raise RuntimeError("spotDL is missing. Run uv sync, or pip install -e ., to reinstall NDM's dependencies.")
     logging.getLogger("spotdl").setLevel(logging.ERROR)
     _initialize_client(data_dir)
+    _configure_proxy(settings)
     import asyncio
 
     from spotdl.download.downloader import Downloader
@@ -126,6 +174,10 @@ def download(song_data: dict, destination: Path, data_dir: Path, stop, progress,
     # to this worker's loop explicitly (the daemon may have serviced earlier jobs).
     asyncio.set_event_loop(loop)
     downloader = Downloader(settings=_settings(data_dir, Path(template), audio_format, bitrate), loop=loop)
+    # Downloader resets GlobalConfig during construction; restore NDM's full proxy map.
+    _configure_proxy(settings)
+    for provider in downloader.audio_providers:
+        _configure_audio_provider(provider, settings)
 
     def on_update(tracker, message):
         if stop.is_set():

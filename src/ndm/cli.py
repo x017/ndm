@@ -15,6 +15,14 @@ from .models import default_data_dir
 
 
 def print_result(result) -> None:
+    from .models import redact_proxy_url
+    if isinstance(result, dict) and isinstance(result.get("settings"), dict):
+        result = {**result, "settings": {**result["settings"]}}
+        settings = result["settings"]
+        if settings.get("proxy_password"):
+            settings["proxy_password"] = "***"
+        if settings.get("proxy_url"):
+            settings["proxy_url"] = redact_proxy_url(settings["proxy_url"])
     print(json.dumps(result, indent=2))
 
 
@@ -95,11 +103,9 @@ def main(argv: list[str] | None = None) -> None:
     add.add_argument("--category", choices=["video", "audio", "archive", "image", "document", "other"])
     add.add_argument("--connections", type=int, choices=range(1, 9))
     add.add_argument("--paused", action="store_true")
-    add.add_argument("--authorized", action="store_true", help="Confirm permission to save audio/video")
     spotify = sub.add_parser("spotify", help="Queue a public Spotify track/album/playlist through spotDL")
     common(spotify)
     spotify.add_argument("url")
-    spotify.add_argument("--authorized", action="store_true", help="Confirm permission to save the matched audio")
     spotify.add_argument("--paused", action="store_true")
     for name, help_text in [("status", "Print the queue as JSON"), ("stop", "Stop the background daemon")]:
         p = sub.add_parser(name, help=help_text)
@@ -126,15 +132,12 @@ def main(argv: list[str] | None = None) -> None:
             install_service(data_dir, args.start, args.action == "uninstall")
         elif command == "add":
             print_result(request(data_dir, "add", {"url": args.url, "filename": args.filename, "category": args.category,
-                                                   "connections": args.connections, "start_paused": args.paused,
-                                                   "authorized": args.authorized}))
+                                                   "connections": args.connections, "start_paused": args.paused}))
         elif command == "spotify":
-            if not args.authorized:
-                raise ValueError("Confirm permission to save matched audio with --authorized.")
             result = request(data_dir, "spotify.search", {"url": args.url}, timeout=300)
             print(result["message"])
             print_result(request(data_dir, "spotify.queue", {"songs": [i["song"] for i in result["items"]],
-                                                             "authorized": True, "start_paused": args.paused}))
+                                                             "start_paused": args.paused}))
         elif command in {"pause", "resume", "remove"}:
             print_result(request(data_dir, "action", {"id": args.id, "action": "delete" if command == "remove" else command}))
         else:

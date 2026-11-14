@@ -24,6 +24,7 @@ from .models import (
     safe_filename,
     validate_url,
 )
+from .network import configure_environment, httpx_options, safe_error
 from .store import Store
 
 CHUNK = 128 * 1024
@@ -41,6 +42,7 @@ class DownloadManager:
         self.allow_private = allow_private
         self.lock = threading.RLock()
         self.settings = Settings.model_validate(store.get_meta("settings", {}))
+        configure_environment(self.settings)
         self.tasks = store.load_downloads()
         self.stop = threading.Event()
         self.controls: dict[str, threading.Event] = {}
@@ -63,7 +65,9 @@ class DownloadManager:
         self.thread.start()
 
     def validate_target(self, url: str) -> str:
-        return validate_url(url, allow_private=self.allow_private)
+        # With remote DNS, the proxy resolves the target; do not leak a local DNS lookup.
+        return validate_url(url, allow_private=self.allow_private,
+                            resolve=not (self.settings.proxy_enabled and self.settings.proxy_remote_dns))
 
     def _mark(self, task_id: str) -> None:
         self.dirty.add(task_id)
@@ -80,7 +84,7 @@ class DownloadManager:
 
     def add(self, *, url: str, filename: str | None = None, category: str | None = None,
             connections: int | None = None, start_paused: bool = False,
-            authorized: bool = False, source: str = "manual") -> dict:
+            source: str = "manual") -> dict:
         from .media import spotify_link
         if spotify_link(url):
             raise ValueError("Use the Spotify toolbar button or ndm spotify command for Spotify links.")
@@ -88,8 +92,6 @@ class DownloadManager:
         parsed = urlsplit(url)
         name = safe_filename(filename or Path(unquote(parsed.path)).name or "download")
         kind = category or category_for(name)
-        if kind in {"video", "audio"} and not authorized and source != "demo":
-            raise ValueError("Confirm that you own this media or have permission to download it.")
         with self.lock:
             for task in self.tasks.values():
                 if task["url"] == url and task["status"] not in {"error", "completed"}:
@@ -102,7 +104,7 @@ class DownloadManager:
                 "status": "paused" if start_paused else "queued", "size": 0,
                 "downloaded": 0, "speed": 0, "connections": connections or self.settings.connections,
                 "segments": [], "resumable": False, "etag": "", "last_modified": "",
-                "mime": "", "error": "", "source": source, "authorized": authorized,
+                "mime": "", "error": "", "source": source,
                 "created_at": time.time(), "completed_at": None,
                 "path": str(path), "part_path": str(path) + ".part",
                 "host": parsed.hostname or "", "final_url": "", "explicit_name": bool(filename),
@@ -114,15 +116,13 @@ class DownloadManager:
             return dict(task)
 
     def add_media(self, *, url: str, format_id: str, name: str, category: str,
-                  quality: str = "best", ext: str = "mp4", authorized: bool = False) -> dict:
+                  quality: str = "best", ext: str = "mp4") -> dict:
         from .media import media_download, spotify_link, uses_ytdlp  # noqa: F401
         url = self.validate_target(url)
         if spotify_link(url):
             raise ValueError("Use the Spotify toolbar button or ndm spotify command to queue this link through spotDL.")
-        if not authorized:
-            raise ValueError("Confirm that you own this media or have permission to download it.")
         if not uses_ytdlp(url):
-            return self.add(url=url, filename=name, category=category, authorized=True, source="media")
+            return self.add(url=url, filename=name, category=category, source="media")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", format_id):
             raise ValueError("Invalid media format. Inspect the link again.")
         if category not in {"video", "audio"}:
@@ -134,7 +134,7 @@ class DownloadManager:
                              and t.get("format_id") == format_id and t["status"] != "error"), None)
             if existing:
                 return dict(existing)
-            task = self.add(url=url, filename=name, category=category, authorized=True, source="ytdlp")
+            task = self.add(url=url, filename=name, category=category, source="ytdlp")
             task = self.tasks[task["id"]]
             task["format_id"] = format_id
             task["media_quality"] = quality
@@ -142,12 +142,10 @@ class DownloadManager:
             self.store.save_downloads([task["id"]], self.tasks)
             return dict(task)
 
-    def add_spotify(self, song: dict, *, authorized: bool = False, start_paused: bool = False) -> dict:
+    def add_spotify(self, song: dict, *, start_paused: bool = False) -> dict:
         """Queue a spotDL metadata match. This never accesses Spotify protected audio."""
         from .spotify import display_name, supported_url
 
-        if not authorized:
-            raise ValueError("Confirm that you have permission to save the matched audio.")
         url = str(song.get("url", ""))
         if not supported_url(url) or "/track/" not in url:
             raise ValueError("spotDL queue entries must be individual Spotify tracks.")
@@ -163,7 +161,7 @@ class DownloadManager:
                 "status": "paused" if start_paused else "queued", "size": 0,
                 "downloaded": 0, "speed": 0, "connections": 1, "segments": [],
                 "resumable": False, "etag": "", "last_modified": "", "mime": "audio/mpeg",
-                "error": "", "source": "spotdl", "authorized": True,
+                "error": "", "source": "spotdl",
                 "created_at": time.time(), "completed_at": None,
                 "path": str(path), "part_path": str(path) + ".part",
                 "host": "open.spotify.com", "final_url": "", "explicit_name": True,
@@ -199,7 +197,7 @@ class DownloadManager:
                     self.store.event("Download queued", task["name"])
                 elif task["status"] == "completed" and action == "retry":
                     return self.add(url=task["url"], filename=task["name"], category=task["category"],
-                                    authorized=task["authorized"], source=task["source"])
+                                    source=task["source"])
             elif action == "delete":
                 self._deleted_paths[task_id] = [task["part_path"], task["path"] + ".ndm.json"]
                 if task["source"] in {"ytdlp", "spotdl"} and task["status"] != "completed":
@@ -231,6 +229,7 @@ class DownloadManager:
         with self.lock:
             was_running = self.settings.engine_running
             self.settings = candidate
+            configure_environment(candidate)
             self.root = Path(candidate.download_dir).expanduser().resolve()
             self.root.mkdir(parents=True, exist_ok=True)
             self.store.set_meta("settings", candidate.model_dump())
@@ -247,12 +246,9 @@ class DownloadManager:
             self.store.event("Preferences updated", "Your download engine is ready.")
         return candidate
 
-    def capture(self, *, url: str, filename: str | None, mime: str, source: str,
-                authorized: bool) -> dict:
+    def capture(self, *, url: str, filename: str | None, mime: str, source: str) -> dict:
         if not self.settings.auto_capture:
             raise RuntimeError("Media capture is off. Enable it in Media grabber first.")
-        if not authorized:
-            raise ValueError("Capture permission has not been granted.")
         url = self.validate_target(url)
         host = (urlsplit(url).hostname or "").lower()
         allowed = self.settings.allowed_domains
@@ -265,8 +261,8 @@ class DownloadManager:
             raise ValueError("The link does not point to an audio or video file.")
         if Path(urlsplit(url).path).suffix.lower() in {".m3u8", ".mpd"}:
             return self.add_media(url=url, format_id="best", name=Path(urlsplit(url).path).stem or "media",
-                                  category=kind, ext="mp4" if kind == "video" else "m4a", authorized=True)
-        return self.add(url=url, filename=filename, category=kind, source=source, authorized=True)
+                                  category=kind, ext="mp4" if kind == "video" else "m4a")
+        return self.add(url=url, filename=filename, category=kind, source=source)
 
     def _watch_inbox(self) -> None:
         if not (self.settings.auto_capture and self.settings.watch_inbox and self.settings.engine_running):
@@ -281,7 +277,7 @@ class DownloadManager:
                 urls = re.findall(r"(?:^URL=|^\s*)(https?://\S+)", text, re.MULTILINE | re.IGNORECASE)
                 for url in urls[:100]:
                     try:
-                        self.capture(url=url, filename=None, mime="", source="inbox", authorized=True)
+                        self.capture(url=url, filename=None, mime="", source="inbox")
                     except (ValueError, RuntimeError) as exc:
                         self.store.event("Link skipped", str(exc), "warning")
                 path.rename(path.with_name(path.name + ".processed"))
@@ -359,7 +355,8 @@ class DownloadManager:
             return
         try:
             with httpx.Client(timeout=httpx.Timeout(20, read=30), follow_redirects=True,
-                              headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}, trust_env=True,
+                              headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+                              **httpx_options(self.settings),
                               event_hooks={"request": [lambda request: self.validate_target(str(request.url))]}) as client:
                 for attempt in range(2):
                     try:
@@ -401,7 +398,7 @@ class DownloadManager:
                 task = self.tasks.get(task_id)
                 if task:
                     task.update(status="error", speed=0,
-                                error=str(exc)[:500] or exc.__class__.__name__)
+                                error=safe_error(exc, self.settings))
                     self._mark(task_id)
                     self.store.event("Download needs attention", task["name"] + ": " + task["error"], "warning")
         finally:
@@ -424,6 +421,7 @@ class DownloadManager:
                 if not task:
                     return
                 snapshot = dict(task)
+                settings = self.settings.model_dump()
 
             def progress(downloaded, total, phase, percent):
                 with self.lock:
@@ -434,7 +432,7 @@ class DownloadManager:
 
             path = download(snapshot["spotify_song"], Path(snapshot["path"]), self.store.directory,
                             stop, progress, audio_format=snapshot["spotify_format"],
-                            bitrate=snapshot["spotify_bitrate"])
+                            bitrate=snapshot["spotify_bitrate"], settings=settings)
             with self.lock:
                 task = self.tasks.get(task_id)
                 if not task:
@@ -454,7 +452,7 @@ class DownloadManager:
                 if stop.is_set() or isinstance(exc, SpotifyCancelled):
                     task.update(status="paused", speed=0, phase="paused")
                 else:
-                    task.update(status="error", speed=0, phase="error", error=str(exc)[:500])
+                    task.update(status="error", speed=0, phase="error", error=safe_error(exc, self.settings))
                     self.store.event("spotDL download needs attention", task["error"], "warning")
                 self._mark(task_id)
         finally:
@@ -475,6 +473,7 @@ class DownloadManager:
                 if not task:
                     return
                 snapshot = dict(task)
+                settings = self.settings.model_dump()
 
             def progress(downloaded, total, phase):
                 with self.lock:
@@ -491,7 +490,7 @@ class DownloadManager:
 
             active = max(1, sum(t["status"] == "downloading" for t in self.tasks.values()))
             path = media_download(snapshot, stop, progress,
-                                  self.settings.speed_limit // active, snapshot["connections"])
+                                  self.settings.speed_limit // active, snapshot["connections"], settings=settings)
             with self.lock:
                 task = self.tasks.get(task_id)
                 if not task:

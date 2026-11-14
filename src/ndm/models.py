@@ -7,9 +7,20 @@ import socket
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ACCENTS = ["#7856e8", "#4778e6", "#169c83", "#e29342", "#dc657e", "#64748b"]
+# Every semantic color exposed by Nexa can be overridden independently.
+CUSTOM_COLOR_KEYS = {
+    "background", "surface", "surface_raised", "surface_muted", "foreground",
+    "text_secondary", "text_muted", "border", "border_subtle", "border_strong",
+    "accent", "accent_strong", "accent_subtle", "accent_foreground",
+    "success", "warning", "danger", "info", "control_on", "control_glyph",
+    "control_track", "control_track_hover", "control_thumb", "control_thumb_on",
+    "hover", "active", "scrim", "focus_ring", "series_1", "series_2",
+    "series_3", "series_4", "series_5", "series_6",
+}
+PROXY_SCHEMES = {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
@@ -59,7 +70,7 @@ def safe_filename(name: str, fallback: str = "download") -> str:
     return name
 
 
-def validate_url(url: str, *, allow_private: bool = False) -> str:
+def validate_url(url: str, *, allow_private: bool = False, resolve: bool = True) -> str:
     """Reject credentials, non-HTTP schemes and optionally private targets."""
     url = url.strip()
     if len(url) > 8192:
@@ -75,14 +86,77 @@ def validate_url(url: str, *, allow_private: bool = False) -> str:
         raise ValueError("Invalid URL port.")
     if not allow_private:
         try:
-            addresses = socket.getaddrinfo(parsed.hostname, port or (443 if parsed.scheme == "https" else 80))
-        except socket.gaierror as exc:
-            raise ValueError("The host could not be resolved. Check the URL and your connection.") from exc
-        for item in addresses:
-            address = ipaddress.ip_address(item[4][0])
-            if not address.is_global:
+            literal = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            if not literal.is_global:
                 raise ValueError("Private and local network URLs are blocked by this daemon's settings.")
+        elif resolve:
+            try:
+                addresses = socket.getaddrinfo(parsed.hostname, port or (443 if parsed.scheme == "https" else 80))
+            except socket.gaierror as exc:
+                raise ValueError("The host could not be resolved. Check the URL and your connection.") from exc
+            for item in addresses:
+                address = ipaddress.ip_address(item[4][0])
+                if not address.is_global:
+                    raise ValueError("Private and local network URLs are blocked by this daemon's settings.")
     return url
+
+
+def normalize_color(value: str) -> str:
+    value = value.strip().lower()
+    if not re.fullmatch(r"#[0-9a-f]{6}(?:[0-9a-f]{2})?", value):
+        raise ValueError("Use a hex color such as #1f2430 or #1f2430ff.")
+    return value
+
+
+def normalize_proxy_url(value: str) -> str:
+    """Validate HTTP/HTTPS/SOCKS5 proxy URLs and fill in conventional ports."""
+    from urllib.parse import quote
+
+    value = value.strip()
+    if not value:
+        return ""
+    if len(value) > 2048:
+        raise ValueError("Proxy URL is too long.")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Enter a valid proxy URL, for example socks5://127.0.0.1:1080.") from exc
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in PROXY_SCHEMES:
+        raise ValueError("Proxy scheme must be http, https, socks5, or socks5h.")
+    host = parsed.hostname
+    if not host or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("Proxy URL must be only scheme://[user:password@]host[:port].")
+    if port is None:
+        port = PROXY_SCHEMES[scheme]
+    if not 1 <= port <= 65535:
+        raise ValueError("Proxy port must be between 1 and 65535.")
+    userinfo = ""
+    if parsed.username is not None:
+        userinfo = quote(unquote(parsed.username), safe="")
+        if parsed.password is not None:
+            userinfo += ":" + quote(unquote(parsed.password), safe="")
+        userinfo += "@"
+    host_part = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{userinfo}{host_part}:{port}"
+
+
+def redact_proxy_url(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except ValueError:
+        return "proxy"
 
 
 class Settings(BaseModel):
@@ -96,6 +170,12 @@ class Settings(BaseModel):
     resume_on_start: bool = True
     theme: str = "light"
     accent: str = ACCENTS[0]
+    colors: dict[str, str] = Field(default_factory=dict)
+    proxy_enabled: bool = False
+    proxy_url: str = ""
+    proxy_username: str = Field(default="", max_length=256)
+    proxy_password: str = Field(default="", max_length=256)
+    proxy_remote_dns: bool = True
     auto_capture: bool = False
     clipboard_capture: bool = False
     watch_inbox: bool = False
@@ -116,9 +196,35 @@ class Settings(BaseModel):
     @field_validator("accent")
     @classmethod
     def valid_accent(cls, value: str) -> str:
-        if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
-            raise ValueError("Use a six-digit hex color, such as #7856e8.")
-        return value.lower()
+        return normalize_color(value)
+
+    @field_validator("colors")
+    @classmethod
+    def valid_colors(cls, value: dict[str, str]) -> dict[str, str]:
+        unknown = set(value) - CUSTOM_COLOR_KEYS
+        if unknown:
+            raise ValueError("Unknown color setting: " + ", ".join(sorted(unknown)))
+        return {key: normalize_color(color) for key, color in value.items()}
+
+    @field_validator("proxy_url")
+    @classmethod
+    def valid_proxy(cls, value: str) -> str:
+        return normalize_proxy_url(value)
+
+    @field_validator("proxy_username", "proxy_password")
+    @classmethod
+    def no_proxy_crlf(cls, value: str) -> str:
+        if "\r" in value or "\n" in value:
+            raise ValueError("Proxy credentials cannot contain line breaks.")
+        return value
+
+    @model_validator(mode="after")
+    def proxy_complete(self) -> Settings:
+        if self.proxy_enabled and not self.proxy_url:
+            raise ValueError("A proxy URL is required when proxy support is enabled.")
+        if self.proxy_password and not self.proxy_username:
+            raise ValueError("A proxy username is required with a proxy password.")
+        return self
 
     @field_validator("media_quality")
     @classmethod
@@ -171,6 +277,12 @@ class SettingsPatch(BaseModel):
     resume_on_start: bool | None = None
     theme: str | None = None
     accent: str | None = None
+    colors: dict[str, str] | None = None
+    proxy_enabled: bool | None = None
+    proxy_url: str | None = None
+    proxy_username: str | None = None
+    proxy_password: str | None = None
+    proxy_remote_dns: bool | None = None
     auto_capture: bool | None = None
     clipboard_capture: bool | None = None
     watch_inbox: bool | None = None
@@ -189,7 +301,6 @@ class NewDownload(BaseModel):
     category: str | None = None
     connections: int | None = Field(default=None, ge=1, le=8)
     start_paused: bool = False
-    authorized: bool = False
     source: str = Field(default="manual", max_length=32)
 
     @field_validator("category")
@@ -203,7 +314,6 @@ class NewDownload(BaseModel):
 class MediaRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     url: str = Field(min_length=1, max_length=8192)
-    authorized: bool = False
 
 
 class CaptureRequest(BaseModel):
@@ -212,4 +322,3 @@ class CaptureRequest(BaseModel):
     filename: str | None = Field(default=None, max_length=180)
     mime: str = Field(default="", max_length=200)
     source: str = Field(default="clipboard", pattern="^(clipboard|inbox)$")
-    authorized: bool = False

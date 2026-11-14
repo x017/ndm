@@ -133,28 +133,29 @@ def test_engine_pause_stops_scheduling(manager, file_server):
     wait_for(manager, task["id"], "completed")
 
 
-def test_media_requires_permission(manager):
-    with pytest.raises(ValueError, match="permission"):
-        manager.add(url="https://example.com/song.mp3", filename="song.mp3")
+def test_media_adds_without_permission_checkbox(manager):
+    task = manager.add(url="https://example.com/song.mp3", filename="song.mp3", start_paused=True)
+    assert task["status"] == "paused"
+    assert task["category"] == "audio"
 
 
 def test_capture_is_opt_in_and_allowlisted(manager):
     with pytest.raises(RuntimeError, match="off"):
-        manager.capture(url="https://example.com/a.mp4", filename=None, mime="video/mp4", source="clipboard", authorized=True)
+        manager.capture(url="https://example.com/a.mp4", filename=None, mime="video/mp4", source="clipboard")
     manager.update_settings(SettingsPatch(auto_capture=True, allowed_domains=["allowed.example"]))
     with pytest.raises(ValueError, match="allowlist"):
-        manager.capture(url="https://other.example/a.mp4", filename=None, mime="video/mp4", source="clipboard", authorized=True)
+        manager.capture(url="https://other.example/a.mp4", filename=None, mime="video/mp4", source="clipboard")
 
 
-def test_inbox_watches_authorized_link_files(manager, file_server):
+def test_inbox_watches_link_files(manager, file_server):
     manager.update_settings(SettingsPatch(auto_capture=True, watch_inbox=True))
     inbox = manager.store.directory / "inbox"
-    link = inbox / "authorized.txt"
+    link = inbox / "links.txt"
     link.write_text(file_server.url.replace("file.bin", "clip.mp4") + "\n")
     deadline = time.monotonic() + 6
-    while not (inbox / "authorized.txt.processed").exists() and time.monotonic() < deadline:
+    while not (inbox / "links.txt.processed").exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert (inbox / "authorized.txt.processed").exists()
+    assert (inbox / "links.txt.processed").exists()
     task = next(t for t in manager.tasks.values() if t["source"] == "inbox")
     done = wait_for(manager, task["id"], "completed")
     assert Path(done["path"]).read_bytes() == file_server.payload
@@ -167,3 +168,16 @@ def test_store_rejects_second_owner(tmp_path):
             Store(tmp_path / "locked")
     finally:
         store.close()
+
+
+def test_http_proxy_is_used_for_segmented_transfer(manager):
+    proxy = FileServer(b"proxied payload" * 1000)
+    try:
+        manager.update_settings(SettingsPatch(proxy_enabled=True,
+                                              proxy_url=f"http://127.0.0.1:{proxy.server.server_port}"))
+        task = manager.add(url="http://remote.invalid/file.bin", filename="proxied.bin", connections=2)
+        done = wait_for(manager, task["id"], "completed")
+        assert Path(done["path"]).read_bytes() == proxy.payload
+        assert proxy.requests
+    finally:
+        proxy.close()

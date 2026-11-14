@@ -86,3 +86,28 @@ def test_html_media_discovery():
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_proxy_settings_normalize_and_validate():
+    from ndm.models import normalize_proxy_url, redact_proxy_url
+    assert normalize_proxy_url("SOCKS5://proxy.local") == "socks5://proxy.local:1080"
+    assert normalize_proxy_url("http://user:p%40ss@proxy.local:8080") == "http://user:p%40ss@proxy.local:8080"
+    assert redact_proxy_url("http://user:secret@proxy.local:8080") == "http://proxy.local:8080"
+    for value in ["ftp://proxy.local", "socks4://proxy.local", "http://proxy.local/path", "http://proxy.local:99999"]:
+        with pytest.raises(ValueError):
+            normalize_proxy_url(value)
+    with pytest.raises(ValidationError):
+        Settings(proxy_enabled=True)
+    with pytest.raises(ValidationError):
+        Settings(proxy_password="secret")
+
+
+def test_full_custom_palette_and_remote_dns_validation():
+    from ndm.models import CUSTOM_COLOR_KEYS
+    settings = Settings(colors={key: "#112233ff" for key in CUSTOM_COLOR_KEYS})
+    assert len(settings.colors) == len(CUSTOM_COLOR_KEYS) == 34
+    with pytest.raises(ValidationError):
+        Settings(colors={"not_a_token": "#112233"})
+    assert validate_url("http://private-name.invalid/file", resolve=False)
+    with pytest.raises(ValueError):
+        validate_url("http://127.0.0.1/file", resolve=False)

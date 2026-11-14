@@ -11,7 +11,9 @@ from ndm.desktop import Desktop, format_bytes, percent, status_text
 class LocalClient:
     def __init__(self, tmp_path, monkeypatch):
         self.state = {"downloads": [], "settings": {
-            "theme": "light", "accent": "#7856e8", "engine_running": True, "connections": 4,
+            "theme": "light", "accent": "#7856e8", "colors": {}, "proxy_enabled": False,
+            "proxy_url": "", "proxy_username": "", "proxy_password": "", "proxy_remote_dns": True,
+            "engine_running": True, "connections": 4,
             "max_concurrent": 3, "speed_limit": 0, "resume_on_start": True, "notifications": False,
             "download_dir": str(tmp_path / "downloads"), "music_dir": str(tmp_path / "music"),
             "auto_capture": False, "clipboard_capture": False, "watch_inbox": False,
@@ -77,7 +79,7 @@ def test_real_toolbar_dialog_form_and_category_tree(tmp_path, monkeypatch):
         ctx.input_mouse_button(ui.MouseButton.LEFT, False)
         frame(desktop, ctx)
         assert desktop.dialog == "add"
-        ctx.input_click(610, 230)
+        ctx.input_click(610, 240)
         frame(desktop, ctx)
         ctx.input_mouse_button(ui.MouseButton.LEFT, False)
         frame(desktop, ctx)
@@ -85,7 +87,6 @@ def test_real_toolbar_dialog_form_and_category_tree(tmp_path, monkeypatch):
         ctx.input_text("https://example.org/fixture.zip")
         frame(desktop, ctx)
         assert desktop.url == "https://example.org/fixture.zip"
-        desktop.authorized = True
         desktop.add()
         assert any(operation == "add" for operation, _ in client.calls)
         frame(desktop, ctx)
@@ -114,7 +115,7 @@ def test_spotify_dialog_uses_native_inputs(tmp_path, monkeypatch):
     desktop.open_dialog("spotify")
     with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
         frame(desktop, ctx)
-        ctx.input_click(610, 333)
+        ctx.input_click(610, 340)
         frame(desktop, ctx)
         ctx.input_mouse_button(ui.MouseButton.LEFT, False)
 
@@ -124,8 +125,6 @@ def test_spotify_dialog_uses_native_inputs(tmp_path, monkeypatch):
         ctx.input_text(url)
         frame(desktop, ctx)
         assert desktop.spotify_url == url
-        assert not desktop.spotify_authorized
-        desktop.spotify_authorized = True
         desktop.spotify_result = {"items": [{"id": "a", "name": "Local song", "artist": "Local artist",
                                              "album": "Local album", "duration": 123, "song": {}}], "truncated": False}
         desktop.spotify_selected = {"a"}
@@ -143,12 +142,12 @@ def test_all_native_dialogs_render(tmp_path, monkeypatch):
             desktop.open_dialog(name)
             frame(desktop, ctx)
             assert desktop.dialog == name
-        for tab in range(5):
+        for tab in range(6):
             desktop.open_dialog("options")
             desktop.options_tab = tab
             frame(desktop, ctx)
         desktop.open_dialog("options")
-        desktop.options_tab = 4
+        desktop.options_tab = 5
         desktop.perform("settings", {"theme": "dark", "accent": "#169c83"})
         frame(desktop, ctx)
         assert ctx.theme_mode == ui.ThemeMode.DARK
@@ -159,3 +158,62 @@ def test_table_formatting():
     task = {"status": "downloading", "source": "spotdl", "percent": 40, "phase": "processing", "size": 0, "downloaded": 0, "speed": 0}
     assert percent(task) == 40
     assert status_text(task) == "Converting"
+
+
+def test_global_ctrl_v_pastes_url_and_spotify_routes_correctly(tmp_path, monkeypatch):
+    LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    clipboard = {"text": "https://example.org/file.zip"}
+    monkeypatch.setattr(ui.UI, "get_clipboard", lambda self: clipboard["text"])
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        frame(desktop, ctx)
+        ctx.input_key(ui.Key.V, True, ui.Mod.PRIMARY)
+        frame(desktop, ctx)
+        ctx.input_key(ui.Key.V, False, ui.Mod.PRIMARY)
+        assert desktop.dialog == "add"
+        assert desktop.url == "https://example.org/file.zip"
+        desktop.dialog = ""
+        clipboard["text"] = "https://open.spotify.com/track/" + "a" * 22
+        ctx.input_key(ui.Key.V, True, ui.Mod.PRIMARY)
+        frame(desktop, ctx)
+        ctx.input_key(ui.Key.V, False, ui.Mod.PRIMARY)
+        assert desktop.dialog == "spotify"
+        assert desktop.spotify_url.endswith("a" * 22)
+        desktop.dialog = ""
+        clipboard["text"] = "not a link"
+        desktop.paste_url(ctx)
+        assert desktop.dialog == ""
+        assert "Copy a single" in desktop.notice
+
+
+def test_custom_palette_applies_every_token_and_resets(tmp_path, monkeypatch):
+    from ndm.models import CUSTOM_COLOR_KEYS
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    colors = {key: "#123456" for key in CUSTOM_COLOR_KEYS}
+    client.state["settings"]["colors"] = colors
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        frame(desktop, ctx)
+        for key in CUSTOM_COLOR_KEYS:
+            color = ctx.theme[ui.Token[key.upper()]]
+            assert (color.r, color.g, color.b) == (0x12, 0x34, 0x56)
+        client.state["settings"]["colors"] = {}
+        desktop.refresh()
+        frame(desktop, ctx)
+        assert ctx.theme[ui.Token.BACKGROUND] != ui.Color.hex("#123456")
+
+
+def test_proxy_options_save_through_native_form(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    desktop.open_dialog("options")
+    desktop.options_tab = 1
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        frame(desktop, ctx)
+        desktop.settings_form.update(proxy_enabled=True, proxy_url="socks5://127.0.0.1:1080",
+                                     proxy_username="user", proxy_password="secret")
+        desktop.save_options()
+        assert desktop.state["settings"]["proxy_url"] == "socks5://127.0.0.1:1080"
+        assert desktop.state["settings"]["proxy_enabled"] is True
+        assert any(op == "settings" and payload["proxy_password"] == "secret" for op, payload in client.calls)
