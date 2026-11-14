@@ -84,3 +84,30 @@ def test_shutdown_stops_accepting_requests(daemon):
         time.sleep(0.02)
     daemon.close()
     assert not is_running(daemon.data_dir)
+
+
+def test_old_persisted_settings_are_migrated_on_startup(tmp_path):
+    from ndm.models import Settings
+    from ndm.store import Store
+
+    directory = tmp_path / "state"
+    store = Store(directory)
+    store.set_meta("settings", {"theme": "dark", "connections": 2})
+    store.close()
+    instance = NativeDaemon(directory)
+    try:
+        settings = request(directory, "state")["settings"]
+        assert settings["theme"] == "dark"
+        assert settings["connections"] == 2
+        assert settings["proxy_enabled"] is False
+        assert settings["proxy_url"] == ""
+        assert settings["colors"] == {}
+    finally:
+        instance.close()
+    store = Store(directory)
+    try:
+        saved = store.get_meta("settings", {})
+    finally:
+        store.close()
+    assert saved == Settings.model_validate(saved).model_dump()
+    assert saved["connections"] == 2

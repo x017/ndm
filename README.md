@@ -73,8 +73,7 @@ ndm
 
 Install **FFmpeg** on your PATH for spotDL conversion/tagging and yt-dlp merging.
 Nexa bundles its native UI runtime in the `nexa-ui` package. Linux desktops also
-need working OpenGL/display libraries; the screenshot mode below does not need
-a display server.
+need working OpenGL/display libraries.
 
 ### Commands
 
@@ -199,14 +198,8 @@ extraction, spotDL adapter/queue controls, proxy transport wiring, full-palette
 rendering, and global Ctrl+V routing are covered. Tests do not contact
 Spotify or download copyrighted audio.
 
-Render the real Nexa UI without a display server:
-
-```bash
-NDM_HOME=.local/ndm-desktop ndm desktop --screenshot .local/ndm.png
-```
-
-This screenshot is a native raster render, not a website. To exercise the UI,
-run `ndm` in a desktop session on your own machine.
+Run `ndm` or `ndm desktop` in a desktop session on your own machine. The desktop
+command opens the native window directly; it has no screenshot/headless mode.
 
 ### Layout
 

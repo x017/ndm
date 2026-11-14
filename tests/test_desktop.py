@@ -217,3 +217,28 @@ def test_proxy_options_save_through_native_form(tmp_path, monkeypatch):
         assert desktop.state["settings"]["proxy_url"] == "socks5://127.0.0.1:1080"
         assert desktop.state["settings"]["proxy_enabled"] is True
         assert any(op == "settings" and payload["proxy_password"] == "secret" for op, payload in client.calls)
+
+
+def test_options_accepts_settings_from_older_daemon(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    for key in ("colors", "proxy_enabled", "proxy_url", "proxy_username", "proxy_password", "proxy_remote_dns"):
+        client.state["settings"].pop(key, None)
+    client.state["settings"]["connections"] = 2
+    desktop = Desktop(data_dir=tmp_path)
+    assert desktop.state["settings"]["proxy_enabled"] is False
+    assert desktop.state["settings"]["connections"] == 2
+    desktop.open_dialog("options")
+    desktop.options_tab = 1
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        frame(desktop, ctx)
+        assert desktop.settings_form["proxy_url"] == ""
+        assert desktop.settings_form["proxy_remote_dns"] is True
+        desktop.settings_form.update(proxy_enabled=True, proxy_url="http://127.0.0.1:8080")
+        desktop.save_options()
+        assert desktop.state["settings"]["proxy_enabled"] is True
+    # A later refresh from the same older daemon must not reintroduce the crash.
+    for key in ("colors", "proxy_enabled", "proxy_url", "proxy_username", "proxy_password", "proxy_remote_dns"):
+        client.state["settings"].pop(key, None)
+    desktop.refresh()
+    desktop.open_dialog("options")
+    assert desktop.settings_form["proxy_enabled"] is False

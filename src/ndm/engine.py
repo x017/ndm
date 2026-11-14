@@ -41,7 +41,12 @@ class DownloadManager:
         self.store = store
         self.allow_private = allow_private
         self.lock = threading.RLock()
-        self.settings = Settings.model_validate(store.get_meta("settings", {}))
+        saved_settings = store.get_meta("settings", {})
+        self.settings = Settings.model_validate(saved_settings)
+        # Persist defaults for fields introduced by newer versions immediately,
+        # so an upgrade does not leave a partial settings object on disk.
+        if self.settings.model_dump() != saved_settings:
+            store.set_meta("settings", self.settings.model_dump())
         configure_environment(self.settings)
         self.tasks = store.load_downloads()
         self.stop = threading.Event()

@@ -12,7 +12,7 @@ import nexa as ui
 
 from .daemon import is_running, start_detached
 from .ipc import request
-from .models import ACCENTS, CUSTOM_COLOR_KEYS, MEDIA_EXTENSIONS, normalize_color
+from .models import ACCENTS, CUSTOM_COLOR_KEYS, MEDIA_EXTENSIONS, Settings, normalize_color
 from .network import proxy_label, safe_error
 
 CATEGORY_NAMES = {"all": "All Downloads", "unfinished": "Unfinished", "finished": "Finished",
@@ -56,8 +56,21 @@ def status_text(task: dict) -> str:
     return {"queued": "Queued", "paused": "Stopped", "completed": "Complete", "error": "Error"}.get(task["status"], task["status"])
 
 
+def complete_settings(settings: dict | None) -> dict:
+    """Fill settings added since a daemon/state file was created.
+
+    The daemon validates persisted settings, but an older still-running daemon
+    can return a partial dictionary over IPC. Normalize at the UI boundary so
+    opening Options never depends on the daemon having been restarted first.
+    """
+    defaults = Settings().model_dump()
+    if settings:
+        defaults.update({key: value for key, value in settings.items() if key in Settings.model_fields})
+    return Settings.model_validate(defaults).model_dump()
+
+
 class Desktop:
-    def __init__(self, *, data_dir: Path, screenshot: str | None = None):
+    def __init__(self, *, data_dir: Path):
         self.data_dir = data_dir.expanduser().resolve()
         if not is_running(self.data_dir):
             start_detached(self.data_dir)
@@ -67,7 +80,7 @@ class Desktop:
                 time.sleep(0.1)
             else:
                 raise RuntimeError(f"The native daemon did not start. See {self.data_dir / 'daemon.log'}.")
-        self.state = self.call("state")
+        self.state = self._normalized_state(self.call("state"))
         self.cache_lock = threading.RLock()
         self.stop = threading.Event()
         self.app = None
@@ -100,7 +113,7 @@ class Desktop:
         self.library = []
         self.library_selection = -1
         self.options_tab = 0
-        self.settings_form = dict(self.state["settings"])
+        self.settings_form = complete_settings(self.state["settings"])
         self.custom_color = ui.Color.hex(self.state["settings"]["accent"])
         self.color_hex: dict[str, str] = {}
         self.last_clipboard = ""
@@ -109,18 +122,17 @@ class Desktop:
         self._following_system = False
         self._theme_signature = None
         self._base_palettes: dict[int, dict] = {}
-        self.screenshot = screenshot
-        if screenshot:
-            os.environ["NEXA_HEADLESS"] = "1"
-            os.environ["CUI_SCREENSHOT"] = str(Path(screenshot).resolve())
-            os.environ["CUI_SCREENSHOT_FRAMES"] = "12"
 
     def call(self, operation: str, payload: dict | None = None, *, timeout: float = 30.0):
         return request(self.data_dir, operation, payload, timeout=timeout)
 
+    @staticmethod
+    def _normalized_state(state: dict) -> dict:
+        return {**state, "settings": complete_settings(state.get("settings"))}
+
     def refresh(self) -> None:
         try:
-            state = self.call("state", timeout=3)
+            state = self._normalized_state(self.call("state", timeout=3))
             with self.cache_lock:
                 self.state = state
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
@@ -138,7 +150,7 @@ class Desktop:
         self.error = ""
         self.notice = ""
         if name == "options":
-            self.settings_form = dict(self.state["settings"])
+            self.settings_form = complete_settings(self.state["settings"])
             self.custom_color = ui.Color.hex(self.state["settings"]["accent"])
             self.color_hex = {}
         if name == "add":
