@@ -1,4 +1,4 @@
-"""NDM command line: native desktop, independent daemon, companion, and user service."""
+"""NDM command line: native desktop, local daemon, queue control, and sign-in service."""
 from __future__ import annotations
 
 import argparse
@@ -10,41 +10,29 @@ import subprocess
 import sys
 from pathlib import Path
 
-import httpx
-
+from .ipc import request
 from .models import default_data_dir
-from .server import run_server
 
 
-def client_for(port: int) -> httpx.Client:
-    return httpx.Client(base_url=f"http://127.0.0.1:{port}", headers={"X-NDM-Client": "1"}, timeout=20)
+def print_result(result) -> None:
+    print(json.dumps(result, indent=2))
 
 
-def print_response(response: httpx.Response) -> None:
-    data = response.json()
-    if not response.is_success:
-        detail = data.get("detail", "Request failed.")
-        if isinstance(detail, list):
-            detail = " ".join(d.get("msg", "") for d in detail)
-        raise ValueError(detail)
-    print(json.dumps(data, indent=2))
-
-
-def install_service(data_dir: Path, port: int, start: bool, uninstall: bool = False) -> None:
+def install_service(data_dir: Path, start: bool, uninstall: bool = False) -> None:
     if sys.platform.startswith("linux"):
         unit = Path.home() / ".config" / "systemd" / "user" / "ndm.service"
         if uninstall:
             subprocess.run(["systemctl", "--user", "disable", "--now", "ndm.service"], check=False)
             unit.unlink(missing_ok=True)
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-            print("NDM user service removed. Your downloads and preferences are kept.")
+            print("NDM user service removed. Downloads and preferences are kept.")
             return
         if unit.exists():
             raise ValueError(f"{unit} already exists. Review it or run ndm service uninstall first.")
         unit.parent.mkdir(parents=True, exist_ok=True)
-        command = " ".join(shlex.quote(x) for x in [sys.executable, "-m", "ndm", "daemon", "--port", str(port)])
+        command = " ".join(shlex.quote(x) for x in [sys.executable, "-m", "ndm", "daemon", "--data-dir", str(data_dir)])
         unit.write_text(f"""[Unit]
-Description=NDM background download engine
+Description=NDM native background download engine
 After=network-online.target
 
 [Service]
@@ -61,12 +49,12 @@ WantedBy=default.target
         if start:
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
             subprocess.run(["systemctl", "--user", "enable", "--now", "ndm.service"], check=True)
-            print("NDM will start at sign-in. For unattended operation without a login, enable lingering with loginctl enable-linger $USER.")
+            print("NDM starts at sign-in. For operation without a login: loginctl enable-linger $USER")
     elif sys.platform == "darwin":
         plist = Path.home() / "Library" / "LaunchAgents" / "io.ndm.daemon.plist"
         label = f"gui/{os.getuid()}"
         if uninstall:
-            subprocess.run(["launchctl", "bootout", label, str(plist)], check=False)
+            subprocess.run(["launchctl", "bootout", label, plist.as_posix()], check=False)
             plist.unlink(missing_ok=True)
             print("NDM LaunchAgent removed. Your files are kept.")
             return
@@ -74,77 +62,87 @@ WantedBy=default.target
             raise ValueError(f"{plist} already exists. Review it or run ndm service uninstall first.")
         plist.parent.mkdir(parents=True, exist_ok=True)
         with plist.open("wb") as handle:
-            plistlib.dump({"Label": "io.ndm.daemon", "ProgramArguments": [sys.executable, "-m", "ndm", "daemon", "--port", str(port)],
+            plistlib.dump({"Label": "io.ndm.daemon", "ProgramArguments": [sys.executable, "-m", "ndm", "daemon", "--data-dir", str(data_dir)],
                            "EnvironmentVariables": {"NDM_HOME": str(data_dir)}, "RunAtLoad": True,
                            "KeepAlive": {"SuccessfulExit": False}, "StandardOutPath": str(data_dir / "daemon.log"),
                            "StandardErrorPath": str(data_dir / "daemon.log")}, handle)
         print(f"Installed {plist}")
         if start:
-            subprocess.run(["launchctl", "bootstrap", label, str(plist)], check=True)
+            subprocess.run(["launchctl", "bootstrap", label, plist.as_posix()], check=True)
     else:
-        print("Windows: create a Task Scheduler task at sign-in running your installed ndm.exe with arguments: daemon")
-        print(f"Set NDM_HOME={data_dir}. Do not run the task as administrator; use your own user account.")
+        print("Windows: create a Task Scheduler task at sign-in running your installed ndm.exe.")
+        print(f"Arguments: daemon --data-dir \"{data_dir}\"")
+        print("Run as your own user, not administrator.")
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="ndm", description="Your downloads, in flow. Native Python + Nexa UI.")
+    parser = argparse.ArgumentParser(prog="ndm", description="Native IDM-style download manager built with Nexa UI.")
     sub = parser.add_subparsers(dest="command")
+
     def common(p):
-        p.add_argument("--data-dir", type=Path, default=None, help="Daemon state directory (default: ~/.local/share/ndm, or NDM_HOME)")
-        p.add_argument("--port", type=int, default=8765, help="Local daemon port (default: 8765)")
-    desktop = sub.add_parser("desktop", help="Open the native Nexa desktop app; start a daemon if needed")
+        p.add_argument("--data-dir", type=Path, default=None, help="State directory (default: NDM_HOME or ~/.local/share/ndm)")
+
+    desktop = sub.add_parser("desktop", help="Open the native desktop; start the local daemon if needed")
     common(desktop)
-    desktop.add_argument("--screenshot", help="Render headlessly to a PNG instead of opening a window")
-    daemon = sub.add_parser("daemon", help="Run the background download engine in this process")
+    desktop.add_argument("--screenshot", help="Render the native UI headlessly to a PNG")
+    daemon = sub.add_parser("daemon", help="Run the background engine with local IPC; no web server")
     common(daemon)
-    daemon.add_argument("--host", default="127.0.0.1")
-    daemon.add_argument("--allow-private", action="store_true", help="Allow local-network targets on a trusted, private daemon")
-    web = sub.add_parser("web", help="Serve the browser companion and API")
-    common(web)
-    web.add_argument("--host", default="127.0.0.1")
-    web.add_argument("--demo", action="store_true", help="Seed clearly labeled local sample transfers")
-    web.add_argument("--allow-private", action="store_true")
-    add = sub.add_parser("add", help="Add a URL to a running daemon")
+    daemon.add_argument("--block-private", action="store_true", help="Reject private/local-network download targets")
+    add = sub.add_parser("add", help="Add a direct URL to the running daemon")
     common(add)
     add.add_argument("url")
     add.add_argument("--filename")
     add.add_argument("--category", choices=["video", "audio", "archive", "image", "document", "other"])
     add.add_argument("--connections", type=int, choices=range(1, 9))
     add.add_argument("--paused", action="store_true")
-    add.add_argument("--authorized", action="store_true", help="Confirm ownership or permission for audio/video")
-    status = sub.add_parser("status", help="Show the running daemon's queue as JSON")
-    common(status)
-    service = sub.add_parser("service", help="Install or remove a sign-in service (Linux/macOS)")
+    add.add_argument("--authorized", action="store_true", help="Confirm permission to save audio/video")
+    spotify = sub.add_parser("spotify", help="Queue a public Spotify track/album/playlist through spotDL")
+    common(spotify)
+    spotify.add_argument("url")
+    spotify.add_argument("--authorized", action="store_true", help="Confirm permission to save the matched audio")
+    spotify.add_argument("--paused", action="store_true")
+    for name, help_text in [("status", "Print the queue as JSON"), ("stop", "Stop the background daemon")]:
+        p = sub.add_parser(name, help=help_text)
+        common(p)
+    for name in ("pause", "resume", "remove"):
+        p = sub.add_parser(name, help=f"{name.title()} a queued download")
+        common(p)
+        p.add_argument("id")
+    service = sub.add_parser("service", help="Install/remove a Linux or macOS sign-in service")
     common(service)
     service.add_argument("action", choices=["install", "uninstall"])
-    service.add_argument("--start", action="store_true", help="Enable and start the service immediately")
+    service.add_argument("--start", action="store_true")
     args = parser.parse_args(argv)
     command = args.command or "desktop"
     data_dir = (getattr(args, "data_dir", None) or default_data_dir()).expanduser().resolve()
-    port = getattr(args, "port", 8765)
-    if not 1 <= port <= 65535:
-        parser.error("--port must be between 1 and 65535")
     try:
-        if command in {"daemon", "web"}:
-            run_server(data_dir=data_dir, host=args.host, port=port,
-                       demo=getattr(args, "demo", False), allow_private=getattr(args, "allow_private", False))
+        if command == "daemon":
+            from .daemon import run_daemon
+            run_daemon(data_dir=data_dir, allow_private=not args.block_private)
         elif command == "desktop":
             from .desktop import Desktop
-            Desktop(port=port, data_dir=data_dir, screenshot=args.screenshot).run()
-        elif command == "add":
-            with client_for(port) as client:
-                print_response(client.post("/api/downloads", json={"url": args.url, "filename": args.filename,
-                    "category": args.category, "connections": args.connections, "start_paused": args.paused,
-                    "authorized": args.authorized}))
-        elif command == "status":
-            with client_for(port) as client:
-                print_response(client.get("/api/state"))
+            Desktop(data_dir=data_dir, screenshot=args.screenshot).run()
         elif command == "service":
-            install_service(data_dir, port, args.start, args.action == "uninstall")
+            install_service(data_dir, args.start, args.action == "uninstall")
+        elif command == "add":
+            print_result(request(data_dir, "add", {"url": args.url, "filename": args.filename, "category": args.category,
+                                                   "connections": args.connections, "start_paused": args.paused,
+                                                   "authorized": args.authorized}))
+        elif command == "spotify":
+            if not args.authorized:
+                raise ValueError("Confirm permission to save matched audio with --authorized.")
+            result = request(data_dir, "spotify.search", {"url": args.url}, timeout=300)
+            print(result["message"])
+            print_result(request(data_dir, "spotify.queue", {"songs": [i["song"] for i in result["items"]],
+                                                             "authorized": True, "start_paused": args.paused}))
+        elif command in {"pause", "resume", "remove"}:
+            print_result(request(data_dir, "action", {"id": args.id, "action": "delete" if command == "remove" else command}))
+        else:
+            print_result(request(data_dir, "state" if command == "status" else "shutdown"))
     except KeyboardInterrupt:
         pass
-    except (ValueError, RuntimeError, httpx.HTTPError, subprocess.CalledProcessError) as exc:
+    except (ValueError, RuntimeError, OSError, EOFError, subprocess.CalledProcessError) as exc:
         print(f"NDM: {exc}", file=sys.stderr)
-        if isinstance(exc, httpx.HTTPError):
-            print(f"Start the daemon first: ndm daemon --port {port}", file=sys.stderr)
+        if command not in {"daemon", "desktop", "service"}:
+            print("Start the desktop with ndm, or the background daemon with ndm daemon.", file=sys.stderr)
         raise SystemExit(1) from exc

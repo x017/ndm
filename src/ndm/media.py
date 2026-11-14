@@ -62,7 +62,7 @@ def inspect_media(url: str, *, allow_private: bool = False) -> dict:
     url = validate_url(url, allow_private=allow_private)
     if spotify_link(url):
         return {"kind": "spotify", "title": "Your Spotify link", "items": [],
-                "message": "Spotify tracks use protected streams. Open this link in Spotify and use Premium offline mode. NDM can save your own audio files and authorized direct links."}
+                "message": "Use NDM's Spotify toolbar button to inspect this link with spotDL. It matches Spotify metadata to public audio sources; it does not extract Spotify's protected streams."}
     if uses_ytdlp(url):
         options = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
                    "socket_timeout": 15, "extractor_retries": 1}

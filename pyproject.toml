@@ -1,16 +1,16 @@
 [project]
 name = "ndm"
 version = "0.1.0"
-description = "Nex Download Manager — a quiet, capable download engine with a Nexa desktop UI"
+description = "Native IDM-style download manager built with Nexa UI"
 readme = "README.md"
 authors = [{ name = "Parsa", email = "parsam280xyz@gmail.com" }]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.16"
 dependencies = [
     "nexa-ui>=1.4.0,<2",
     "httpx>=0.28,<1",
-    "fastapi>=0.115,<1",
-    "uvicorn>=0.30,<1",
-    "yt-dlp>=2026.10.26",
+    "pydantic>=2.9.2,<3",
+    "yt-dlp>=2026.10.26,<2027",
+    "spotdl>=4.6.0,<5",
 ]
 
 [project.optional-dependencies]

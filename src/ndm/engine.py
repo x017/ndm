@@ -36,11 +36,9 @@ class RangeLost(Exception):
 
 
 class DownloadManager:
-    def __init__(self, store: Store, *, allow_private: bool = False, hosted: bool = False):
+    def __init__(self, store: Store, *, allow_private: bool = False):
         self.store = store
         self.allow_private = allow_private
-        self.hosted = hosted
-        self.demo_port: int | None = None
         self.lock = threading.RLock()
         self.settings = Settings.model_validate(store.get_meta("settings", {}))
         self.tasks = store.load_downloads()
@@ -65,11 +63,6 @@ class DownloadManager:
         self.thread.start()
 
     def validate_target(self, url: str) -> str:
-        parsed = urlsplit(url.strip())
-        if (self.demo_port and parsed.scheme == "http" and parsed.hostname == "127.0.0.1"
-                and parsed.port == self.demo_port and parsed.path.startswith("/demo/")
-                and not parsed.username and not parsed.password):
-            return url.strip()
         return validate_url(url, allow_private=self.allow_private)
 
     def _mark(self, task_id: str) -> None:
@@ -88,6 +81,9 @@ class DownloadManager:
     def add(self, *, url: str, filename: str | None = None, category: str | None = None,
             connections: int | None = None, start_paused: bool = False,
             authorized: bool = False, source: str = "manual") -> dict:
+        from .media import spotify_link
+        if spotify_link(url):
+            raise ValueError("Use the Spotify toolbar button or ndm spotify command for Spotify links.")
         url = self.validate_target(url)
         parsed = urlsplit(url)
         name = safe_filename(filename or Path(unquote(parsed.path)).name or "download")
@@ -122,7 +118,7 @@ class DownloadManager:
         from .media import media_download, spotify_link, uses_ytdlp  # noqa: F401
         url = self.validate_target(url)
         if spotify_link(url):
-            raise ValueError("Spotify's protected streams cannot be downloaded. Use Open in Spotify or add an audio file you own.")
+            raise ValueError("Use the Spotify toolbar button or ndm spotify command to queue this link through spotDL.")
         if not authorized:
             raise ValueError("Confirm that you own this media or have permission to download it.")
         if not uses_ytdlp(url):
@@ -144,6 +140,41 @@ class DownloadManager:
             task["media_quality"] = quality
             task["media_format"] = (f"{format_id}+bestaudio/best" if category == "video" else format_id) if format_id != "best" else None
             self.store.save_downloads([task["id"]], self.tasks)
+            return dict(task)
+
+    def add_spotify(self, song: dict, *, authorized: bool = False, start_paused: bool = False) -> dict:
+        """Queue a spotDL metadata match. This never accesses Spotify protected audio."""
+        from .spotify import display_name, supported_url
+
+        if not authorized:
+            raise ValueError("Confirm that you have permission to save the matched audio.")
+        url = str(song.get("url", ""))
+        if not supported_url(url) or "/track/" not in url:
+            raise ValueError("spotDL queue entries must be individual Spotify tracks.")
+        with self.lock:
+            existing = next((t for t in self.tasks.values() if t["url"] == url and t["status"] != "error"), None)
+            if existing:
+                return dict(existing)
+            name = display_name(song, self.settings.spotify_format)
+            path = self._unique(self.root / "audio", name)
+            task_id = uuid.uuid4().hex[:12]
+            task = {
+                "id": task_id, "url": url, "name": name, "category": "audio",
+                "status": "paused" if start_paused else "queued", "size": 0,
+                "downloaded": 0, "speed": 0, "connections": 1, "segments": [],
+                "resumable": False, "etag": "", "last_modified": "", "mime": "audio/mpeg",
+                "error": "", "source": "spotdl", "authorized": True,
+                "created_at": time.time(), "completed_at": None,
+                "path": str(path), "part_path": str(path) + ".part",
+                "host": "open.spotify.com", "final_url": "", "explicit_name": True,
+                "explicit_category": True, "spotify_song": dict(song),
+                "spotify_format": self.settings.spotify_format,
+                "spotify_bitrate": self.settings.spotify_bitrate,
+                "provider": "YouTube Music via spotDL", "percent": 0,
+            }
+            self.tasks[task_id] = task
+            self.store.save_downloads([task_id], self.tasks)
+            self.store.event("spotDL track queued", name)
             return dict(task)
 
     def action(self, task_id: str, action: str) -> dict:
@@ -171,8 +202,9 @@ class DownloadManager:
                                     authorized=task["authorized"], source=task["source"])
             elif action == "delete":
                 self._deleted_paths[task_id] = [task["part_path"], task["path"] + ".ndm.json"]
-                if task["source"] == "ytdlp" and task["status"] != "completed":
+                if task["source"] in {"ytdlp", "spotdl"} and task["status"] != "completed":
                     final = Path(task["path"])
+                    self._deleted_paths[task_id].append(str(final))
                     self._deleted_paths[task_id].extend(str(p) for p in final.parent.glob(final.stem + ".*")
                                                         if p.suffix in {".part", ".ytdl"})
                 if task_id in self.controls:
@@ -195,13 +227,6 @@ class DownloadManager:
     def update_settings(self, patch: SettingsPatch) -> Settings:
         data = self.settings.model_dump()
         changes = patch.model_dump(exclude_none=True)
-        if self.hosted:
-            for key in ("download_dir", "music_dir"):
-                if key in changes:
-                    requested = Path(changes[key]).expanduser().resolve()
-                    expected = self.root if key == "download_dir" else Path.home() / "Music"
-                    if requested != expected:
-                        raise ValueError("Hosted folders are fixed to the preview workspace. Change folders in the desktop app.")
         candidate = Settings.model_validate({**data, **changes})
         with self.lock:
             was_running = self.settings.engine_running
@@ -326,6 +351,9 @@ class DownloadManager:
                 self._mark(task_id)
 
     def _run(self, task_id: str, stop: threading.Event) -> None:
+        if self.tasks.get(task_id, {}).get("source") == "spotdl":
+            self._run_spotdl(task_id, stop)
+            return
         if self.tasks.get(task_id, {}).get("source") == "ytdlp":
             self._run_ytdlp(task_id, stop)
             return
@@ -386,6 +414,56 @@ class DownloadManager:
                             Path(path).unlink(missing_ok=True)
                         except OSError:
                             pass
+
+    def _run_spotdl(self, task_id: str, stop: threading.Event) -> None:
+        from .spotify import SpotifyCancelled, download
+
+        try:
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if not task:
+                    return
+                snapshot = dict(task)
+
+            def progress(downloaded, total, phase, percent):
+                with self.lock:
+                    current = self.tasks.get(task_id)
+                    if current:
+                        current.update(phase=phase, percent=percent)
+                        self._mark(task_id)
+
+            path = download(snapshot["spotify_song"], Path(snapshot["path"]), self.store.directory,
+                            stop, progress, audio_format=snapshot["spotify_format"],
+                            bitrate=snapshot["spotify_bitrate"])
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if not task:
+                    path.unlink(missing_ok=True)
+                    return
+                size = path.stat().st_size
+                task.update(path=str(path), name=path.name, status="completed", size=size,
+                            downloaded=size, speed=0, completed_at=time.time(), percent=100,
+                            phase="complete", error="")
+                self._mark(task_id)
+                self.store.event("spotDL match downloaded", task["name"], "success")
+        except Exception as exc:
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if not task:
+                    return
+                if stop.is_set() or isinstance(exc, SpotifyCancelled):
+                    task.update(status="paused", speed=0, phase="paused")
+                else:
+                    task.update(status="error", speed=0, phase="error", error=str(exc)[:500])
+                    self.store.event("spotDL download needs attention", task["error"], "warning")
+                self._mark(task_id)
+        finally:
+            with self.lock:
+                self.threads.pop(task_id, None)
+                self.controls.pop(task_id, None)
+                if self.reasons.pop(task_id, "pause") == "delete":
+                    for name in self._deleted_paths.pop(task_id, []):
+                        Path(name).unlink(missing_ok=True)
 
     def _run_ytdlp(self, task_id: str, stop: threading.Event) -> None:
         import yt_dlp
@@ -632,7 +710,7 @@ class DownloadManager:
                 "history": list(self.speed_history),
                 "daemon": {"uptime": time.time() - self.started, "pid": os.getpid(),
                            "version": "0.1.0", "data_dir": str(self.store.directory),
-                           "ffmpeg": bool(shutil.which("ffmpeg")), "hosted": self.hosted,
+                           "ffmpeg": bool(shutil.which("ffmpeg")),
                            "inbox": str(self.store.directory / "inbox")},
             }
 
@@ -640,8 +718,7 @@ class DownloadManager:
         files = []
         roots = [self.root]
         music = Path(self.settings.music_dir).expanduser()
-        if not self.hosted:
-            roots.append(music)
+        roots.append(music)
         seen = set()
         for root in roots:
             if not root.is_dir():

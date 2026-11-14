@@ -60,7 +60,7 @@ def safe_filename(name: str, fallback: str = "download") -> str:
 
 
 def validate_url(url: str, *, allow_private: bool = False) -> str:
-    """Reject credentials, non-HTTP schemes and (on hosted demos) private targets."""
+    """Reject credentials, non-HTTP schemes and optionally private targets."""
     url = url.strip()
     if len(url) > 8192:
         raise ValueError("This URL is too long.")
@@ -81,7 +81,7 @@ def validate_url(url: str, *, allow_private: bool = False) -> str:
         for item in addresses:
             address = ipaddress.ip_address(item[4][0])
             if not address.is_global:
-                raise ValueError("Private and local network URLs are disabled in this hosted preview.")
+                raise ValueError("Private and local network URLs are blocked by this daemon's settings.")
     return url
 
 
@@ -102,6 +102,8 @@ class Settings(BaseModel):
     capture_types: list[str] = Field(default_factory=lambda: ["video", "audio"])
     allowed_domains: list[str] = Field(default_factory=list)
     media_quality: str = "best"
+    spotify_format: str = "mp3"
+    spotify_bitrate: str = "192k"
     notifications: bool = True
 
     @field_validator("theme")
@@ -123,6 +125,20 @@ class Settings(BaseModel):
     def valid_quality(cls, value: str) -> str:
         if value not in {"best", "1080", "720", "audio"}:
             raise ValueError("Unsupported media quality.")
+        return value
+
+    @field_validator("spotify_format")
+    @classmethod
+    def valid_spotify_format(cls, value: str) -> str:
+        if value not in {"mp3", "m4a", "flac", "opus", "ogg"}:
+            raise ValueError("Choose MP3, M4A, FLAC, Opus, or Ogg.")
+        return value
+
+    @field_validator("spotify_bitrate")
+    @classmethod
+    def valid_spotify_bitrate(cls, value: str) -> str:
+        if value not in {"auto", "128k", "192k", "256k", "320k", "disable"}:
+            raise ValueError("Unsupported audio conversion bitrate.")
         return value
 
     @field_validator("capture_types")
@@ -161,6 +177,8 @@ class SettingsPatch(BaseModel):
     capture_types: list[str] | None = None
     allowed_domains: list[str] | None = None
     media_quality: str | None = None
+    spotify_format: str | None = None
+    spotify_bitrate: str | None = None
     notifications: bool | None = None
 
 
@@ -193,5 +211,5 @@ class CaptureRequest(BaseModel):
     url: str = Field(min_length=1, max_length=8192)
     filename: str | None = Field(default=None, max_length=180)
     mime: str = Field(default="", max_length=200)
-    source: str = Field(default="extension", pattern="^(extension|clipboard|inbox)$")
+    source: str = Field(default="clipboard", pattern="^(clipboard|inbox)$")
     authorized: bool = False

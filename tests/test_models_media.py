@@ -26,23 +26,10 @@ def test_url_rejects_credentials_and_non_http():
     assert validate_url("http://127.0.0.1/private.zip", allow_private=True).startswith("http://")
 
 
-def test_hosted_demo_only_allows_its_own_fixture():
-    import tempfile
-    from pathlib import Path
-
-    from ndm.engine import DownloadManager
-    from ndm.store import Store
-    with tempfile.TemporaryDirectory() as directory:
-        manager = DownloadManager(Store(Path(directory) / "state"), hosted=True)
-        try:
-            manager.demo_port = 3000
-            assert manager.validate_target("http://127.0.0.1:3000/demo/file.zip")
-            with pytest.raises(ValueError):
-                manager.validate_target("http://127.0.0.1:3000/api/state")
-            with pytest.raises(ValueError):
-                manager.validate_target("http://169.254.169.254/latest/meta-data")
-        finally:
-            manager.shutdown()
+def test_private_targets_require_explicit_native_opt_in():
+    with pytest.raises(ValueError, match="blocked"):
+        validate_url("http://169.254.169.254/latest/meta-data")
+    assert validate_url("http://127.0.0.1/file.zip", allow_private=True)
 
 
 def test_settings_validate_colors_and_limits():
@@ -61,7 +48,8 @@ def test_spotify_is_recognized_not_extracted():
     result = inspect_media(url, allow_private=True)
     assert result["kind"] == "spotify"
     assert result["items"] == []
-    assert "Premium offline" in result["message"]
+    assert "spotDL" in result["message"]
+    assert "protected" in result["message"]
 
 
 def test_manifest_uses_extractor():

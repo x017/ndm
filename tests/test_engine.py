@@ -140,10 +140,10 @@ def test_media_requires_permission(manager):
 
 def test_capture_is_opt_in_and_allowlisted(manager):
     with pytest.raises(RuntimeError, match="off"):
-        manager.capture(url="https://example.com/a.mp4", filename=None, mime="video/mp4", source="extension", authorized=True)
+        manager.capture(url="https://example.com/a.mp4", filename=None, mime="video/mp4", source="clipboard", authorized=True)
     manager.update_settings(SettingsPatch(auto_capture=True, allowed_domains=["allowed.example"]))
     with pytest.raises(ValueError, match="allowlist"):
-        manager.capture(url="https://other.example/a.mp4", filename=None, mime="video/mp4", source="extension", authorized=True)
+        manager.capture(url="https://other.example/a.mp4", filename=None, mime="video/mp4", source="clipboard", authorized=True)
 
 
 def test_inbox_watches_authorized_link_files(manager, file_server):
