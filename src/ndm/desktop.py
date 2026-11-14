@@ -79,7 +79,7 @@ def complete_settings(settings: dict | None) -> dict:
 OPTIONS_KEYS = [
     "download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
     "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
-    "spotify_format", "spotify_bitrate", "proxy_enabled", "proxy_url", "proxy_username",
+    "firefox_cookies", "spotify_format", "spotify_bitrate", "proxy_enabled", "proxy_url", "proxy_username",
     "proxy_password", "proxy_remote_dns",
 ]
 
@@ -968,6 +968,8 @@ class Desktop:
                         domains = ctx.input("capture_domains", ", ".join(form["allowed_domains"]), label="Allowed hostnames (comma-separated; empty = any)", width=ui.FILL)
                         form["allowed_domains"] = [v.strip() for v in domains.split(",") if v.strip()]
                         ctx.text("Drop .txt or .url files containing media links into the inbox. No browser extension is required.", width=ui.FILL, size=11)
+                        form["firefox_cookies"] = ctx.checkbox("Automatically use my Firefox cookies", form["firefox_cookies"])
+                        ctx.text("Reads Firefox cookies locally for each new download or media inspection. Only cookies matching the destination are sent; NDM does not save cookie values. Does not apply to spotDL.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                     elif self.options_tab == 4:
                         formats = ["mp3", "m4a", "flac", "opus", "ogg"]
                         rates = ["auto", "128k", "192k", "256k", "320k", "disable"]

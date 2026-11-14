@@ -25,7 +25,7 @@ PROXY_SCHEMES = {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}
 PROXY_SCHEME_ALIASES = {"sockcs5": "socks5"}
 # Bump when the daemon's settings schema changes so the desktop can replace an
 # out-of-date background daemon instead of sending it fields it cannot accept.
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
@@ -188,6 +188,7 @@ class Settings(BaseModel):
     capture_types: list[str] = Field(default_factory=lambda: ["video", "audio"])
     allowed_domains: list[str] = Field(default_factory=list)
     media_quality: str = "best"
+    firefox_cookies: bool = False
     spotify_format: str = "mp3"
     spotify_bitrate: str = "192k"
     notifications: bool = True
@@ -295,6 +296,7 @@ class SettingsPatch(BaseModel):
     capture_types: list[str] | None = None
     allowed_domains: list[str] | None = None
     media_quality: str | None = None
+    firefox_cookies: bool | None = None
     spotify_format: str | None = None
     spotify_bitrate: str | None = None
     notifications: bool | None = None

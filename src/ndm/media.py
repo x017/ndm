@@ -11,7 +11,13 @@ import httpx
 import yt_dlp
 
 from .models import MEDIA_EXTENSIONS, category_for, safe_filename, validate_url
-from .network import httpx_options, safe_error, ytdlp_options
+from .network import (
+    FIREFOX_COOKIE_ERROR,
+    firefox_cookie_jar,
+    httpx_options,
+    safe_error,
+    ytdlp_options,
+)
 
 MEDIA_HOSTS = (
     "youtube.com", "youtu.be", "vimeo.com", "soundcloud.com", "bandcamp.com",
@@ -72,6 +78,10 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
+        except yt_dlp.cookies.CookieLoadError as exc:
+            # CookieLoadError is not a DownloadError. Keep profile/cookie details
+            # out of IPC errors and give the user a way to recover.
+            raise ValueError(FIREFOX_COOKIE_ERROR) from exc
         except yt_dlp.utils.DownloadError as exc:
             message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
             raise ValueError(safe_error(ValueError(message), settings)) from exc
@@ -117,7 +127,7 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
     size = 0
     try:
         with httpx.Client(follow_redirects=True, timeout=15, headers={"User-Agent": "NDM/0.1"},
-                          **httpx_options(settings),
+                          cookies=firefox_cookie_jar(settings), **httpx_options(settings),
                           event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private, resolve=resolve)]}) as client:
             with client.stream("GET", url) as response:
                 response.raise_for_status()
@@ -156,7 +166,7 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
                       "quality": "Original", "category": category_for(absolute),
                       "note": "Found on page", "needs_ffmpeg": False})
     return {"kind": "html", "title": parser.title.strip() or "Page media", "items": items[:30],
-            "message": "Only direct media elements are detected. Scripts, logins and protected streams are not bypassed." if items else "No direct audio or video links were found. Try a direct file URL."}
+            "message": "Only direct media elements are detected. Scripts and protected streams are not bypassed." if items else "No direct audio or video links were found. Try a direct file URL."}
 
 
 def quality_format(quality: str, ffmpeg: bool) -> str:

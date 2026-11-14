@@ -24,7 +24,13 @@ from .models import (
     safe_filename,
     validate_url,
 )
-from .network import configure_environment, httpx_options, safe_error
+from .network import (
+    FIREFOX_COOKIE_ERROR,
+    configure_environment,
+    firefox_cookie_jar,
+    httpx_options,
+    safe_error,
+)
 from .store import Store
 
 CHUNK = 128 * 1024
@@ -361,7 +367,7 @@ class DownloadManager:
         try:
             with httpx.Client(timeout=httpx.Timeout(20, read=30), follow_redirects=True,
                               headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
-                              **httpx_options(self.settings),
+                              cookies=firefox_cookie_jar(self.settings), **httpx_options(self.settings),
                               event_hooks={"request": [lambda request: self.validate_target(str(request.url))]}) as client:
                 for attempt in range(2):
                     try:
@@ -514,7 +520,8 @@ class DownloadManager:
                 if stop.is_set() or isinstance(exc, yt_dlp.utils.DownloadCancelled):
                     task.update(status="paused", speed=0, phase="paused")
                 else:
-                    task.update(status="error", speed=0, error=str(exc)[:500], phase="error")
+                    message = FIREFOX_COOKIE_ERROR if isinstance(exc, yt_dlp.cookies.CookieLoadError) else str(exc)
+                    task.update(status="error", speed=0, error=safe_error(ValueError(message), self.settings), phase="error")
                     self.store.event("Media download needs attention", task["error"], "warning")
                 self._mark(task_id)
         finally:
