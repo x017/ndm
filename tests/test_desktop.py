@@ -356,3 +356,114 @@ def test_right_click_opens_spotify_result_menu(tmp_path, monkeypatch):
             frame(desktop, ctx)
         assert _right_click_until(desktop, ctx, 420, range(150, 600, 5), opened) is not None
         assert opened[0] == "t1"
+
+
+def _download_row_y(desktop, ctx, x=300):
+    """Find a y inside the first download row by right-clicking until it opens."""
+    opened = []
+    original = desktop._row_context_menu
+
+    def spy(ctx_, task):
+        opened.append(task["id"])
+        original(ctx_, task)
+
+    desktop._row_context_menu = spy
+    try:
+        for y in range(90, 260, 2):
+            opened.clear()
+            ctx.input_mouse_move(x, y)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, True)
+            frame(desktop, ctx)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, False)
+            frame(desktop, ctx)
+            if opened:
+                return y
+    finally:
+        desktop._row_context_menu = original
+    return None
+
+
+def test_right_click_opens_menu_from_every_column(tmp_path, monkeypatch):
+    """The menu must open from any column, not just the filename anchor."""
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    opened = []
+    original = desktop._row_context_menu
+
+    def spy(ctx, task):
+        opened.append(task["id"])
+        original(ctx, task)
+
+    desktop._row_context_menu = spy
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        row_y = _download_row_y(desktop, ctx)
+        assert row_y is not None
+        # Size, Status, Progress, Time Left, Rate, Last Try, Description
+        for x in (700, 790, 880, 960, 1050, 1150, 1240):
+            opened.clear()
+            ctx.input_key(ui.Key.ESCAPE, True)
+            frame(desktop, ctx)
+            ctx.input_key(ui.Key.ESCAPE, False)
+            frame(desktop, ctx)
+            ctx.input_mouse_move(x, row_y)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, True)
+            frame(desktop, ctx)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, False)
+            frame(desktop, ctx)
+            assert opened, f"right-click at x={x} did not open the row menu"
+
+
+def test_right_click_outside_the_table_does_not_open_row_menu(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    opened = []
+    original = desktop._row_context_menu
+    desktop._row_context_menu = lambda ctx, task: (opened.append(task["id"]), original(ctx, task))[1]
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        row_y = _download_row_y(desktop, ctx)
+        assert row_y is not None
+        ctx.input_key(ui.Key.ESCAPE, True)
+        frame(desktop, ctx)
+        ctx.input_key(ui.Key.ESCAPE, False)
+        frame(desktop, ctx)
+        opened.clear()
+        # Sidebar is left of the table content; toolbar is above the first row.
+        for x, y in ((60, row_y), (300, 52)):
+            ctx.input_mouse_move(x, y)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, True)
+            frame(desktop, ctx)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, False)
+            frame(desktop, ctx)
+        assert not opened
+
+
+def test_row_menu_suppressed_while_a_dialog_is_open(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    opened = []
+    original = desktop._row_context_menu
+    desktop._row_context_menu = lambda ctx, task: (opened.append(task["id"]), original(ctx, task))[1]
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        row_y = _download_row_y(desktop, ctx)
+        assert row_y is not None
+        desktop.open_dialog("about")
+        frame(desktop, ctx)
+        opened.clear()
+        ctx.input_mouse_move(1240, row_y)
+        ctx.input_mouse_button(ui.MouseButton.RIGHT, True)
+        frame(desktop, ctx)
+        ctx.input_mouse_button(ui.MouseButton.RIGHT, False)
+        frame(desktop, ctx)
+        assert not opened

@@ -821,6 +821,26 @@ class Desktop:
         tasks.sort(key=keys.get(self.sort.column, keys[6]), reverse=self.sort.descending)
         return tasks
 
+    def _row_popover(self, ctx: ui.UI, anchor_label: str, *, band_top: float | None = None,
+                     enabled: bool = True):
+        """Right-click menu for the whole row, not just the filename cell.
+
+        ctx.context_menu anchors to the last interactive item, so it only ever
+        covered the filename. A table row exposes no rect of its own, but the
+        filename button spans the row's full height, so its band identifies the
+        row. A right-click anywhere in that band opens a popover anchored to the
+        button. band_top is the previous row's bottom, which claims the padding
+        between rows without letting two rows match the same click.
+        """
+        rect = ctx.get_rect(ctx.make_id(anchor_label))
+        self._row_band_bottom = rect.y + rect.h
+        mouse = ctx.mouse_pos
+        top = rect.y if band_top is None else min(band_top, rect.y)
+        if (enabled and rect.h > 0 and top <= mouse.y <= rect.y + rect.h
+                and mouse.x >= rect.x and ctx.mouse_clicked(ui.MouseButton.RIGHT)):
+            ctx.popover_open("row_menu")
+        return ctx.popover("row_menu", placement=ui.Placement.BOTTOM_START, width=230)
+
     def _select_row(self, ctx: ui.UI, task: dict) -> None:
         """Shared selection + double-click handling for row and filename clicks."""
         if self._select_frame == self.frame_no and self.last_row == task["id"]:
@@ -935,6 +955,7 @@ class Desktop:
         with ctx.table("downloads", columns, sort=self.sort, height=ui.FILL, compact=True,
                        striped=True, selectable=True) as table:
             if table:
+                band_top = None
                 for task in tasks:
                     with ctx.id_scope(task["id"]):
                         clicked = table.row(task["id"] in self.selected)
@@ -949,9 +970,11 @@ class Desktop:
                             full_width=True, selected=task["id"] in self.selected)
                         if clicked or name_clicked:
                             self._select_row(ctx, task)
-                        with ctx.context_menu("row_actions") as menu:
+                        with self._row_popover(ctx, task["name"], band_top=band_top,
+                                               enabled=not self.dialog) as menu:
                             if menu:
                                 self._row_context_menu(ctx, task)
+                        band_top = self._row_band_bottom
                         table.cell_text(size_label(task))
                         table.cell_text(status_text(task))
                         table.cell()
@@ -1161,6 +1184,7 @@ class Desktop:
                                ui.TableColumn("Album", width=180), ui.TableColumn("Duration", width=75)]
                     with ctx.table("spotify_tracks", columns, height=245, compact=True, striped=True, selectable=True) as table:
                         if table:
+                            spotify_band = None
                             for item in items:
                                 with ctx.id_scope(item["id"]):
                                     row_clicked = table.row(item["id"] in self.spotify_selected)
@@ -1171,9 +1195,10 @@ class Desktop:
                                         selected=item["id"] in self.spotify_selected)
                                     if row_clicked or title_clicked:
                                         self.spotify_selected.symmetric_difference_update({item["id"]})
-                                    with ctx.context_menu("spotify_row_actions") as menu:
+                                    with self._row_popover(ctx, item["name"], band_top=spotify_band) as menu:
                                         if menu:
                                             self._spotify_row_menu(ctx, item, items)
+                                    spotify_band = self._row_band_bottom
                                     table.cell_text(item["artist"])
                                     table.cell_text(item["album"])
                                     duration = item["duration"]
@@ -1455,6 +1480,7 @@ class Desktop:
                 columns = [ui.TableColumn("File", width=ui.GROW(1)), ui.TableColumn("Size", width=90), ui.TableColumn("Folder", width=280)]
                 with ctx.table("local_audio", columns, height=330, compact=True, striped=True, selectable=True) as table:
                     if table:
+                        library_band = None
                         for index, track in enumerate(self.library):
                             with ctx.id_scope(str(index)):
                                 row_clicked = table.row(index == self.library_selection)
@@ -1469,7 +1495,7 @@ class Desktop:
                                         os_open_path(track["path"])
                                     except OSError as exc:
                                         self.error = safe_error(exc, self.state.get("settings", {}))
-                                with ctx.context_menu("library_row_actions") as menu:
+                                with self._row_popover(ctx, track["name"], band_top=library_band) as menu:
                                     if menu:
                                         self.library_selection = index
                                         if ctx.menu_item("Play file", icon=ui.Icon.PLAY):
@@ -1482,6 +1508,7 @@ class Desktop:
                                         ctx.menu_separator()
                                         if ctx.menu_item("Copy file path", icon=ui.Icon.COPY):
                                             self._copy_to_clipboard(ctx, track["path"], "Path")
+                                library_band = self._row_band_bottom
                                 table.cell_text(format_bytes(track["size"]))
                                 table.cell_text(track["folder"])
                 ctx.text("Click a file to open it in your desktop audio player. Files stay on this computer.", size=11, color=ui.Color.TEXT_SECONDARY)
