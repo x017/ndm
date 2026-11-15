@@ -379,6 +379,43 @@ def estimated_size(song: dict, audio_format: str, bitrate: str) -> int:
     return int(duration * kilobits * 125) if duration > 0 and kilobits > 0 else 0
 
 
+def _trace_search(provider, song, settings: dict | None) -> None:
+    """Log the real YouTube Music search: query, candidates, and failures.
+
+    spotDL logs its scoring at a custom MATCH level and its query at DEBUG, so
+    with a normal INFO log the entire matching step was a black box: a proxy
+    that died inside ``client.search`` looked identical to "no match found".
+    Wrap the provider's own search entry point so every query, every candidate
+    it returned, and any exception it raised are recorded against the track.
+    """
+    original = provider.get_results
+    label = song.display_name
+
+    def traced(search_term: str, *args, **kwargs):
+        log.info("YTM query=%r track=%r", redact(search_term), label)
+        began = time.monotonic()
+        try:
+            results = original(search_term, *args, **kwargs)
+        except Exception as exc:
+            # This is the network leg that actually fails behind a bad proxy.
+            log_failure(log, "YouTube Music search", exc, settings=settings,
+                        track=label, query=redact(search_term))
+            raise
+        elapsed = time.monotonic() - began
+        log.info("YTM query=%r returned %s candidate(s) in %.2fs",
+                 redact(search_term), len(results or []), elapsed)
+        for index, item in enumerate(results or [], start=1):
+            log.info("YTM   #%d %s | %s | %ss | verified=%s | %s", index,
+                     getattr(item, "name", "?"), getattr(item, "author", "?"),
+                     getattr(item, "duration", "?"), getattr(item, "verified", "?"),
+                     redact(getattr(item, "url", "?")))
+        if not results:
+            log.warning("YTM query=%r returned nothing usable", redact(search_term))
+        return results
+
+    provider.get_results = traced
+
+
 def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None, stop=None) -> dict:
     """Use spotDL only to select a public YouTube Music match for a Spotify track.
 
@@ -451,6 +488,7 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
     match_logger = YtdlpLogger("ndm.spotify.match", "[match]")
     try:
         _configure_audio_provider(provider, settings)
+        _trace_search(provider, song, settings)
         # Capture spotDL's own yt-dlp candidate inspection instead of letting its
         # quiet/no_warnings settings discard the network detail.
         provider.audio_handler.params["logger"] = match_logger

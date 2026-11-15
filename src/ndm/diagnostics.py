@@ -22,6 +22,11 @@ import traceback
 from pathlib import Path
 
 LOG_FILENAME = "ndm.log"
+# spotDL logs its per-candidate scoring at a custom MATCH level *below* DEBUG,
+# so a DEBUG handler still discards it. Capture it explicitly: the candidate
+# scores are the whole point of a matching trace.
+_MATCH_LEVEL = 5
+logging.addLevelName(_MATCH_LEVEL, "MATCH")
 _MAX_BYTES = 2_000_000
 _BACKUPS = 3
 _CONFIGURED: Path | None = None
@@ -126,7 +131,9 @@ def setup_logging(data_dir: Path, *, debug: bool | None = None, rotate: bool = T
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s"))
     handler.addFilter(_RedactingFilter())
-    handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    # The file always keeps upstream's matching detail (MATCH=5 and DEBUG).
+    # NDM's own debug stays opt-in via the root level below.
+    handler.setLevel(_MATCH_LEVEL)
     root = logging.getLogger()
     for existing in list(root.handlers):
         if getattr(existing, "_ndm_handler", False):
@@ -142,7 +149,9 @@ def setup_logging(data_dir: Path, *, debug: bool | None = None, rotate: bool = T
             existing.addFilter(_RedactingFilter())
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
     # Upstream chatter stays in the file; it must not spam the user's terminal.
-    logging.getLogger("spotdl").setLevel(logging.DEBUG if verbose else logging.INFO)
+    # Matching detail is always recorded, because a failed match is otherwise
+    # indistinguishable from a failed transfer.
+    logging.getLogger("spotdl").setLevel(_MATCH_LEVEL)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     _CONFIGURED = path
@@ -155,7 +164,7 @@ def get_logger(name: str) -> logging.Logger:
 
 def configure_upstream_logging() -> None:
     """Keep spotDL's matching detail available in the log instead of discarding it."""
-    logging.getLogger("spotdl").setLevel(logging.DEBUG if debug_enabled() else logging.INFO)
+    logging.getLogger("spotdl").setLevel(_MATCH_LEVEL)
 
 
 class YtdlpLogger:

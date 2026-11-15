@@ -164,7 +164,11 @@ class NativeDaemon:
         if operation not in {"state", "health"}:
             keys = sorted(payload)
             count = len(payload.get("songs") or []) if operation == "spotify.queue" else ""
-            log.info("IPC %s%s keys=%s", operation, f" songs={count}" if count != "" else "", keys)
+            if operation == "action":
+                log.debug("IPC %s keys=%s", operation, keys)
+            else:
+                log.info("IPC %s%s keys=%s", operation,
+                         f" songs={count}" if count != "" else "", keys)
             log.debug("IPC %s payload=%s", operation, redact(payload))
         if operation == "health":
             return {"name": "ndm", "transport": "local-ipc", "pid": os.getpid(),

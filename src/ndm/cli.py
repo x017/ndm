@@ -115,6 +115,8 @@ def main(argv: list[str] | None = None) -> None:
     logs.add_argument("--path", action="store_true", help="Print only the log file path")
     logs.add_argument("--job", default="", help="Show only lines for one download id (see the queue)")
     logs.add_argument("--grep", default="", help="Show only lines containing this text (e.g. FAILED, STREAM)")
+    logs.add_argument("--match", action="store_true",
+                      help="Show only the Spotify matching trace (queries, candidates, scores, errors)")
     doctor = sub.add_parser("doctor", help="Test Spotify/YouTube connectivity and show tool versions")
     common(doctor)
     compare = sub.add_parser("match-check", help="Compare the NDM and spotDL matchers without downloading")
@@ -199,7 +201,8 @@ def main(argv: list[str] | None = None) -> None:
                 # Read a wider window before filtering so --job/--grep can reach back
                 # past other jobs' chatter, then keep only the requested trailing lines.
                 wanted = max(1, args.lines)
-                window = wanted * 40 if (args.job or args.grep) else wanted
+                filtering = bool(args.job or args.grep or args.match)
+                window = wanted * 40 if filtering else wanted
                 try:
                     result = request(data_dir, "diagnostics", {"lines": window}, timeout=15)
                 except (OSError, ValueError, RuntimeError, EOFError):
@@ -207,10 +210,13 @@ def main(argv: list[str] | None = None) -> None:
                     path, text = log_path(data_dir), tail(data_dir, window)
                 else:
                     path, text = result["path"], result["log"]
-                if args.job or args.grep:
+                if filtering:
+                    terms = ("matching", "ytm ", "matched", "match]", "spotdl", "search",
+                             "stream", "score", "candidate")
                     rows = [r for r in text.splitlines()
                             if (not args.job or args.job in r)
-                            and (not args.grep or args.grep.lower() in r.lower())]
+                            and (not args.grep or args.grep.lower() in r.lower())
+                            and (not args.match or any(t in r.lower() for t in terms))]
                     text = "\n".join(rows[-wanted:]) or "No log lines matched that filter."
                 print(f"Log: {path}")
                 print(text)
