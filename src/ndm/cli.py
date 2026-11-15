@@ -109,6 +109,12 @@ def main(argv: list[str] | None = None) -> None:
     for name, help_text in [("status", "Print the queue as JSON"), ("stop", "Stop the background daemon")]:
         p = sub.add_parser(name, help=help_text)
         common(p)
+    logs = sub.add_parser("logs", help="Show the diagnostics log (use after a failed download)")
+    common(logs)
+    logs.add_argument("--lines", type=int, default=80, help="How many trailing lines to print")
+    logs.add_argument("--path", action="store_true", help="Print only the log file path")
+    doctor = sub.add_parser("doctor", help="Test Spotify/YouTube connectivity and show tool versions")
+    common(doctor)
     for name in ("pause", "resume", "remove"):
         p = sub.add_parser(name, help=f"{name.title()} a queued download")
         common(p)
@@ -137,6 +143,47 @@ def main(argv: list[str] | None = None) -> None:
             print(result["message"])
             print_result(request(data_dir, "spotify.queue", {"songs": [i["song"] for i in result["items"]],
                                                              "start_paused": args.paused}))
+        elif command == "logs":
+            from .diagnostics import log_path, tail
+            if args.path:
+                print(log_path(data_dir))
+            else:
+                try:
+                    result = request(data_dir, "diagnostics", {"lines": args.lines}, timeout=15)
+                except (OSError, ValueError, RuntimeError, EOFError):
+                    # The daemon may be stopped; the log file is still readable.
+                    print(f"Log: {log_path(data_dir)}")
+                    print(tail(data_dir, args.lines))
+                else:
+                    print(f"Log: {result['path']}")
+                    print(result["log"])
+        elif command == "doctor":
+            from .diagnostics import check_connectivity, environment, log_path, setup_logging
+            try:
+                state = request(data_dir, "state", timeout=10)
+                settings = state.get("settings", {})
+            except (OSError, ValueError, RuntimeError, EOFError):
+                from .models import Settings
+                from .store import Store
+                setup_logging(data_dir)
+                try:
+                    settings = Settings.model_validate(Store(data_dir).get_meta("settings", {})).model_dump()
+                except Exception:
+                    settings = Settings().model_dump()
+            print("Versions/tools:")
+            for key, value in environment(settings).items():
+                print(f"  {key}: {value}")
+            print(f"\nLog file: {log_path(data_dir)}")
+            print("\nConnectivity (through your configured proxy):")
+            failed = False
+            for row in check_connectivity(settings):
+                mark = "OK  " if row["ok"] else "FAIL"
+                print(f"  {mark} {row['url']} — {row['detail']}")
+                if row.get("hint"):
+                    print(f"       {row['hint']}")
+                failed = failed or not row["ok"]
+            if failed:
+                print("\nAt least one host is unreachable. That is a network/proxy/DNS issue, not a tagging bug.")
         elif command in {"pause", "resume", "remove"}:
             print_result(request(data_dir, "action", {"id": args.id, "action": "delete" if command == "remove" else command}))
         else:

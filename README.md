@@ -97,6 +97,9 @@ ndm pause <task-id>
 ndm resume <task-id>
 ndm remove <task-id>                 # keeps completed files
 ndm spotify https://open.spotify.com/playlist/...
+ndm logs                             # read the failure log after an error
+ndm logs --path                      # print only the log file location
+ndm doctor                           # test Spotify/YouTube reachability + tools
 ndm stop                             # stop the background daemon
 ```
 
@@ -241,9 +244,42 @@ Spotify account passwords or launch an OAuth web server. Advanced users can set
 `SPOTIPY_CLIENT_ID` and `SPOTIPY_CLIENT_SECRET` for their own official Spotify API
 application before launching NDM; default spotDL metadata access needs no login.
 
+### When a download fails
+
+Failures are recorded in a rotating log at `NDM_HOME/logs/ndm.log` (default
+`~/.local/share/ndm/logs/ndm.log`, 2 MB × 3 backups). Three ways to read it:
+
+- **Tools → Diagnostics…** in the desktop, or **Diagnostics** in a failed row's
+  Properties. It shows the log tail, resolved `ffmpeg`/`ffprobe`/`deno` paths,
+  library versions, and a **Test connection** button that probes
+  `open.spotify.com`, `music.youtube.com`, and `www.youtube.com` through your
+  configured proxy.
+- `ndm logs` (works even when the daemon is stopped) and `ndm doctor`.
+- Open the log file directly.
+
+The queue row itself leads with an actionable cause — DNS, proxy, TLS
+interception, rate limiting, a YouTube sign-in/bot check, a missing JavaScript
+runtime, or missing FFmpeg — followed by the upstream message. Full upstream
+detail (yt-dlp warnings, the exception chain, and a traceback) goes to the log,
+tagged with the task id so a single track can be traced.
+
+Set `NDM_DEBUG=1` for verbose yt-dlp/spotDL output, including each retried
+request:
+
+```bash
+ndm stop
+NDM_DEBUG=1 ndm daemon               # verbose; then retry the track
+```
+
+Proxy passwords, proxy usernames, `Cookie`/`Set-Cookie` values, and
+`Authorization` headers are redacted before anything is written or displayed,
+so the log is safe to share when reporting a problem.
+
 ## Data and security
 
 - Queue/settings/events: SQLite under `NDM_HOME` (default `~/.local/share/ndm`).
+- Diagnostics: `NDM_HOME/logs/ndm.log`, rotating, with credentials and cookie
+  values redacted before writing.
 - Downloads: `~/Downloads/NDM`, split by category, configurable in Options.
 - A store lock prevents two daemons from owning the same state directory.
 - IPC uses a 32-byte private challenge key in `ipc.key`; the POSIX socket is

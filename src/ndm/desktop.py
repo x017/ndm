@@ -118,6 +118,20 @@ def status_text(task: dict) -> str:
     return {"queued": "Queued", "paused": "Stopped", "completed": "Complete", "error": "Error"}.get(task["status"], task["status"])
 
 
+def clip_error(text: str, limit: int) -> str:
+    """Shorten an error for a banner without dropping the trailing log pointer.
+
+    Failure messages end with "full log: ndm logs"; a plain slice would cut off
+    the one part that tells the user where the full explanation lives.
+    """
+    if len(text) <= limit:
+        return text
+    tail = " | full log: ndm logs"
+    if text.endswith(tail) and limit > len(tail) + 20:
+        return text[:limit - len(tail) - 1].rstrip() + "…" + tail
+    return text[:limit].rstrip() + "…"
+
+
 def complete_settings(settings: dict | None) -> dict:
     """Fill settings added since a daemon/state file was created.
 
@@ -161,6 +175,10 @@ class Desktop:
         self.notice = ""
         self.delete_ids: list[str] = []
         self.details_id = None
+        self.diagnostics_text = ""
+        self.diagnostics_path = ""
+        self.diagnostics_env: dict = {}
+        self.diagnostics_check: list[dict] = []
         self.exit_after_stop = False
         self.url = ""
         self.filename = ""
@@ -359,6 +377,76 @@ class Desktop:
         self.busy = ""
         self.error = safe_error(exc, self.state.get("settings", {}))
 
+    def load_diagnostics(self) -> None:
+        """Read the daemon's log off the UI thread."""
+        if self.busy:
+            return
+        self.busy = "diagnostics"
+        self.error = ""
+
+        def work():
+            return self.call("diagnostics", {"lines": 200}, timeout=20)
+
+        def done(result: dict) -> None:
+            self.busy = ""
+            self.diagnostics_path = result.get("path", "")
+            self.diagnostics_text = result.get("log", "")
+            self.diagnostics_env = result.get("environment", {})
+
+        self.runner.submit(work, on_done=done, on_error=self._operation_error)
+
+    def check_diagnostics(self) -> None:
+        if self.busy:
+            return
+        self.busy = "diagnostics"
+        self.error = ""
+
+        def work():
+            return self.call("diagnostics.check", {}, timeout=90)
+
+        def done(result: dict) -> None:
+            self.busy = ""
+            self.diagnostics_check = result.get("results", [])
+
+        self.runner.submit(work, on_done=done, on_error=self._operation_error)
+
+    def _diagnostics_dialog(self, ctx: ui.UI, state: dict) -> None:
+        with ctx.dialog("Diagnostics", True, width=760) as dialog:
+            if dialog:
+                path = self.diagnostics_path or state.get("daemon", {}).get("log_path", "")
+                ctx.text("Failure detail is written here. Proxy passwords and cookie values are redacted.",
+                         size=11, color=ui.Color.TEXT_SECONDARY, width=ui.FILL)
+                if path:
+                    ctx.text(path, size=11, selectable=True, width=ui.FILL)
+                ctx.text("For verbose upstream output, stop the daemon and run: NDM_DEBUG=1 ndm daemon",
+                         size=11, color=ui.Color.TEXT_SECONDARY, width=ui.FILL)
+                self._error_in_dialog(ctx)
+                if self.diagnostics_env:
+                    facts = self.diagnostics_env
+                    ctx.text(f"ffmpeg: {facts.get('ffmpeg')} · ffprobe: {facts.get('ffprobe')} · deno: {facts.get('deno')}",
+                             size=11, width=ui.FILL)
+                    ctx.text(f"yt-dlp {facts.get('yt_dlp')} · spotDL {facts.get('spotdl')} · proxy {facts.get('proxy_enabled')} · cookies {facts.get('firefox_cookies')}",
+                             size=11, width=ui.FILL)
+                for row in self.diagnostics_check:
+                    tone = ui.Tone.SUCCESS if row.get("ok") else ui.Tone.DANGER
+                    ctx.alert(f"{row.get('url')} — {row.get('detail')}"
+                              + (f" · {row['hint']}" if row.get("hint") else ""), tone=tone)
+                with ctx.row(gap=10):
+                    if ctx.button("Refresh log", icon=ui.Icon.REFRESH_CW, disabled=bool(self.busy)):
+                        self.load_diagnostics()
+                    if ctx.button("Test connection", icon=ui.Icon.LINK, disabled=bool(self.busy)):
+                        self.check_diagnostics()
+                    if self.busy == "diagnostics":
+                        ctx.text("Working…", size=11, color=ui.Color.TEXT_SECONDARY)
+                body = self.diagnostics_text or "No log entries yet. Queue a track, let it fail, then press Refresh log."
+                with ctx.scroll("diagnostics_log", height=320, width=ui.FILL, gap=4):
+                    ctx.text(body, size=11, font=ui.FontRole.MONO, selectable=True, width=ui.FILL)
+                with ctx.dialog_footer():
+                    if ctx.button("Close"):
+                        self.dialog = ""
+            if not dialog.open:
+                self.dialog = ""
+
     def _cancel_spotify_stream(self) -> None:
         self.spotify_search_id += 1
         handle = self.spotify_handle
@@ -541,7 +629,7 @@ class Desktop:
             self._menus(ctx, settings)
             self._toolbar(ctx)
             if self.error and not self.dialog:
-                if ctx.alert(self.error[:350], tone=ui.Tone.WARNING, dismissible=True):
+                if ctx.alert(clip_error(self.error, 350), tone=ui.Tone.WARNING, dismissible=True):
                     self.error = ""
             if self.notice and not self.dialog:
                 if ctx.alert(self.notice, tone=ui.Tone.SUCCESS, dismissible=True):
@@ -628,6 +716,9 @@ class Desktop:
                         self.open_dialog("media")
                     if ctx.menu_item("Offline audio files…", icon=ui.Icon.MUSIC):
                         self.load_library()
+                    if ctx.menu_item("Diagnostics…", icon=ui.Icon.FILE_TEXT):
+                        self.open_dialog("diagnostics")
+                        self.load_diagnostics()
                     if ctx.menu_item("Options…", icon=ui.Icon.SETTINGS):
                         self.open_dialog("options")
             with ctx.menu_bar_menu("Help", mnemonic="H") as menu:
@@ -828,7 +919,7 @@ class Desktop:
         if self.error:
             # Keep dialog errors visible until explicitly dismissed; an auto-
             # dismissible alert can disappear in the same click that caused it.
-            ctx.alert(self.error[:450], tone=ui.Tone.DANGER)
+            ctx.alert(clip_error(self.error, 450), tone=ui.Tone.DANGER)
             if ctx.button("Dismiss error", size=ui.ControlSize.SM):
                 self.error = ""
 
@@ -843,6 +934,8 @@ class Desktop:
             self._options_dialog(ctx, state)
         elif self.dialog == "details":
             self._details_dialog(ctx, state)
+        elif self.dialog == "diagnostics":
+            self._diagnostics_dialog(ctx, state)
         elif self.dialog == "library":
             self._library_dialog(ctx)
         elif self.dialog in {"delete", "shutdown", "about"}:
@@ -1184,6 +1277,9 @@ class Desktop:
                 with ctx.dialog_footer():
                     if ctx.button("Close"):
                         self.dialog = ""
+                    if task["error"] and ctx.button("Diagnostics", icon=ui.Icon.FILE_TEXT):
+                        self.open_dialog("diagnostics")
+                        self.load_diagnostics()
                     if task["status"] == "completed":
                         if ctx.button("Show in Folder", icon=ui.Icon.FOLDER):
                             self.perform("open", {"id": task["id"], "folder": True})

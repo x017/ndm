@@ -13,6 +13,14 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import spotify
+from .diagnostics import (
+    check_connectivity,
+    environment,
+    log_environment,
+    log_path,
+    setup_logging,
+    tail,
+)
 from .engine import DownloadManager
 from .ipc import endpoint, listener, request
 from .media import inspect_media
@@ -147,6 +155,7 @@ class NativeDaemon:
             result["daemon"]["spotify"] = spotify.availability()
             result["daemon"]["transport"] = endpoint(self.data_dir)[1]
             result["daemon"]["settings_schema"] = SETTINGS_SCHEMA_VERSION
+            result["daemon"]["log_path"] = str(log_path(self.data_dir))
             return result
         if operation == "add":
             return self.manager.add(**NewDownload.model_validate(payload).model_dump())
@@ -172,6 +181,13 @@ class NativeDaemon:
             command = SpotifyQueue.model_validate(payload)
             return {"tasks": [self.manager.add_spotify(song, start_paused=command.start_paused)
                               for song in command.songs]}
+        if operation == "diagnostics":
+            lines = int(payload.get("lines", 80))
+            return {"path": str(log_path(self.data_dir)), "log": tail(self.data_dir, lines),
+                    "environment": environment(self.manager.settings.model_dump())}
+        if operation == "diagnostics.check":
+            return {"path": str(log_path(self.data_dir)),
+                    "results": check_connectivity(self.manager.settings.model_dump())}
         if operation == "library":
             return {"tracks": self.manager.library()}
         if operation == "playlist":
@@ -217,8 +233,13 @@ class NativeDaemon:
 
 
 def run_daemon(*, data_dir: Path | None = None, allow_private: bool = True) -> None:
+    directory = (data_dir or default_data_dir()).expanduser().resolve()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    daemon = NativeDaemon(data_dir or default_data_dir(), allow_private=allow_private)
+    path = setup_logging(directory)
+    log_environment(log)
+    log.info("Diagnostics log: %s (set NDM_DEBUG=1 for verbose upstream output)", path)
+    daemon = NativeDaemon(directory, allow_private=allow_private)
+    log_environment(log, daemon.manager.settings.model_dump())
 
     def stop(signum, frame):
         daemon.stop_event.set()

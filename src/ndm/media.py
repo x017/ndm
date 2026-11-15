@@ -11,6 +11,14 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 import yt_dlp
 
+from .diagnostics import (
+    YtdlpLogger,
+    debug_enabled,
+    failure_message,
+    get_logger,
+    log_failure,
+    redact,
+)
 from .models import MEDIA_EXTENSIONS, category_for, safe_filename, validate_url
 from .network import (
     FIREFOX_COOKIE_ERROR,
@@ -19,6 +27,8 @@ from .network import (
     safe_error,
     ytdlp_options,
 )
+
+log = get_logger("ndm.media")
 
 MEDIA_HOSTS = (
     "youtube.com", "youtu.be", "vimeo.com", "soundcloud.com", "bandcamp.com",
@@ -261,6 +271,12 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
         if data.get("status") == "started":
             progress(None, None, "processing")
 
+    # A logger object makes yt-dlp bypass quiet/no_warnings, so the network and
+    # extractor warnings that explain a failure are captured instead of dropped.
+    logger = YtdlpLogger(context=f"[{task.get('source') or 'media'}]")
+    log.debug("Transfer start url=%s destination=%s proxy=%s cookies=%s",
+              redact(task["url"]), destination, bool((settings or {}).get("proxy_enabled")),
+              bool((settings or {}).get("firefox_cookies")))
     options = {
         "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
         "continuedl": True, "overwrites": False, "retries": 3, "fragment_retries": 3,
@@ -268,7 +284,9 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
         "outtmpl": str(destination.with_suffix("")) + ".%(ext)s",
         "format": task.get("media_format") or quality_format(task.get("media_quality", "best"), ffmpeg),
         "progress_hooks": [hook], "postprocessor_hooks": [post_hook],
-        "paths": {"home": str(destination.parent)},
+        # No "paths" home: outtmpl is already absolute, and yt-dlp warns that
+        # --paths is ignored, which would add noise to every diagnostics log.
+        "logger": logger, "verbose": debug_enabled(),
         **ytdlp_options(settings or {}),
     }
     if rate_limit:
@@ -291,25 +309,33 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
         options["merge_output_format"] = "mp4" if task["category"] == "video" else task.get("audio_ext", "m4a")
     if task.get("js_runtimes"):
         options["js_runtimes"] = task["js_runtimes"]
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(task["url"], download=True)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(task["url"], download=True)
+            if stop.is_set():
+                raise yt_dlp.utils.DownloadCancelled()
+            downloads = info.get("requested_downloads") or []
+            for item in downloads:
+                candidate = Path(item.get("filepath") or "")
+                if candidate.is_file() and candidate.suffix != ".part":
+                    if expected_ext:
+                        converted = candidate.with_suffix("." + expected_ext)
+                        if converted.is_file():
+                            return converted
+                    return candidate
+            if expected_ext:
+                converted = destination.with_suffix("." + expected_ext)
+                if converted.is_file():
+                    return converted
+            candidates = [p for p in destination.parent.glob(destination.stem + ".*")
+                          if p.is_file() and p.suffix not in {".part", ".ytdl", ".json"}]
+            if not candidates:
+                raise OSError("The extractor finished without creating a media file.")
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+    except yt_dlp.utils.DownloadCancelled:
+        raise
+    except Exception as exc:
         if stop.is_set():
-            raise yt_dlp.utils.DownloadCancelled()
-        downloads = info.get("requested_downloads") or []
-        for item in downloads:
-            candidate = Path(item.get("filepath") or "")
-            if candidate.is_file() and candidate.suffix != ".part":
-                if expected_ext:
-                    converted = candidate.with_suffix("." + expected_ext)
-                    if converted.is_file():
-                        return converted
-                return candidate
-        if expected_ext:
-            converted = destination.with_suffix("." + expected_ext)
-            if converted.is_file():
-                return converted
-        candidates = [p for p in destination.parent.glob(destination.stem + ".*")
-                      if p.is_file() and p.suffix not in {".part", ".ytdl", ".json"}]
-        if not candidates:
-            raise OSError("The extractor finished without creating a media file.")
-        return max(candidates, key=lambda p: p.stat().st_mtime)
+            raise yt_dlp.utils.DownloadCancelled() from exc
+        log_failure(log, "media transfer", exc, url=task["url"], source=task.get("source"))
+        raise ValueError(failure_message(exc, detail=logger.summary())) from exc

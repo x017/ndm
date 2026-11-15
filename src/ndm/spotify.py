@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
-import logging
 import os
 import re
 import shutil
@@ -17,6 +16,15 @@ from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .diagnostics import (
+    YtdlpLogger,
+    configure_upstream_logging,
+    debug_enabled,
+    failure_message,
+    get_logger,
+    log_failure,
+    redact,
+)
 from .models import safe_filename
 from .network import (
     configure_environment,
@@ -26,6 +34,8 @@ from .network import (
     proxy_url,
     requests_proxies,
 )
+
+log = get_logger("ndm.spotify")
 
 _INIT_LOCK = threading.RLock()
 _CLIENT_INITIALIZED = False
@@ -216,7 +226,7 @@ def search(url: str, data_dir: Path, *, limit: int = 500, settings: dict | None 
         raise ValueError("Paste a full Spotify track, album, or playlist link from open.spotify.com.")
     if availability()["installed"] is False:
         raise RuntimeError("spotDL is not installed. Run uv sync, or pip install -e ., to install NDM's dependencies.")
-    logging.getLogger("spotdl").setLevel(logging.ERROR)
+    configure_upstream_logging()
     _initialize_client(data_dir)
     _configure_proxy(settings)
     from spotdl.utils import search as upstream_search
@@ -258,7 +268,7 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
     url = _resolve_spotify_url(url, settings)
     if availability()["installed"] is False:
         raise RuntimeError("spotDL is not installed. Run uv sync, or pip install -e ., to install NDM's dependencies.")
-    logging.getLogger("spotdl").setLevel(logging.ERROR)
+    configure_upstream_logging()
     _initialize_client(data_dir)
     _configure_proxy(settings)
     from spotdl.types.song import Song
@@ -347,7 +357,7 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
     """
     if availability()["installed"] is False:
         raise RuntimeError("spotDL is missing. Run uv sync, or pip install -e ., to reinstall NDM's dependencies.")
-    logging.getLogger("spotdl").setLevel(logging.ERROR)
+    configure_upstream_logging()
     _initialize_client(data_dir)
     _configure_proxy(settings)
     from spotdl.providers.audio import YouTubeMusic
@@ -373,24 +383,38 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
     if stop is not None and stop.is_set():
         raise SpotifyCancelled()
 
+    log.info("Matching %r by %r (duration=%ss isrc=%s) proxy=%s cookies=%s",
+             song.name, song.artist, song.duration, song.isrc or "-",
+             bool((settings or {}).get("proxy_enabled")), bool((settings or {}).get("firefox_cookies")))
     provider = YouTubeMusic()
+    match_logger = YtdlpLogger("ndm.spotify.match", "[match]")
     try:
         _configure_audio_provider(provider, settings)
+        # Capture spotDL's own yt-dlp candidate inspection instead of letting its
+        # quiet/no_warnings settings discard the network detail.
+        provider.audio_handler.params["logger"] = match_logger
+        provider.audio_handler.params["verbose"] = debug_enabled()
         matched_url = provider.search(song, only_verified=False)
     except Exception as exc:
         # spotDL's view-count tie-breaker may inspect a candidate with yt-dlp and
         # wrap the real cause in AudioProviderError. Keep ranking unchanged, but
         # surface the underlying network/cookie/extractor failure to the queue.
+        log_failure(log, "YouTube Music matching", exc, track=song.display_name)
         cause = exc.__cause__
-        if cause is not None and cause is not exc:
-            raise cause from exc
-        raise
+        root = cause if cause is not None and cause is not exc else exc
+        raise ValueError(failure_message(
+            root, detail=match_logger.summary(),
+            prefix=f"YouTube Music matching failed for {song.display_name}",
+        )) from exc
     finally:
         provider.audio_handler.close()
     if stop is not None and stop.is_set():
         raise SpotifyCancelled()
     if not matched_url:
-        raise LookupError(f"spotDL found no YouTube Music match for {song.display_name}.")
+        log.error("No YouTube Music match for %r", song.display_name)
+        raise LookupError(f"spotDL found no YouTube Music match for {song.display_name}. "
+                          "Retry, or check the track title/artist. Full log: ndm logs")
+    log.info("Matched %r -> %s", song.display_name, matched_url)
     song.download_url = matched_url
     return {"url": matched_url, "song": song.json, "provider": "YouTube Music via spotDL"}
 
@@ -426,13 +450,16 @@ def tag_file(path: Path, song_data: dict, *, stop=None) -> None:
     from spotdl.types.song import Song
     from spotdl.utils.metadata import embed_metadata
 
+    log.info("Tagging %s", path)
     try:
         embed_metadata(path, Song.from_missing_data(**_taggable(song_data)))
     except Exception as exc:
+        log_failure(log, "tagging", exc, path=str(path))
         cause = exc.__cause__ or exc
+        detail = (redact(str(cause)) or type(cause).__name__)[:220]
         raise RuntimeError(
-            f"Audio was saved to {path}, but tagging failed: {cause}. "
-            "Retry this track to tag the saved file again."
+            f"Audio was saved to {path}, but tagging failed: {detail}. "
+            "Retry this track to tag the saved file again. Full log: ndm logs"
         ) from exc
     if stop is not None and stop.is_set():
         raise SpotifyCancelled()
