@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "NDM Download Handoff",
+  "version": "1.0.0",
+  "description": "Hand Chrome downloads to NDM, which asks you in the app before starting them. Grabs YouTube and Spotify pages.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA47/XhCmMzGgLxksUl2k/4mHQmKE19ALY1xA3zzFIozFnw9Zkn7z4pQaKFmB8pLIVzkeSdKYlAC0KpD5eG71N8VCDxEDlcC1nxEz3v1mTR7Q6l+Fcn/wYeODNsYSrqWDwn6lCimBgUfh7Cj6rFqbh/wdjePpMw26oASvnYFPODdGFbD7/EhBKFEDLF54GgBs9CYnKsHsbs3FAzamRmgy/rfGTJ+fxKt4a2yU/ctDBQdsakRifBOYYzOViSk9A6h0hPl0nLHH9RZMGzxpexRP8lChkTu44foGDlH+g+i366l2BUaFDG+1WFAJvcDEFO7eu/R8jCcJQPLglnO38XpEtrwIDAQAB",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "storage",
+    "notifications",
+    "contextMenus",
+    "activeTab"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "NDM Download Handoff",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

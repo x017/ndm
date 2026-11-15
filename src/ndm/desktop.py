@@ -16,6 +16,7 @@ from .ipc import request
 from .ipc import stream as ipc_stream
 from .models import (
     ACCENTS,
+    COOKIE_BROWSERS,
     CUSTOM_COLOR_KEYS,
     MEDIA_EXTENSIONS,
     SETTINGS_SCHEMA_VERSION,
@@ -152,7 +153,7 @@ OPTIONS_KEYS = [
     "download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
     "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
     "browser_integration", "browser_ask",
-    "firefox_cookies", "spotify_format", "spotify_bitrate", "spotify_tagger", "spotify_matcher", "proxy_enabled", "proxy_url", "proxy_username",
+    "firefox_cookies", "cookie_browser", "spotify_format", "spotify_bitrate", "spotify_tagger", "spotify_matcher", "proxy_enabled", "proxy_url", "proxy_username",
     "proxy_password", "proxy_remote_dns",
 ]
 
@@ -178,6 +179,7 @@ class Desktop:
         self.seen_offers: set[str] = set()
         self.offer_id = ""
         self.offer_paused = False
+        self.offer_resolving = ""
         self.palette_open = False
         self.palette_stage = "media"
         self.palette_target = ""
@@ -446,7 +448,7 @@ class Desktop:
                     facts = self.diagnostics_env
                     ctx.text(f"ffmpeg: {facts.get('ffmpeg')} · ffprobe: {facts.get('ffprobe')} · deno: {facts.get('deno')}",
                              size=11, width=ui.FILL)
-                    ctx.text(f"yt-dlp {facts.get('yt_dlp')} · spotDL {facts.get('spotdl')} · proxy {facts.get('proxy_enabled')} · remote DNS {facts.get('proxy_remote_dns')} · cookies {facts.get('firefox_cookies')}",
+                    ctx.text(f"yt-dlp {facts.get('yt_dlp')} · spotDL {facts.get('spotdl')} · proxy {facts.get('proxy_enabled')} · remote DNS {facts.get('proxy_remote_dns')} · cookies {facts.get('cookie_browser')}",
                              size=11, width=ui.FILL)
                 for row in self.diagnostics_check:
                     tone = ui.Tone.SUCCESS if row.get("ok") else ui.Tone.DANGER
@@ -1201,23 +1203,39 @@ class Desktop:
         if not new:
             return
         self.seen_offers.update(o["id"] for o in new)
-        if self.dialog in {"", "offer"}:
+        if self.dialog in {"", "offer"} and not self.offer_resolving:
             self.offer_id = new[0]["id"]
             self.offer_paused = False
             self.dialog = "offer"
         else:
             # Never yank away a dialog the user is typing into.
-            self.notice = f"Firefox sent {len(new)} download(s). Review them in Downloads → Browser requests."
+            self.notice = f"The browser sent {len(new)} request(s). Review them in Downloads → Browser requests."
 
     def resolve_offer(self, accept: bool) -> None:
         offer_id = self.offer_id
+        if not offer_id or self.offer_resolving:
+            return
+        payload = {"id": offer_id, "accept": accept, "start_paused": self.offer_paused}
+        offer = next((o for o in (self.state.get("offers") or []) if o["id"] == offer_id), {})
+        # Expanding a playlist or inspecting YouTube can take much longer than
+        # a file handoff. Never do that network work on the rendering thread.
+        if accept and offer.get("kind") in {"youtube", "spotify"} and self.runner is not None:
+            self.offer_resolving = offer_id
+            self.error = ""
+            self.runner.submit(
+                lambda: self.call("browser.resolve", payload, timeout=300),
+                on_done=lambda result: self._offer_resolved(offer_id, result),
+                on_error=lambda exc: self._offer_resolution_failed(offer_id, exc))
+            return
         try:
-            self.call("browser.resolve", {"id": offer_id, "accept": accept,
-                                          "start_paused": self.offer_paused})
+            self.call("browser.resolve", payload)
             self.error = ""
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
             self.error = safe_error(exc, self.state.get("settings", {}))
+        self._advance_offer(offer_id)
+
+    def _advance_offer(self, offer_id: str) -> None:
         self.offer_id = ""
         remaining = [o for o in (self.state.get("offers") or []) if o["id"] != offer_id]
         if remaining:
@@ -1226,10 +1244,29 @@ class Desktop:
         else:
             self.dialog = ""
 
+    def _offer_resolved(self, offer_id: str, result: dict) -> None:
+        self.offer_resolving = ""
+        self.error = ""
+        self.refresh()
+        self._advance_offer(offer_id)
+        count = len(result.get("tasks") or [])
+        self.notice = f"Queued {count} download(s) from the browser." if count else "Browser request accepted."
+
+    def _offer_resolution_failed(self, offer_id: str, exc: BaseException) -> None:
+        self.offer_resolving = ""
+        self.error = safe_error(exc, self.state.get("settings", {}))
+        self.refresh()
+        # The daemon restores a failed offer. Keep it visible for a retry.
+        if any(o["id"] == offer_id for o in (self.state.get("offers") or [])):
+            self.offer_id = offer_id
+            self.dialog = "offer"
+
     def _offer_dialog(self, ctx: ui.UI, state: dict) -> None:
         offers = state.get("offers") or []
         offer = next((o for o in offers if o["id"] == self.offer_id), None)
         if offer is None:
+            if self.offer_resolving:
+                return
             # Resolved elsewhere, or it expired while the dialog was open.
             self.dialog = ""
             self.offer_id = ""
@@ -1237,11 +1274,15 @@ class Desktop:
         settings = state["settings"]
         destination = Path(settings["music_dir"] if offer["category"] == "audio"
                            else settings["download_dir"]) / offer["category"]
-        with ctx.dialog("Firefox wants to download a file", True, width=560) as dialog:
+        kind = offer.get("kind", "file")
+        titles = {"file": "The browser wants to download a file",
+                  "youtube": "Grab this YouTube video?",
+                  "spotify": "Grab this Spotify link?"}
+        with ctx.dialog(titles.get(kind, titles["file"]), True, width=560) as dialog:
             if dialog:
                 ctx.heading(offer["name"], level=3)
                 rows = [("From", offer["host"] or "unknown host"),
-                        ("Type", offer["category"]),
+                        ("Type", kind if kind != "file" else offer["category"]),
                         ("Size", format_bytes(offer["size"]) if offer["size"] else "Unknown"),
                         ("Save to", str(destination))]
                 for label, value in rows:
@@ -1250,17 +1291,27 @@ class Desktop:
                         ctx.text(value, size=11, selectable=True, width=ui.GROW(1))
                 ctx.text(offer["url"], size=10, selectable=True, width=ui.FILL,
                          color=ui.Color.TEXT_SECONDARY)
+                if kind != "file":
+                    ctx.text("NDM will inspect this page only after you approve it. "
+                             + ("Spotify albums/playlists may queue multiple tracks." if kind == "spotify"
+                                else "The video uses your Media Grabber settings."),
+                             size=11, width=ui.FILL, color=ui.Color.TEXT_SECONDARY)
                 if len(offers) > 1:
-                    ctx.alert(f"{len(offers)} downloads are waiting. This is the oldest.",
+                    ctx.alert(f"{len(offers)} requests are waiting. This is the oldest.",
                               tone=ui.Tone.INFO)
+                resolving = bool(self.offer_resolving)
                 self.offer_paused = ctx.checkbox("Add paused (start it later)", self.offer_paused)
                 self._error_in_dialog(ctx)
+                if resolving:
+                    ctx.text("Preparing downloads…", size=11, color=ui.Color.TEXT_SECONDARY)
                 with ctx.dialog_footer():
-                    if ctx.button("Leave in Firefox"):
+                    if ctx.button("Leave in browser" if kind == "file" else "Cancel", disabled=resolving):
                         self.resolve_offer(False)
-                    if ctx.button("Download", icon=ui.Icon.DOWNLOAD, variant=ui.ButtonVariant.PRIMARY):
+                    label = "Grab" if kind != "file" else "Download"
+                    if ctx.button("Working…" if resolving else label, icon=ui.Icon.DOWNLOAD,
+                                  variant=ui.ButtonVariant.PRIMARY, disabled=resolving):
                         self.resolve_offer(True)
-            if not dialog.open:
+            if not dialog.open and not self.offer_resolving:
                 self.resolve_offer(False)
 
     def _dialogs(self, ctx: ui.UI, state: dict) -> None:
@@ -1598,16 +1649,25 @@ class Desktop:
                         form["auto_capture"] = ctx.switch("Enable automatic media capture", form["auto_capture"])
                         form["clipboard_capture"] = ctx.checkbox("Capture copied direct media links while this window is open", form["clipboard_capture"])
                         form["watch_inbox"] = ctx.checkbox("Watch the link inbox in the background", form["watch_inbox"])
-                        form["browser_integration"] = ctx.switch("Hand Firefox downloads to NDM", form["browser_integration"])
-                        form["browser_ask"] = ctx.checkbox("Ask me in the app before each browser download", form["browser_ask"])
-                        ctx.text("Setup: uv run ndm extension install — then load extension/firefox/manifest.json via about:debugging.",
+                        form["browser_integration"] = ctx.switch("Hand browser downloads to NDM", form["browser_integration"])
+                        form["browser_ask"] = ctx.checkbox("Ask before automatic browser file downloads (page grabs always ask)", form["browser_ask"])
+                        browsers = list(COOKIE_BROWSERS)
+                        labels = ["Off"] + [b.capitalize() for b in browsers[1:]]
+                        current = form.get("cookie_browser") or ("firefox" if form["firefox_cookies"] else "none")
+                        chosen = browsers[ctx.select("cookie_browser", labels, browsers.index(current),
+                                                     label="Use cookies from", width=ui.FILL)]
+                        form["cookie_browser"] = chosen
+                        form["firefox_cookies"] = chosen == "firefox"
+                        ctx.text("Read locally per operation; never stored by NDM. Chromium may need a keyring unlock.",
+                                 width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                        ctx.text("Browser setup: uv run ndm extension install --browser firefox (or chrome/chromium/brave/edge/all).",
                                  width=ui.FILL, size=11)
-                        ctx.text("Inbox: " + state["daemon"]["inbox"], selectable=True, size=11, width=ui.FILL)
-                        domains = ctx.input("capture_domains", ", ".join(form["allowed_domains"]), label="Allowed hostnames (comma-separated; empty = any)", width=ui.FILL)
+                        ctx.text("Then load extension/firefox or extension/chrome; full steps in extension/README.md.",
+                                 width=ui.FILL, size=11)
+                        domains = ctx.input("capture_domains", ", ".join(form["allowed_domains"]), label="Capture allowlist (comma-separated; empty = any)", width=ui.FILL)
                         form["allowed_domains"] = [v.strip() for v in domains.split(",") if v.strip()]
-                        ctx.text("Drop .txt or .url files containing media links into the inbox. No browser extension is required.", width=ui.FILL, size=11)
-                        form["firefox_cookies"] = ctx.checkbox("Automatically use my Firefox cookies", form["firefox_cookies"])
-                        ctx.text("Reads Firefox cookies locally for each new download, media inspection, or spotDL audio match. Only cookies matching the destination are sent; NDM does not save cookie values.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                        ctx.text("Inbox: " + state["daemon"]["inbox"], selectable=True, size=11, width=ui.FILL)
+                        ctx.text("Drop .txt/.url media links into the inbox. Inbox/clipboard capture does not need an extension.", width=ui.FILL, size=11)
                     elif self.options_tab == 4:
                         formats = ["mp3", "m4a", "flac", "opus", "ogg"]
                         rates = ["auto", "128k", "192k", "256k", "320k", "disable"]
@@ -1620,7 +1680,7 @@ class Desktop:
                         info = state["daemon"]["spotify"]
                         ctx.text(f"spotDL {info['version'] or 'not installed'} · FFmpeg {'installed' if info['ffmpeg'] else 'missing'}", size=12)
                         ctx.text("spotDL selects the YouTube Music match; NDM's yt-dlp pipeline downloads and converts it. No spotDL web UI or downloader gateway is used.", width=ui.FILL, size=11)
-                        ctx.text("The Capture tab's Firefox cookie option also applies to spotDL's YouTube Music search and NDM's matched-audio transfer.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                        ctx.text("The Capture tab's browser-cookie selector also applies to spotDL's YouTube Music search and NDM's matched-audio transfer.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                         ctx.text("Use only audio you own or have permission to save. Pausing a spotDL track is cooperative; conversion may finish before it stops.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                     else:
                         self._appearance_options(ctx, state)

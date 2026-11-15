@@ -28,7 +28,8 @@ from .diagnostics import (
 from .models import SpotifyCancelled, safe_filename
 from .network import (
     configure_environment,
-    firefox_cookie_options,
+    cookie_browser,
+    cookie_options,
     httpx_options,
     proxy_url,
     requests_proxies,
@@ -92,9 +93,9 @@ def _configure_audio_provider(provider, settings: dict | None) -> None:
     proxies = requests_proxies(data)
     if url:
         provider.audio_handler.params["proxy"] = url
-    cookie_options = firefox_cookie_options(data)
-    if cookie_options:
-        provider.audio_handler.params.update(cookie_options)
+    cookies = cookie_options(data)
+    if cookies:
+        provider.audio_handler.params.update(cookies)
     else:
         provider.audio_handler.params.pop("cookiesfrombrowser", None)
     # Upstream retries construct a fresh YTMusic client. Always route those through
@@ -259,14 +260,14 @@ def search(url: str, data_dir: Path, *, limit: int = 500, settings: dict | None 
         raise RuntimeError("spotDL is not installed. Run uv sync, or pip install -e ., to install NDM's dependencies.")
     log.info("SEARCH url=%s limit=%s proxy=%s remote_dns=%s cookies=%s", redact(url), limit,
              bool((settings or {}).get("proxy_enabled")), (settings or {}).get("proxy_remote_dns"),
-             bool((settings or {}).get("firefox_cookies")))
+             cookie_browser(settings or {}))
     started = time.monotonic()
     configure_upstream_logging()
     _initialize_client(data_dir)
     _configure_proxy(settings)
     from spotdl.utils import search as upstream_search
     from spotdl.utils.search import parse_query
-    if proxy_url(settings or {}) or (settings or {}).get("firefox_cookies"):
+    if proxy_url(settings or {}) or cookie_browser(settings or {}) != "none":
         upstream_search.client = _configured_ytmusic(settings or {})
     else:
         upstream_search.client = None
@@ -306,7 +307,7 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
         raise RuntimeError("spotDL is not installed. Run uv sync, or pip install -e ., to install NDM's dependencies.")
     log.info("STREAM url=%s limit=%s proxy=%s remote_dns=%s cookies=%s", redact(url), limit,
              bool((settings or {}).get("proxy_enabled")), (settings or {}).get("proxy_remote_dns"),
-             bool((settings or {}).get("firefox_cookies")))
+             cookie_browser(settings or {}))
     started = time.monotonic()
     configure_upstream_logging()
     _initialize_client(data_dir)
@@ -548,7 +549,7 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
 
     log.info("Matching %r by %r (duration=%ss isrc=%s) proxy=%s cookies=%s",
              song.name, song.artist, song.duration, song.isrc or "-",
-             bool((settings or {}).get("proxy_enabled")), bool((settings or {}).get("firefox_cookies")))
+             bool((settings or {}).get("proxy_enabled")), cookie_browser(settings or {}))
     if (settings or {}).get("spotify_matcher") == "ndm":
         from .matching import find_match
 

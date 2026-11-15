@@ -753,7 +753,7 @@ def test_browser_offer_does_not_interrupt_an_open_dialog(tmp_path, monkeypatch):
             frame(desktop, ctx)
         assert desktop.dialog == "add"
         assert desktop.url == "https://example.org/typing"
-        assert "Firefox sent" in desktop.notice
+        assert "browser sent" in desktop.notice
 
 
 def test_browser_offer_queue_advances_to_the_next(tmp_path, monkeypatch):
@@ -789,3 +789,66 @@ def test_capture_options_expose_browser_integration(tmp_path, monkeypatch):
         for _ in range(2):
             frame(desktop, ctx)
         assert desktop.dialog == "options"
+
+
+def test_media_grab_dialog_uses_background_runner_and_can_retry(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    offer = _offer("yt-offer", "YouTube page")
+    offer.update(kind="youtube", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                 host="www.youtube.com", size=0)
+    client.state["offers"] = [offer]
+    desktop.refresh()
+    submitted = []
+
+    class Runner:
+        def submit(self, work, *, on_done, on_error):
+            submitted.append((work, on_done, on_error))
+
+    desktop.runner = Runner()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        assert desktop.dialog == "offer"
+        # Click Grab; the slow browser.resolve must be submitted, not called inline.
+        ctx.input_mouse_move(842, 560)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, True)
+        frame(desktop, ctx)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, False)
+        frame(desktop, ctx)
+        assert submitted and desktop.offer_resolving == "yt-offer"
+        assert not any(op == "browser.resolve" for op, _ in client.calls)
+        # A transient failure restores the same offer for a visible retry.
+        submitted[0][2](RuntimeError("offline"))
+        frame(desktop, ctx)
+        assert desktop.offer_resolving == ""
+        assert desktop.offer_id == "yt-offer"
+        assert "offline" in desktop.error
+        # Success advances out of the dialog and reports the queued task.
+        desktop.resolve_offer(True)
+        submitted[1][1]({"status": "started", "tasks": ["task-1"]})
+        assert desktop.dialog == ""
+        assert "Queued 1" in desktop.notice
+        frame(desktop, ctx)
+
+
+def test_capture_tab_saves_chrome_cookie_selection(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    desktop.open_dialog("options")
+    desktop.options_tab = 3
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(2):
+            frame(desktop, ctx)
+        assert desktop.settings_form["cookie_browser"] == "none"
+        # Open the native select and click Chrome in its rendered dropdown.
+        for x, y in ((640, 435), (500, 545)):
+            ctx.input_mouse_move(x, y)
+            ctx.input_mouse_button(ui.MouseButton.LEFT, True)
+            frame(desktop, ctx)
+            ctx.input_mouse_button(ui.MouseButton.LEFT, False)
+            frame(desktop, ctx)
+        assert desktop.settings_form["cookie_browser"] == "chrome"
+        desktop.save_options()
+        assert client.state["settings"]["cookie_browser"] == "chrome"
+        assert client.state["settings"]["firefox_cookies"] is False

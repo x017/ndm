@@ -26,9 +26,10 @@ from .models import (
     validate_url,
 )
 from .network import (
-    FIREFOX_COOKIE_ERROR,
     configure_environment,
-    firefox_cookie_jar,
+    cookie_browser,
+    cookie_error,
+    cookie_jar,
     httpx_options,
     safe_error,
 )
@@ -135,7 +136,7 @@ class DownloadManager:
 
     def add_media(self, *, url: str, format_id: str, name: str, category: str,
                   quality: str = "best", ext: str = "mp4", size: int = 0,
-                  size_estimated: bool = False) -> dict:
+                  size_estimated: bool = False, start_paused: bool = False) -> dict:
         from .media import spotify_link, uses_ytdlp
         url = self.validate_target(url)
         if spotify_link(url):
@@ -154,7 +155,8 @@ class DownloadManager:
                                  and t["status"] not in {"error", "completed"}), None)
                 if existing:
                     return dict(existing)
-                task = self.add(url=url, filename=name, category=category, source="media", dedupe=False)
+                task = self.add(url=url, filename=name, category=category, source="media",
+                                dedupe=False, start_paused=start_paused)
                 current = self.tasks[task["id"]]
                 if size > 0:
                     current.update(size=size, size_estimated=size_estimated)
@@ -173,7 +175,8 @@ class DownloadManager:
                              and t["status"] != "error"), None)
             if existing:
                 return dict(existing)
-            task = self.add(url=url, filename=name, category=category, source="ytdlp", dedupe=False)
+            task = self.add(url=url, filename=name, category=category, source="ytdlp",
+                            dedupe=False, start_paused=start_paused)
             current = self.tasks[task["id"]]
             current["format_id"] = format_id
             current["media_quality"] = quality
@@ -279,6 +282,10 @@ class DownloadManager:
     def update_settings(self, patch: SettingsPatch) -> Settings:
         data = self.settings.model_dump()
         changes = patch.model_dump(exclude_none=True)
+        if "firefox_cookies" in changes and "cookie_browser" not in changes:
+            # A legacy CLI/UI patch must still be able to change the selector;
+            # otherwise the old persisted cookie_browser would override it.
+            changes["cookie_browser"] = "firefox" if changes["firefox_cookies"] else "none"
         log.info("SETTINGS changed keys=%s", sorted(changes))
         candidate = Settings.model_validate({**data, **changes})
         with self.lock:
@@ -304,40 +311,104 @@ class DownloadManager:
     OFFER_TTL = 300.0
     OFFER_LIMIT = 50
 
+    def _pending_offer(self, url: str) -> dict | None:
+        """Expire old offers and collapse repeated browser events under lock."""
+        now = time.time()
+        for offer_id, stale in list(self.offers.items()):
+            if now - stale["created_at"] > self.OFFER_TTL:
+                del self.offers[offer_id]
+        return next(({"id": offer["id"], "status": "pending", "duplicate": True}
+                     for offer in self.offers.values() if offer["url"] == url), None)
+
+    def _require_browser_integration(self) -> None:
+        if not self.settings.browser_integration:
+            raise RuntimeError("Browser integration is off. Enable it in Options → Capture.")
+
+    def _offer(self, fields: dict) -> dict:
+        if len(self.offers) >= self.OFFER_LIMIT:
+            raise ValueError("Too many downloads are waiting for approval.")
+        offer_id = uuid.uuid4().hex[:12]
+        self.offers[offer_id] = {"id": offer_id, "created_at": time.time(), **fields}
+        return {"id": offer_id, "status": "pending"}
+
     def offer_download(self, *, url: str, filename: str | None = None, mime: str = "",
                        size: int = 0, page_url: str = "") -> dict:
         """Queue a browser download for the user to approve in the app.
 
         Returns immediately so the extension can decide whether to cancel
-        Firefox's own transfer. With browser_ask off the download starts at once;
+        the browser's own transfer. With browser_ask off it starts at once;
         otherwise it waits in `offers` until the desktop resolves it.
         """
-        if not self.settings.browser_integration:
-            raise RuntimeError("Browser integration is off. Enable it in Options → Capture.")
+        self._require_browser_integration()
         url = self.validate_target(url)
         name = safe_filename(filename or Path(unquote(urlsplit(url).path)).name or "download")
         kind = category_for(name, mime)
         with self.lock:
-            now = time.time()
-            for offer_id, stale in list(self.offers.items()):
-                if now - stale["created_at"] > self.OFFER_TTL:
-                    del self.offers[offer_id]
-            for offer in self.offers.values():
-                if offer["url"] == url:
-                    return {"id": offer["id"], "status": "pending", "duplicate": True}
+            duplicate = self._pending_offer(url)
+            if duplicate:
+                return duplicate
             if not self.settings.browser_ask:
                 task = self.add(url=url, filename=name, category=kind, source="firefox")
                 return {"id": "", "status": "started", "task": task["id"]}
-            if len(self.offers) >= self.OFFER_LIMIT:
-                raise ValueError("Too many downloads are waiting for approval.")
-            offer_id = uuid.uuid4().hex[:12]
-            self.offers[offer_id] = {
-                "id": offer_id, "url": url, "name": name, "category": kind,
+            result = self._offer({
+                "url": url, "name": name, "category": kind,
                 "mime": mime, "size": size, "page_url": page_url,
-                "host": (urlsplit(url).hostname or "").lower(), "created_at": now,
-            }
+                "host": (urlsplit(url).hostname or "").lower(), "kind": "file",
+            })
         self.store.event("Download offered", f"{name} is waiting for approval.")
-        return {"id": offer_id, "status": "pending"}
+        return result
+
+    def offer_media(self, *, url: str, kind: str = "") -> dict:
+        """Offer a YouTube/Spotify page without fetching it before approval.
+
+        Page grabs always ask, even when browser_ask is off: that switch governs
+        automatic file interception, not an explicit request to expand a page
+        or playlist. The client-supplied kind is only a hint, never authority.
+        """
+        from .media import grab_page_kind
+
+        self._require_browser_integration()
+        url = self.validate_target(url)
+        detected = grab_page_kind(url)
+        if not detected or (kind and kind != detected):
+            raise ValueError("Only YouTube video and Spotify track/album/playlist pages can be grabbed. "
+                             "Use a direct link for other files.")
+        with self.lock:
+            duplicate = self._pending_offer(url)
+            if duplicate:
+                return duplicate
+            result = self._offer({
+                "url": url, "name": f"{detected.capitalize()} page",
+                "category": "audio" if detected == "spotify" else "video",
+                "mime": "", "size": 0, "page_url": url,
+                "host": (urlsplit(url).hostname or "").lower(), "kind": detected,
+            })
+        self.store.event("Media page offered", f"A {detected} link is waiting for approval.")
+        return result
+
+    def _start_offer(self, offer: dict, *, start_paused: bool = False) -> dict:
+        """Turn an approved offer into the right kind of download."""
+        kind = offer.get("kind", "file")
+        if kind == "spotify":
+            from . import spotify as spotify_module
+            listing = spotify_module.search(offer["url"], self.store.directory,
+                                            settings=self.settings.model_dump())
+            items = listing.get("items") or []
+            if not items:
+                raise ValueError("Spotify returned no tracks for that link.")
+            tasks = [self.add_spotify(item["song"], start_paused=start_paused)["id"] for item in items]
+            return {"status": "started", "tasks": tasks, "task": tasks[0]}
+        if kind == "youtube":
+            from .media import inspect_media
+            info = inspect_media(offer["url"], allow_private=self.allow_private,
+                                 settings=self.settings.model_dump())
+            name = safe_filename(info.get("title") or "media")[:180] or "media"
+            task = self.add_media(url=offer["url"], format_id="best", name=name,
+                                  category="video", ext="mp4", start_paused=start_paused)
+            return {"status": "started", "task": task["id"], "tasks": [task["id"]]}
+        task = self.add(url=offer["url"], filename=offer["name"], category=offer["category"],
+                        start_paused=start_paused, source="firefox")
+        return {"status": "started", "task": task["id"], "tasks": [task["id"]]}
 
     def resolve_offer(self, offer_id: str, accept: bool, *, start_paused: bool = False) -> dict:
         with self.lock:
@@ -346,9 +417,14 @@ class DownloadManager:
             raise KeyError("That download offer is no longer waiting.")
         if not accept:
             return {"status": "declined", "id": offer_id}
-        task = self.add(url=offer["url"], filename=offer["name"], category=offer["category"],
-                        start_paused=start_paused, source="firefox")
-        return {"status": "started", "id": offer_id, "task": task["id"]}
+        try:
+            result = self._start_offer(offer, start_paused=start_paused)
+        except Exception:
+            # Put it back so a transient failure does not silently lose the link.
+            with self.lock:
+                self.offers[offer_id] = offer
+            raise
+        return {"id": offer_id, **result}
 
     def capture(self, *, url: str, filename: str | None, mime: str, source: str) -> dict:
         if not self.settings.auto_capture:
@@ -465,12 +541,12 @@ class DownloadManager:
         track.stage("connecting", url=redact(initial.get("url", "")), name=initial.get("name"),
                     connections=initial.get("connections"))
         track.detail("config proxy=%s cookies=%s speed_limit=%s",
-                     bool(self.settings.proxy_enabled), bool(self.settings.firefox_cookies),
+                     bool(self.settings.proxy_enabled), cookie_browser(self.settings),
                      self.settings.speed_limit or "unlimited")
         try:
             with httpx.Client(timeout=httpx.Timeout(20, read=30), follow_redirects=True,
                               headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
-                              cookies=firefox_cookie_jar(self.settings), **httpx_options(self.settings),
+                              cookies=cookie_jar(self.settings), **httpx_options(self.settings),
                               event_hooks={"request": [lambda request: self.validate_target(str(request.url))]}) as client:
                 for attempt in range(2):
                     try:
@@ -549,7 +625,7 @@ class DownloadManager:
             track.detail("config proxy=%s remote_dns=%s cookies=%s matcher=%s tagger=%s "
                          "rate_limit=%s connections=%s ffmpeg=%s",
                          bool(settings.get("proxy_enabled")), settings.get("proxy_remote_dns"),
-                         bool(settings.get("firefox_cookies")), settings.get("spotify_matcher"),
+                         cookie_browser(settings), settings.get("spotify_matcher"),
                          settings.get("spotify_tagger"), self.settings.speed_limit or "unlimited",
                          snapshot["connections"], bool(shutil.which("ffmpeg")))
             track.stage("matching")
@@ -618,7 +694,7 @@ class DownloadManager:
                     task.update(status="paused", speed=0, phase="paused")
                 else:
                     if isinstance(exc, yt_dlp.cookies.CookieLoadError):
-                        message = FIREFOX_COOKIE_ERROR
+                        message = cookie_error(cookie_browser(self.settings))
                     else:
                         message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
                     task.update(status="error", speed=0, phase="error",
@@ -649,7 +725,7 @@ class DownloadManager:
                 settings = self.settings.model_dump()
             track.stage("extracting", url=redact(snapshot["url"]), name=snapshot["name"])
             track.detail("config proxy=%s cookies=%s quality=%s format=%s",
-                         bool(settings.get("proxy_enabled")), bool(settings.get("firefox_cookies")),
+                         bool(settings.get("proxy_enabled")), cookie_browser(settings),
                          snapshot.get("media_quality"), snapshot.get("media_format") or "auto")
 
             def progress(downloaded, total, phase, *, estimated=False):
@@ -693,7 +769,8 @@ class DownloadManager:
                 if stop.is_set() or isinstance(exc, yt_dlp.utils.DownloadCancelled):
                     task.update(status="paused", speed=0, phase="paused")
                 else:
-                    message = FIREFOX_COOKIE_ERROR if isinstance(exc, yt_dlp.cookies.CookieLoadError) else str(exc)
+                    message = (cookie_error(cookie_browser(settings))
+                               if isinstance(exc, yt_dlp.cookies.CookieLoadError) else str(exc))
                     task.update(status="error", speed=0, error=safe_error(ValueError(message), self.settings), phase="error")
                     self.store.event("Media download needs attention", task["error"], "warning")
                     track.failed(exc, settings=settings, url=redact(snapshot["url"]))

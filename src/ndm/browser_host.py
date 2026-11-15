@@ -1,11 +1,11 @@
-"""Firefox native-messaging host.
+"""Firefox/Chromium native-messaging host.
 
-Firefox launches this process and speaks length-prefixed JSON over stdin/stdout.
+The browser launches this process and speaks length-prefixed JSON over stdin/stdout.
 It forwards each intercepted download to the local daemon over the existing
 authenticated IPC, so NDM still opens no network port and the browser never
 learns the IPC key.
 
-Nothing here may print to stdout except protocol frames: Firefox treats stray
+Nothing here may print to stdout except protocol frames: the browser treats stray
 output as a malformed message and drops the connection.
 """
 from __future__ import annotations
@@ -53,7 +53,7 @@ def handle(message: dict, data_dir: Path) -> dict:
     """Translate one browser request into a daemon call.
 
     Every failure is reported as ok=False rather than raised, so the extension
-    can leave Firefox's own download running instead of cancelling it.
+    can leave the browser's own download running instead of cancelling it.
     """
     if not isinstance(message, dict):
         return {"ok": False, "error": "Malformed request."}
@@ -67,6 +67,14 @@ def handle(message: dict, data_dir: Path) -> dict:
         return {"ok": True, "running": True,
                 "enabled": bool(settings.get("browser_integration")),
                 "ask": bool(settings.get("browser_ask", True))}
+    if kind == "grab":
+        payload = {key: message[key] for key in ("url", "kind") if key in message}
+        try:
+            result = request(data_dir, "browser.grab", payload, timeout=10)
+        except (OSError, ValueError, RuntimeError, TimeoutError, EOFError) as exc:
+            log.info("grab refused: %s", exc)
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, **result}
     if kind == "offer":
         payload = {key: message[key] for key in ("url", "filename", "mime", "size", "page_url")
                    if key in message}
@@ -85,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ndm-browser-host", add_help=False)
     parser.add_argument("--data-dir", type=Path, default=None)
     args, _ = parser.parse_known_args(argv)
-    # Firefox launches the host with its own environment, so NDM_HOME is not
+    # The browser launches the host with its own environment, so NDM_HOME is not
     # inherited. The installed launcher passes the data dir explicitly.
     data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)

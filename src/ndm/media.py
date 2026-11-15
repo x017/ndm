@@ -6,7 +6,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 import yt_dlp
@@ -21,8 +21,9 @@ from .diagnostics import (
 )
 from .models import MEDIA_EXTENSIONS, category_for, safe_filename, validate_url
 from .network import (
-    FIREFOX_COOKIE_ERROR,
-    firefox_cookie_jar,
+    cookie_browser,
+    cookie_error,
+    cookie_jar,
     httpx_options,
     safe_error,
     ytdlp_options,
@@ -48,6 +49,26 @@ def uses_ytdlp(url: str) -> bool:
 def spotify_link(url: str) -> bool:
     host = (urlsplit(url).hostname or "").lower()
     return host in {"spotify.com", "open.spotify.com", "play.spotify.com", "spotify.link"}
+
+
+def grab_page_kind(url: str) -> str:
+    """Classify the two page types offered by the browser extensions.
+
+    Keep this in step with ndmPageKind() in extension/*/core.js. In particular,
+    a generic yt-dlp site or a Spotify home page is not a browser page grab.
+    """
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host in {"youtube.com", "m.youtube.com", "youtu.be"}:
+        if host == "youtu.be":
+            return "youtube" if re.fullmatch(r"/[A-Za-z0-9_-]{11}", parsed.path) else ""
+        if parsed.path == "/watch" and parse_qs(parsed.query).get("v"):
+            return "youtube"
+        return "youtube" if re.fullmatch(r"/(?:shorts|embed|live)/[A-Za-z0-9_-]{11}", parsed.path) else ""
+    if host in {"open.spotify.com", "play.spotify.com"}:
+        return "spotify" if re.fullmatch(
+            r"/(?:intl-[a-z]{2}/)?(?:track|album|playlist)/[A-Za-z0-9]{22}/?", parsed.path) else ""
+    return ""
 
 
 class LinkParser(HTMLParser):
@@ -128,7 +149,7 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
         except yt_dlp.cookies.CookieLoadError as exc:
             # CookieLoadError is not a DownloadError. Keep profile/cookie details
             # out of IPC errors and give the user a way to recover.
-            raise ValueError(FIREFOX_COOKIE_ERROR) from exc
+            raise ValueError(cookie_error(cookie_browser(settings))) from exc
         except yt_dlp.utils.DownloadError as exc:
             message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
             raise ValueError(safe_error(ValueError(message), settings)) from exc
@@ -176,7 +197,7 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
     suffix = Path(urlsplit(url).path).suffix.lower()
     if suffix in MEDIA_EXTENSIONS:
         with httpx.Client(follow_redirects=True, timeout=15, headers={"User-Agent": "NDM/0.1"},
-                          cookies=firefox_cookie_jar(settings), **httpx_options(settings),
+                          cookies=cookie_jar(settings), **httpx_options(settings),
                           event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private, resolve=resolve)]}) as client:
             size = _probe_size(client, url)
         return {"kind": "direct", "title": safe_filename(urlsplit(url).path).rsplit(".", 1)[0],
@@ -187,7 +208,7 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
     size = 0
     try:
         with httpx.Client(follow_redirects=True, timeout=15, headers={"User-Agent": "NDM/0.1"},
-                          cookies=firefox_cookie_jar(settings), **httpx_options(settings),
+                          cookies=cookie_jar(settings), **httpx_options(settings),
                           event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private, resolve=resolve)]}) as client:
             with client.stream("GET", url) as response:
                 response.raise_for_status()
@@ -229,7 +250,7 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
     items = items[:30]
     if items:
         with httpx.Client(follow_redirects=True, timeout=10, headers={"User-Agent": "NDM/0.1"},
-                          cookies=firefox_cookie_jar(settings), **httpx_options(settings),
+                          cookies=cookie_jar(settings), **httpx_options(settings),
                           event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private, resolve=resolve)]}) as client:
             with ThreadPoolExecutor(max_workers=min(6, len(items))) as pool:
                 sizes = list(pool.map(lambda item: _probe_size(client, item["url"]), items))
@@ -276,7 +297,7 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
     logger = YtdlpLogger(context=f"[{task.get('source') or 'media'}]")
     log.debug("Transfer start url=%s destination=%s proxy=%s cookies=%s",
               redact(task["url"]), destination, bool((settings or {}).get("proxy_enabled")),
-              bool((settings or {}).get("firefox_cookies")))
+              cookie_browser(settings or {}))
     options = {
         "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
         "continuedl": True, "overwrites": False, "retries": 3, "fragment_retries": 3,
@@ -313,7 +334,7 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
              "rate_limit=%s fragments=%s ffmpeg=%s postprocessors=%s",
              options.get("format"), expected_ext, options.get("audio_bitrate") or
              (options.get("postprocessors") or [{}])[0].get("preferredquality"),
-             bool(options.get("proxy")), bool(options.get("cookiesfrombrowser")),
+             bool(options.get("proxy")), cookie_browser(settings or {}),
              rate_limit or "unlimited", connections, bool(ffmpeg),
              [p.get("key") for p in options.get("postprocessors") or []])
     try:

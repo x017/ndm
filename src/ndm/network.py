@@ -8,10 +8,29 @@ from urllib.parse import quote, urlsplit
 
 from .models import Settings, redact_proxy_url
 
-FIREFOX_COOKIE_ERROR = (
-    "Could not read Firefox cookies. Check that Firefox and a readable profile "
-    "are installed, or turn off Firefox cookies in Options → Capture."
+COOKIE_ERROR = (
+    "Could not read {browser} cookies. Check that the browser and a readable "
+    "profile are installed, or set cookies to none in Options → Capture. "
+    "Chromium cookies also need a keyring unlock and the browser fully closed "
+    "on some systems."
 )
+
+
+def cookie_browser(settings: Settings | dict) -> str:
+    """Which browser to read cookies from, or "none"."""
+    data = settings.model_dump() if isinstance(settings, Settings) else (settings or {})
+    choice = data.get("cookie_browser")
+    if choice is not None:
+        # An explicit selector (including "none") beats a stale legacy flag,
+        # even when a caller passes a raw/partial settings dictionary.
+        return choice
+    return "firefox" if data.get("firefox_cookies") else "none"
+
+
+def cookie_error(browser: str) -> str:
+    return COOKIE_ERROR.format(browser=browser.capitalize())
+
+
 _ENV_LOCK = threading.RLock()
 _ORIGINAL_ENV: dict[str, str | None] | None = None
 _ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy")
@@ -51,31 +70,31 @@ def httpx_options(settings: Settings | dict) -> dict:
 def ytdlp_options(settings: Settings | dict) -> dict:
     url = proxy_url(settings)
     options = {"proxy": url} if url else {}
-    options.update(firefox_cookie_options(settings))
+    options.update(cookie_options(settings))
     return options
 
 
-def firefox_cookie_options(settings: Settings | dict) -> dict:
-    """Read Firefox lazily for each yt-dlp operation, only after opting in."""
-    data = settings.model_dump() if isinstance(settings, Settings) else settings
-    return {"cookiesfrombrowser": ("firefox",)} if data.get("firefox_cookies") else {}
+def cookie_options(settings: Settings | dict) -> dict:
+    """Read the chosen browser lazily per yt-dlp operation, only after opting in."""
+    browser = cookie_browser(settings)
+    return {"cookiesfrombrowser": (browser,)} if browser != "none" else {}
 
 
-def firefox_cookie_jar(settings: Settings | dict) -> CookieJar | None:
+def cookie_jar(settings: Settings | dict) -> CookieJar | None:
     """A domain-matching cookie jar for HTML inspection and segmented HTTP downloads.
 
-    Read a fresh snapshot for each operation so logging in/out in Firefox takes
-    effect without restarting NDM. Values stay in memory, never in NDM's store.
-    Do not expose upstream exception text: it may contain private profile data.
+    Read a fresh snapshot for each operation so logging in/out in the browser
+    takes effect without restarting NDM. Values stay in memory, never in NDM's
+    store. Do not expose upstream exception text: it may contain profile data.
     """
-    data = settings.model_dump() if isinstance(settings, Settings) else settings
-    if not data.get("firefox_cookies"):
+    browser = cookie_browser(settings)
+    if browser == "none":
         return None
     from yt_dlp.cookies import extract_cookies_from_browser
     try:
-        return extract_cookies_from_browser("firefox")
+        return extract_cookies_from_browser(browser)
     except Exception as exc:
-        raise ValueError(FIREFOX_COOKIE_ERROR) from exc
+        raise ValueError(cookie_error(browser)) from exc
 
 
 def requests_proxies(settings: Settings | dict) -> dict[str, str] | None:

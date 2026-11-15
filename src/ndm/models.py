@@ -31,7 +31,8 @@ PROXY_SCHEME_ALIASES = {"sockcs5": "socks5"}
 # Bump when the daemon's settings schema or local IPC payload contract changes
 # so the desktop can replace an out-of-date background daemon instead of sending
 # it fields it cannot accept.
-SETTINGS_SCHEMA_VERSION = 10
+SETTINGS_SCHEMA_VERSION = 11
+COOKIE_BROWSERS = ("none", "firefox", "chrome", "chromium", "brave", "edge", "vivaldi", "opera", "safari")
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
@@ -197,6 +198,7 @@ class Settings(BaseModel):
     allowed_domains: list[str] = Field(default_factory=list)
     media_quality: str = "best"
     firefox_cookies: bool = False
+    cookie_browser: str = "none"
     spotify_format: str = "mp3"
     spotify_bitrate: str = "192k"
     # "ndm" writes tags directly (None-safe); "spotdl" keeps upstream's embedder
@@ -260,6 +262,32 @@ class Settings(BaseModel):
         if value not in {"mp3", "m4a", "flac", "opus", "ogg"}:
             raise ValueError("Choose MP3, M4A, FLAC, Opus, or Ogg.")
         return value
+
+    @field_validator("cookie_browser")
+    @classmethod
+    def valid_cookie_browser(cls, value: str) -> str:
+        if value not in COOKIE_BROWSERS:
+            raise ValueError("Choose one of: " + ", ".join(COOKIE_BROWSERS))
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_cookie_settings(cls, data):
+        """Keep the legacy Firefox flag and the browser selector consistent.
+
+        firefox_cookies predates cookie_browser and is still persisted in older
+        state files and sent over IPC. Resolve it from the raw input so an
+        explicit cookie_browser="none" really turns cookies off instead of being
+        overridden by a stale flag.
+        """
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        if "cookie_browser" in values and values["cookie_browser"] is not None:
+            values["firefox_cookies"] = values["cookie_browser"] == "firefox"
+        elif values.get("firefox_cookies"):
+            values["cookie_browser"] = "firefox"
+        return values
 
     @field_validator("spotify_matcher")
     @classmethod
@@ -327,6 +355,7 @@ class SettingsPatch(BaseModel):
     allowed_domains: list[str] | None = None
     media_quality: str | None = None
     firefox_cookies: bool | None = None
+    cookie_browser: str | None = None
     spotify_format: str | None = None
     spotify_bitrate: str | None = None
     spotify_tagger: str | None = None
@@ -365,10 +394,10 @@ class CaptureRequest(BaseModel):
 
 
 class BrowserOffer(BaseModel):
-    """A download the Firefox extension intercepted and handed to the app.
+    """A download a browser extension intercepted and handed to the app.
 
-    The extension only cancels Firefox's own transfer after the daemon accepts
-    the offer, so a refused or unreachable NDM leaves the browser download alone.
+    The extension only cancels the browser's own transfer after the daemon
+    accepts the offer, so a refused or unreachable NDM leaves it alone.
     """
     model_config = ConfigDict(extra="forbid")
     url: str = Field(min_length=1, max_length=8192)
@@ -383,3 +412,10 @@ class OfferDecision(BaseModel):
     id: str = Field(min_length=1, max_length=64)
     accept: bool
     start_paused: bool = False
+
+
+class BrowserGrab(BaseModel):
+    """A YouTube or Spotify page the extension asked NDM to grab."""
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=1, max_length=8192)
+    kind: str = Field(default="", pattern="^(youtube|spotify)?$")

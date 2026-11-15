@@ -186,10 +186,10 @@ def create_client(settings: dict | None = None):
     import requests
     from ytmusicapi import YTMusic
 
-    from .network import firefox_cookie_jar, requests_proxies
+    from .network import cookie_jar, requests_proxies
 
     data = settings or {}
-    jar = firefox_cookie_jar(data)
+    jar = cookie_jar(data)
     proxies = requests_proxies(data)
     session = requests.Session()
     session.request = partial(session.request, timeout=30)

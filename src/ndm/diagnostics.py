@@ -288,9 +288,9 @@ def log_failure(logger: logging.Logger, stage: str, exc: BaseException,
 
 _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)cookie(s)? (file|database|profile)|could not (read|find|extract).*cookie|CookieLoadError"),
-     "Firefox cookies could not be read. Turn off Firefox cookies in Options → Capture, or install/sign in to Firefox."),
+     "Browser cookies could not be read. In Options → Capture, set Use cookies from to Off, or select a browser with a readable signed-in profile."),
     (re.compile(r"(?i)sign in to confirm|not a bot|confirm you're not a bot|account.*terminated"),
-     "YouTube is asking for a sign-in/bot check. Enable Firefox cookies (Options → Capture) after signing in to YouTube in Firefox, then retry."),
+     "YouTube is asking for a sign-in/bot check. Sign in to YouTube in Firefox or Chrome, select that browser under Options → Capture → Use cookies from, then retry."),
     (re.compile(r"(?i)no supported javascript runtime|signature solving failed|n challenge|nsig|jsinterp|deno"),
      "This source needs a JavaScript runtime. Install Deno system-wide or run `spotdl --download-deno`, then retry."),
     # A wrapped SSLError often *contains* an EOF; test that specific shape first
@@ -459,6 +459,7 @@ def environment(settings: dict | None = None) -> dict:
         "deno": shutil.which("deno") or "not on PATH",
         "proxy_enabled": bool(data.get("proxy_enabled")),
         "proxy_remote_dns": bool(data.get("proxy_remote_dns", True)),
+        "cookie_browser": data.get("cookie_browser") or ("firefox" if data.get("firefox_cookies") else "none"),
         "firefox_cookies": bool(data.get("firefox_cookies")),
         "debug": debug_enabled(),
     }

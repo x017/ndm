@@ -29,6 +29,7 @@ from .ipc import endpoint, listener, request
 from .media import inspect_media
 from .models import (
     SETTINGS_SCHEMA_VERSION,
+    BrowserGrab,
     BrowserOffer,
     CaptureRequest,
     NewDownload,
@@ -191,6 +192,8 @@ class NativeDaemon:
             return self.manager.capture(**CaptureRequest.model_validate(payload).model_dump())
         if operation == "browser.offer":
             return self.manager.offer_download(**BrowserOffer.model_validate(payload).model_dump())
+        if operation == "browser.grab":
+            return self.manager.offer_media(**BrowserGrab.model_validate(payload).model_dump())
         if operation == "browser.resolve":
             command = OfferDecision.model_validate(payload)
             return self.manager.resolve_offer(command.id, command.accept,

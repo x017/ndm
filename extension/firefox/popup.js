@@ -1,9 +1,12 @@
+const BROWSER = "firefox";
 const KINDS = ["video", "audio", "archive", "document", "image", "other"];
 const DEFAULTS = { enabled: true, minSizeKB: 0, types: KINDS.join(",") };
 const statusEl = document.getElementById("status");
 const enabledEl = document.getElementById("enabled");
 const sizeEl = document.getElementById("minSize");
 const typesEl = document.getElementById("types");
+document.getElementById("setupCommand").textContent = `uv run ndm extension install --browser ${BROWSER}`;
+document.getElementById("doctorCommand").textContent = `uv run ndm extension doctor --browser ${BROWSER}`;
 
 function selectedTypes() {
   return KINDS.filter((kind) => document.getElementById(`t-${kind}`).checked).join(",");
@@ -52,7 +55,7 @@ async function status() {
     statusEl.textContent = reply.enabled
       ? (reply.ask ? "NDM is running — it will ask before downloading."
                    : "NDM is running — downloads start automatically.")
-      : "NDM is running, but browser integration is off. Enable it in Options → Capture.";
+      : "NDM is running, but browser integration is off. Run: uv run ndm config browser_integration true";
   } else {
     statusEl.className = "status bad";
     const detail = reply && reply.error ? String(reply.error) : "";
@@ -71,3 +74,16 @@ async function status() {
 enabledEl.addEventListener("change", save);
 sizeEl.addEventListener("change", save);
 load().then(status);
+
+// Hand the active tab to the grabber; NDM still asks before downloading.
+document.getElementById("grab").addEventListener("click", async () => {
+  const out = document.getElementById("grabResult");
+  out.textContent = "Sending to NDM…";
+  try {
+    const reply = await browser.runtime.sendMessage({ type: "grab" });
+    out.textContent = reply && reply.ok ? "Sent. Review it in the NDM window."
+                                        : (reply && reply.error) || "Could not send this page to NDM.";
+  } catch (error) {
+    out.textContent = String(error);
+  }
+});

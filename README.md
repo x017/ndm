@@ -5,9 +5,10 @@ NDM is a **desktop application**, built in Python with the native
 Internet Download Manager's working layout: menus, an icon toolbar, a category
 tree, a detailed download table, and a status bar.
 
-**There is no React app, web interface, browser extension, webview, or HTTP API.**
-The background daemon communicates over an authenticated Unix domain socket
-(Windows: named pipe). Closing the window leaves downloads running.
+**There is no React app, web interface, webview, or HTTP API.** The background
+daemon communicates over an authenticated Unix domain socket (Windows: named
+pipe). Optional Firefox and Chrome/Chromium extensions use native messaging
+(stdin/stdout), not a web server. Closing the window leaves downloads running.
 
 ## Features
 
@@ -29,9 +30,14 @@ The background daemon communicates over an authenticated Unix domain socket
   (192 kbps audio extraction via FFmpeg). Every inspected item shows its file
   size — exact when the source reports it, `~` when estimated, and the real
   byte count replaces the estimate once the download finishes.
-- **Optional Firefox cookies:** a boolean Capture option automatically reads
-  local Firefox cookies for authenticated downloads, media inspection, and
-  spotDL audio matching. Off by default; no extension or cookie file is needed.
+- **Browser handoff and page grabs:** optional Firefox and Chrome/Chromium
+  extensions intercept downloads with an in-app approval step and send the
+  current YouTube video or Spotify track/album/playlist to the existing
+  yt-dlp / spotDL pipelines. Brave and Edge can load the Chromium extension.
+- **Optional browser cookies:** select Firefox, Chrome, Chromium, Brave, Edge,
+  Vivaldi, Opera, or Safari in Capture options for authenticated downloads,
+  media inspection, and spotDL audio matching. Off by default; no cookie export
+  file is needed.
 - **Background capture:** opt-in link-inbox watching while the window is closed;
   opt-in clipboard capture while the desktop window is open. Optional host
   allowlist applies to both. Linux systemd and macOS LaunchAgent installers.
@@ -101,6 +107,9 @@ ndm logs                             # read the failure log after an error
 ndm logs --path                      # print only the log file location
 ndm doctor                           # test Spotify/YouTube reachability + tools
 ndm match-check <spotify-url>        # compare NDM vs spotDL matching (no download)
+ndm extension install --browser chrome   # register Firefox/Chrome/Chromium/Brave/Edge host
+ndm extension doctor --browser chrome    # test the actual native-host launch
+ndm config cookie_browser chrome         # select local browser cookies (or none)
 ndm stop                             # stop the background daemon
 ```
 
@@ -161,31 +170,59 @@ URL=https://example.org/media/video.mp4
 The daemon marks processed files `.processed`. Spotify inbox links are rejected;
 use the Spotify dialog or CLI so the spotDL metadata/matching path is explicit.
 Clipboard monitoring requires the open desktop window and only captures direct
-media extensions. There is no browser interception extension.
+media extensions. Browser interception is a separate opt-in integration; see
+[extension/README.md](extension/README.md) for Firefox and Chrome setup.
 
-### Firefox cookies
+### Browser cookies
 
-Open **Options → Capture**, check **Automatically use my Firefox cookies**, and
-click **OK**. The persisted boolean setting is `firefox_cookies` (default
-`false`). It works independently of automatic capture: manual downloads and
-Media Grabber inspections can use your existing Firefox login even when inbox
-and clipboard capture are off.
+Open **Options → Capture → Use cookies from**, select the browser where you are
+signed in, and click **OK**. Choices are Off, Firefox, Chrome, Chromium, Brave,
+Edge, Vivaldi, Opera, and Safari. The setting is `cookie_browser` (default
+`none`):
 
-When enabled, NDM reads a fresh cookie snapshot from the auto-detected Firefox
-profile for each new HTTP download, HTML inspection, yt-dlp operation, spotDL
-YouTube Music match, or NDM transfer of a matched audio source. This also works
-for downloads owned by the background daemon. Firefox can stay open; yt-dlp
-reads a temporary copy of its cookie database rather than modifying it. Only
-cookies matching the destination's domain, path, and security rules are sent.
-This does not bypass DRM or make an unauthorized account authorized.
+```bash
+uv run ndm config cookie_browser chrome
+uv run ndm config cookie_browser firefox
+uv run ndm config cookie_browser none
+```
 
-Cookie values are not saved in NDM settings, queue entries, or a cookie-export
-file. Turn the checkbox off to stop reading Firefox cookies for new operations.
-If no readable Firefox profile is available, NDM shows an actionable error;
-install/sign in to Firefox or disable the option. For Spotify queues, the
-cookies apply to spotDL's YouTube Music matching client and to NDM's yt-dlp
-transfer of the matched source; Spotify metadata still uses spotDL's normal
-anonymous or official API credentials, not browser cookies.
+This works independently of automatic capture and browser handoff: manual
+downloads, Media Grabber inspection, and Spotify matching can use an existing
+browser login even when inbox/clipboard capture is off. The older
+`firefox_cookies=true` setting is still accepted and maps to
+`cookie_browser=firefox`; an explicit browser selection takes precedence.
+
+NDM reads a fresh cookie snapshot locally for each new HTTP download, HTML
+inspection, yt-dlp operation, spotDL YouTube Music match, or transfer of a
+matched audio source. Only cookies matching the destination's domain, path, and
+security rules are sent. Cookie values are not saved in NDM settings, queue
+entries, or an export file. Select **Off** to stop reading cookies for new
+operations.
+
+Chromium-family cookie stores may require a keyring unlock and, on some systems,
+the browser to be fully closed. If no readable profile is available, NDM shows
+an actionable error without exposing profile paths or cookie values. Cookies do
+not bypass DRM or authorize an account. Spotify metadata still uses spotDL's
+normal anonymous/official API credentials; browser cookies apply to YouTube
+Music matching and the matched-audio transfer, not Spotify protected audio.
+
+### Browser extensions and page grabs
+
+The checkout ships `extension/firefox/` and `extension/chrome/`. They can hand
+ordinary downloads to NDM and grab the current YouTube/Spotify page. File
+handoff asks in the app by default and cancels the browser copy only after NDM
+accepts; a closed/refusing NDM leaves the browser download intact. Page grabs
+always ask and reuse the existing media pipelines.
+
+```bash
+uv run ndm extension install --browser firefox   # or chrome/chromium/brave/edge/all
+uv run ndm config browser_integration true
+uv run ndm extension doctor --browser firefox
+```
+
+Load the matching extension folder as described in
+[extension/README.md](extension/README.md). The extensions use native messaging;
+NDM still opens no HTTP listener.
 
 ## Using the Media Grabber
 
@@ -208,7 +245,8 @@ anonymous or official API credentials, not browser cookies.
    show the estimate until the real file size is known at completion.
 
 Protected streams and DRM are never bypassed. Spotify links are redirected to
-the spotDL dialog instead.
+the spotDL dialog instead. The browser extensions' page-grab button sends
+YouTube/Spotify links into this same approval/queue flow.
 
 ## Using spotDL
 
@@ -322,10 +360,10 @@ so the log is safe to share when reporting a problem.
   browser token, public bind address, or listening web port.
 - HTTP redirects are revalidated. Direct downloads write `.part` files before
   atomically renaming the completed result.
-- Firefox cookies are opt-in, read locally, kept in memory, and matched to the
-  request destination, including spotDL's YouTube Music clients. NDM does not
-  persist cookie values or transmit them to an NDM server. Upstream temporary
-  database copies are removed after reading.
+- Browser cookies are opt-in per selected browser, read locally, kept in memory,
+  and matched to the request destination, including spotDL's YouTube Music
+  clients. NDM does not persist cookie values or transmit them to an NDM server.
+  Upstream temporary database copies are removed after reading.
 - spotDL's upstream metadata cache is stored by spotDL in its usual per-user
   config directory. Matched audio transfers use NDM's destination folder and
   yt-dlp partial files, not spotDL's downloader temp directory.
@@ -361,7 +399,9 @@ src/ndm/
   spotify.py      spotDL metadata/matching adapter; NDM owns the transfer
   media.py        direct media/HTML inspection and yt-dlp
   models.py       validated settings, colors, proxy URLs, and URL rules
-  network.py      shared proxy configuration and opt-in Firefox cookies
+  network.py      shared proxy configuration and opt-in browser cookies
+  browser_host.py native-messaging stdio helper (no HTTP listener)
+  extension.py    per-browser host registration and doctor
   store.py        SQLite persistence and exclusive state ownership
   cli.py          native desktop, daemon, queue and service commands
 ```

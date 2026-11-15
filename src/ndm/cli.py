@@ -132,9 +132,12 @@ def main(argv: list[str] | None = None) -> None:
         p = sub.add_parser(name, help=f"{name.title()} a queued download")
         common(p)
         p.add_argument("id")
-    extension = sub.add_parser("extension", help="Register the Firefox download-handoff extension host")
+    extension = sub.add_parser("extension", help="Register the browser download/media handoff host")
     common(extension)
     extension.add_argument("action", choices=["install", "uninstall", "status", "doctor"])
+    extension.add_argument("--browser", default="firefox",
+                           choices=["firefox", "chrome", "chromium", "brave", "edge", "all"],
+                           help="Which browser to register (default: firefox)")
     service = sub.add_parser("service", help="Install/remove a Linux or macOS sign-in service")
     common(service)
     service.add_argument("action", choices=["install", "uninstall"])
@@ -151,33 +154,47 @@ def main(argv: list[str] | None = None) -> None:
             Desktop(data_dir=data_dir).run()
         elif command == "extension":
             from . import extension as ext
+            targets = list(ext.BROWSERS) if args.browser == "all" else [args.browser]
             if args.action == "install":
-                info = ext.install(data_dir)
-                print("Firefox native host registered.")
-                print(f"  Manifest:  {info['manifest']}")
-                print(f"  Launcher:  {info['launcher']}")
-                print("\nLoad the extension in Firefox:")
-                print("  1. Open about:debugging#/runtime/this-firefox")
-                print("  2. Click 'Load Temporary Add-on…'")
-                print(f"  3. Pick {info['extension']}/manifest.json")
-                print("\nTurn the handoff on (either one):")
+                infos = [ext.install(data_dir, target) for target in targets]
+                for info in infos:
+                    print(f"[{info['browser']}] native host registered → {info['manifest']}")
+                print(f"\nLauncher: {infos[0]['launcher']}")
+                print("\nLoad the extension:")
+                seen = set()
+                for target in targets:
+                    folder = ext.extension_dir(target)
+                    if folder in seen:
+                        continue
+                    seen.add(folder)
+                    if target == "firefox":
+                        print("  Firefox: about:debugging#/runtime/this-firefox → Load Temporary Add-on…")
+                    else:
+                        print(f"  {target.capitalize()}: chrome://extensions → Developer mode → Load unpacked")
+                    print(f"    {folder}")
+                print("\nTurn the handoff on:")
                 print("  uv run ndm config browser_integration true")
-                print("  or Options → Capture → 'Hand Firefox downloads to NDM'")
-                print("\nCheck it with: uv run ndm extension doctor")
-                print("Temporary add-ons are removed when Firefox closes; reload it next session.")
+                print("\nCheck it with: uv run ndm extension doctor --browser <name>")
+                return
             elif args.action == "uninstall":
-                info = ext.uninstall(data_dir)
-                print("Removed the native host." if info["removed"] else "No native host was registered.")
+                for target in targets:
+                    info = ext.uninstall(data_dir, target)
+                    print(f"[{target}] " + ("removed the native host." if info["removed"]
+                                            else "no native host was registered."))
             elif args.action == "doctor":
-                report = ext.doctor(data_dir)
-                for check in report["checks"]:
-                    mark = "OK  " if check["ok"] else "FAIL"
-                    print(f"  [{mark}] {check['name']}")
-                    if check["detail"] and not check["ok"]:
-                        print(f"         {check['detail']}")
-                if report["ok"]:
-                    print("\nAll checks passed. Firefox downloads will now ask in the app.")
-                else:
+                failed = False
+                for target in targets:
+                    report = ext.doctor(data_dir, target)
+                    print(f"\n[{target}]")
+                    for check in report["checks"]:
+                        mark = "OK  " if check["ok"] else "FAIL"
+                        print(f"  [{mark}] {check['name']}")
+                        if check["detail"] and not check["ok"]:
+                            print(f"         {check['detail']}")
+                    if report["ok"]:
+                        print(f"All checks passed. {target.capitalize()} handoff is ready.")
+                        continue
+                    failed = True
                     names = {c["name"] for c in report["checks"] if not c["ok"]}
                     print()
                     if names == {"browser integration enabled"}:
@@ -186,20 +203,28 @@ def main(argv: list[str] | None = None) -> None:
                         print("Everything is installed correctly. Turn the handoff on:")
                         print("  uv run ndm config browser_integration true")
                     else:
-                        print("Something failed above. Fix it, then re-run: uv run ndm extension install")
-                        print("Then reload the add-on in about:debugging (remove, then Load Temporary Add-on).")
+                        print(f"Something failed above. Fix it, then re-run: uv run ndm extension install --browser {target}")
+                        if target == "firefox":
+                            print("Then reload the add-on in about:debugging (remove, then Load Temporary Add-on).")
+                        else:
+                            print(f"Then reload NDM on {target.lower()}://extensions.")
+                if failed:
+                    raise SystemExit(1)
             else:
-                info = ext.status(data_dir)
-                print(f"Registered:        {'yes' if info['installed'] else 'no'}")
-                print(f"Manifest:          {info['manifest']}")
-                print(f"Launcher present:  {'yes' if info['launcher_exists'] else 'no'}")
-                if info.get("registered_path"):
-                    print(f"Host path:         {info['registered_path']}")
-                    if not info.get("path_matches"):
-                        print("  Warning: the registered path differs from this data dir. Re-run install.")
-                print(f"Extension folder:  {info['extension']}")
-                if not info["extension_present"]:
-                    print("  Warning: extension files not found next to the package.")
+                for target in targets:
+                    info = ext.status(data_dir, target)
+                    print(f"Browser:           {info['browser']}")
+                    print(f"Registered:        {'yes' if info['installed'] else 'no'}")
+                    print(f"Manifest:          {info['manifest']}")
+                    print(f"Launcher present:  {'yes' if info['launcher_exists'] else 'no'}")
+                    if info.get("registered_path"):
+                        print(f"Host path:         {info['registered_path']}")
+                        if not info.get("path_matches"):
+                            print("  Warning: the registered path differs from this data dir. Re-run install.")
+                    print(f"Extension folder:  {info['extension']}")
+                    if not info["extension_present"]:
+                        print("  Warning: extension files not found next to the package.")
+                    print()
         elif command == "service":
             install_service(data_dir, args.start, args.action == "uninstall")
         elif command == "add":
@@ -287,7 +312,7 @@ def main(argv: list[str] | None = None) -> None:
                 state = request(data_dir, "state", timeout=10)
                 current = state.get("settings", {})
                 keys = [k for k in fields
-                        if k.startswith(("proxy_", "spotify_", "firefox_", "browser_"))]
+                        if k.startswith(("proxy_", "spotify_", "firefox_", "cookie_", "browser_"))]
                 for key in keys:
                     value = current.get(key)
                     if key == "proxy_password" and value:
