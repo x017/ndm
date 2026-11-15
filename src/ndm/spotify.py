@@ -12,11 +12,19 @@ import os
 import re
 import shutil
 import threading
+from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .models import safe_filename
-from .network import configure_environment, httpx_options, proxy_url, requests_proxies
+from .network import (
+    configure_environment,
+    firefox_cookie_jar,
+    firefox_cookie_options,
+    httpx_options,
+    proxy_url,
+    requests_proxies,
+)
 
 _INIT_LOCK = threading.RLock()
 _CLIENT_INITIALIZED = False
@@ -43,7 +51,8 @@ def availability() -> dict:
             "source": "YouTube Music (spotDL match)", "protected_spotify_audio": False}
 
 
-def _settings(data_dir: Path, output: Path, audio_format: str, bitrate: str) -> dict:
+def _settings(data_dir: Path, output: Path, audio_format: str, bitrate: str,
+              settings: dict | None = None) -> dict:
     return {
         "audio_providers": ["youtube-music"], "lyrics_providers": [],
         "output": str(output), "format": audio_format, "bitrate": bitrate,
@@ -53,6 +62,9 @@ def _settings(data_dir: Path, output: Path, audio_format: str, bitrate: str) -> 
         "only_verified_results": False, "fetch_albums": False,
         "max_filename_length": 180, "m3u": None, "archive": None,
         "save_file": None, "save_errors": None, "proxy": None,
+        # spotDL creates a second yt-dlp handler for the actual transfer. Its
+        # public extra-options setting reaches both that handler and the matcher.
+        "yt_dlp_args": "--cookies-from-browser firefox" if (settings or {}).get("firefox_cookies") else None,
     }
 
 
@@ -78,20 +90,36 @@ def _configure_proxy(settings: dict | None) -> None:
 
 
 def _configure_audio_provider(provider, settings: dict | None) -> None:
-    url = proxy_url(settings or {})
-    if not url:
-        return
-    provider.audio_handler.params["proxy"] = url
-    client = getattr(provider, "client", None)
-    if client is not None:
-        client.proxies = requests_proxies(settings or {})
-        # Upstream retries construct a fresh YTMusic client; keep the proxy there too.
-        provider._create_client = lambda: _proxied_ytmusic(settings or {})
+    data = settings or {}
+    url = proxy_url(data)
+    if url:
+        provider.audio_handler.params["proxy"] = url
+    cookie_options = firefox_cookie_options(data)
+    if cookie_options:
+        provider.audio_handler.params.update(cookie_options)
+    else:
+        provider.audio_handler.params.pop("cookiesfrombrowser", None)
+    if url or cookie_options:
+        # Upstream retries construct a fresh YTMusic client; keep both options there.
+        provider._create_client = lambda: _configured_ytmusic(data)
+        if getattr(provider, "client", None) is not None:
+            provider.client = provider._create_client()
 
 
-def _proxied_ytmusic(settings: dict):
+def _configured_ytmusic(settings: dict):
+    import requests
     from ytmusicapi import YTMusic
-    return YTMusic(language="de", proxies=requests_proxies(settings))
+
+    jar = firefox_cookie_jar(settings)
+    proxies = requests_proxies(settings)
+    session = requests.Session()
+    session.request = partial(session.request, timeout=30)
+    session.trust_env = not proxies
+    if jar is not None:
+        # Requests applies domain/path/secure matching to session cookies. Do not
+        # flatten the jar into a header, which would leak cookies across hosts.
+        session.cookies.update(jar)
+    return YTMusic(language="de", proxies=proxies, requests_session=session)
 
 
 def _initialize_client(data_dir: Path) -> None:
@@ -129,8 +157,10 @@ def search(url: str, data_dir: Path, *, limit: int = 500, settings: dict | None 
     _configure_proxy(settings)
     from spotdl.utils import search as upstream_search
     from spotdl.utils.search import parse_query
-    if proxy_url(settings or {}):
-        upstream_search.client = _proxied_ytmusic(settings or {})
+    if proxy_url(settings or {}) or (settings or {}).get("firefox_cookies"):
+        upstream_search.client = _configured_ytmusic(settings or {})
+    else:
+        upstream_search.client = None
 
     # parse_query is the same metadata expansion used by spotdl.Spotdl.search.
     songs = parse_query([url.strip()], threads=2)
@@ -173,7 +203,7 @@ def download(song_data: dict, destination: Path, data_dir: Path, stop, progress,
     # spotDL constructs its semaphore before entering run_until_complete; bind it
     # to this worker's loop explicitly (the daemon may have serviced earlier jobs).
     asyncio.set_event_loop(loop)
-    downloader = Downloader(settings=_settings(data_dir, Path(template), audio_format, bitrate), loop=loop)
+    downloader = Downloader(settings=_settings(data_dir, Path(template), audio_format, bitrate, settings), loop=loop)
     # Downloader resets GlobalConfig during construction; restore NDM's full proxy map.
     _configure_proxy(settings)
     for provider in downloader.audio_providers:

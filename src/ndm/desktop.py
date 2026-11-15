@@ -969,7 +969,7 @@ class Desktop:
                         form["allowed_domains"] = [v.strip() for v in domains.split(",") if v.strip()]
                         ctx.text("Drop .txt or .url files containing media links into the inbox. No browser extension is required.", width=ui.FILL, size=11)
                         form["firefox_cookies"] = ctx.checkbox("Automatically use my Firefox cookies", form["firefox_cookies"])
-                        ctx.text("Reads Firefox cookies locally for each new download or media inspection. Only cookies matching the destination are sent; NDM does not save cookie values. Does not apply to spotDL.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                        ctx.text("Reads Firefox cookies locally for each new download, media inspection, or spotDL audio match. Only cookies matching the destination are sent; NDM does not save cookie values.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                     elif self.options_tab == 4:
                         formats = ["mp3", "m4a", "flac", "opus", "ogg"]
                         rates = ["auto", "128k", "192k", "256k", "320k", "disable"]
@@ -978,6 +978,7 @@ class Desktop:
                         info = state["daemon"]["spotify"]
                         ctx.text(f"spotDL {info['version'] or 'not installed'} · FFmpeg {'installed' if info['ffmpeg'] else 'missing'}", size=12)
                         ctx.text("NDM calls the upstream spotDL Python API. Spotify supplies metadata; audio comes from a matching YouTube Music result. No spotDL web UI is launched.", width=ui.FILL, size=11)
+                        ctx.text("The Capture tab's Firefox cookie option also applies to spotDL's YouTube Music search and audio download requests.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                         ctx.text("Use only audio you own or have permission to save. Pausing a spotDL track is cooperative; conversion may finish before it stops.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                     else:
                         self._appearance_options(ctx, state)

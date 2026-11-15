@@ -26,8 +26,8 @@ The background daemon communicates over an authenticated Unix domain socket
 - **yt-dlp media grabber:** media-page and direct-media inspection,
   format selection, and background extraction.
 - **Optional Firefox cookies:** a boolean Capture option automatically reads
-  local Firefox cookies for authenticated downloads and media inspection.
-  Off by default; no browser extension or cookie-export file is needed.
+  local Firefox cookies for authenticated downloads, media inspection, and
+  spotDL audio matching. Off by default; no extension or cookie file is needed.
 - **Background capture:** opt-in link-inbox watching while the window is closed;
   opt-in clipboard capture while the desktop window is open. Optional host
   allowlist applies to both. Linux systemd and macOS LaunchAgent installers.
@@ -158,17 +158,19 @@ Media Grabber inspections can use your existing Firefox login even when inbox
 and clipboard capture are off.
 
 When enabled, NDM reads a fresh cookie snapshot from the auto-detected Firefox
-profile for each new HTTP download, HTML inspection, or yt-dlp operation. This
-also works for downloads owned by the background daemon. Firefox can stay open;
-yt-dlp reads a temporary copy of its cookie database rather than modifying it.
-Only cookies matching the destination's domain, path, and security rules are
-sent. This does not bypass DRM or make an unauthorized account authorized.
+profile for each new HTTP download, HTML inspection, yt-dlp operation, or spotDL
+YouTube Music search/audio transfer. This also works for downloads owned by the
+background daemon. Firefox can stay open; yt-dlp reads a temporary copy of its
+cookie database rather than modifying it. Only cookies matching the
+destination's domain, path, and security rules are sent. This does not bypass
+DRM or make an unauthorized account authorized.
 
 Cookie values are not saved in NDM settings, queue entries, or a cookie-export
 file. Turn the checkbox off to stop reading Firefox cookies for new operations.
 If no readable Firefox profile is available, NDM shows an actionable error;
-install/sign in to Firefox or disable the option. The option does not apply to
-spotDL's separate Spotify/YouTube Music clients.
+install/sign in to Firefox or disable the option. For spotDL, the cookies apply
+to the YouTube Music matching/download clients; Spotify metadata still uses
+spotDL's normal anonymous or official API credentials, not browser cookies.
 
 ## Using spotDL
 
@@ -203,8 +205,9 @@ application before launching NDM; default spotDL metadata access needs no login.
 - HTTP redirects are revalidated. Direct downloads write `.part` files before
   atomically renaming the completed result.
 - Firefox cookies are opt-in, read locally, kept in memory, and matched to the
-  request destination. NDM does not persist cookie values or transmit them to
-  an NDM server. Upstream temporary database copies are removed after reading.
+  request destination, including spotDL's YouTube Music clients. NDM does not
+  persist cookie values or transmit them to an NDM server. Upstream temporary
+  database copies are removed after reading.
 - spotDL's upstream metadata cache is stored by spotDL in its usual per-user
   config directory. Temporary files also use that package's cache directory.
 
