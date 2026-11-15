@@ -103,6 +103,28 @@ def _configure_audio_provider(provider, settings: dict | None) -> None:
         provider.client = provider._create_client()
 
 
+def _bootstrap_ytmusic(client, settings: dict | None):
+    """Force ytmusicapi's lazy visitor-id handshake now, as its own logged step.
+
+    YTMusic() does no I/O; the first request triggers ``base_headers``, which
+    GETs https://music.youtube.com/ to scrape a visitor id. That homepage fetch
+    is a separate network leg from the search API, and it is what actually
+    fails behind a broken proxy -- the error says ``url: /``, not ``/search``.
+    Doing it at the match site means the log names the real failing step instead
+    of blaming "matching". Client construction itself stays lazy, because proxy
+    wiring and upstream retries also build clients without intending any I/O.
+    """
+    began = time.monotonic()
+    log.info("YTM bootstrap: fetching visitor id from https://music.youtube.com/")
+    try:
+        client.base_headers  # noqa: B018 - cached_property performs the request
+    except Exception as exc:
+        log_failure(log, "YouTube Music bootstrap (visitor id)", exc, settings=settings)
+        raise
+    log.info("YTM bootstrap ready in %.2fs", time.monotonic() - began)
+    return client
+
+
 def _configured_ytmusic(settings: dict):
     import requests
     from ytmusicapi import YTMusic
@@ -488,6 +510,8 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
     match_logger = YtdlpLogger("ndm.spotify.match", "[match]")
     try:
         _configure_audio_provider(provider, settings)
+        # Name the visitor-id handshake as its own step before any search runs.
+        _bootstrap_ytmusic(provider.client, settings)
         _trace_search(provider, song, settings)
         # Capture spotDL's own yt-dlp candidate inspection instead of letting its
         # quiet/no_warnings settings discard the network detail.

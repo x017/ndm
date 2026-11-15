@@ -361,7 +361,12 @@ def failure_message(exc: BaseException, *, detail: str = "", prefix: str = "",
 
 _NETWORK_FAILURE = re.compile(
     r"(?i)timed out|timeout|handshake|failed to resolve|getaddrinfo|name or service not known"
-    r"|connection refused|network is unreachable|connection reset|tls/ssl")
+    r"|connection refused|network is unreachable|connection reset|tls/ssl"
+    # A poisoned local lookup often surfaces as a TLS record cut short rather than
+    # a timeout. Without these, the same misconfiguration produced two different
+    # hints depending on which way the connection happened to fail.
+    r"|sslerror|ssleoferror|unexpected_eof_while_reading|eof occurred in violation of protocol"
+    r"|max retries exceeded|wrong version number|unknown ca|certificate verify failed")
 
 
 def config_hint(settings: dict | None, exc: BaseException | str = "") -> str:
