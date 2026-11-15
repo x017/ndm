@@ -152,7 +152,7 @@ def main(argv: list[str] | None = None) -> None:
             from .diagnostics import setup_logging
             from .models import Settings
             from .store import Store
-            setup_logging(data_dir)
+            setup_logging(data_dir, rotate=False)
             try:
                 settings = Settings.model_validate(Store(data_dir).get_meta("settings", {})).model_dump()
             except Exception:
@@ -211,7 +211,7 @@ def main(argv: list[str] | None = None) -> None:
             except (OSError, ValueError, RuntimeError, EOFError):
                 from .models import Settings
                 from .store import Store
-                setup_logging(data_dir)
+                setup_logging(data_dir, rotate=False)
                 try:
                     settings = Settings.model_validate(Store(data_dir).get_meta("settings", {})).model_dump()
                 except Exception:

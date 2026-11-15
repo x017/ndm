@@ -337,5 +337,6 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
     except Exception as exc:
         if stop.is_set():
             raise yt_dlp.utils.DownloadCancelled() from exc
-        log_failure(log, "media transfer", exc, url=task["url"], source=task.get("source"))
-        raise ValueError(failure_message(exc, detail=logger.summary())) from exc
+        log_failure(log, "media transfer", exc, settings=settings,
+                    url=task["url"], source=task.get("source"))
+        raise ValueError(failure_message(exc, detail=logger.summary(), settings=settings)) from exc

@@ -102,16 +102,26 @@ class _RedactingFilter(logging.Filter):
         return True
 
 
-def setup_logging(data_dir: Path, *, debug: bool | None = None) -> Path:
-    """Attach a rotating, redacted file handler to the root logger (idempotent)."""
+def setup_logging(data_dir: Path, *, debug: bool | None = None, rotate: bool = True) -> Path:
+    """Attach a redacted file handler to the root logger (idempotent).
+
+    Only the daemon may rotate this file. RotatingFileHandler keeps its own
+    size counter and renames the file on rollover, so a second process (a CLI
+    command) rotating the same path swaps the inode underneath the daemon:
+    the daemon keeps writing to the now-renamed file and its entries vanish
+    from `ndm logs`. Non-owning processes append without rotating.
+    """
     global _CONFIGURED
     path = log_path(data_dir)
     if _CONFIGURED == path:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     verbose = debug_enabled() if debug is None else debug
-    handler = logging.handlers.RotatingFileHandler(
-        path, maxBytes=_MAX_BYTES, backupCount=_BACKUPS, encoding="utf-8", delay=False)
+    if rotate:
+        handler: logging.Handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=_MAX_BYTES, backupCount=_BACKUPS, encoding="utf-8", delay=False)
+    else:
+        handler = logging.FileHandler(path, mode="a", encoding="utf-8", delay=False)
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s"))
     handler.addFilter(_RedactingFilter())
@@ -223,7 +233,8 @@ def detail_text(exc: BaseException) -> str:
     return redact(" ".join(dict.fromkeys(parts)))
 
 
-def log_failure(logger: logging.Logger, stage: str, exc: BaseException, **fields) -> None:
+def log_failure(logger: logging.Logger, stage: str, exc: BaseException,
+                settings: dict | None = None, **fields) -> None:
     """Write the full, redacted failure chain plus the stage that produced it."""
     context = " ".join(f"{k}={redact(v)}" for k, v in fields.items() if v not in (None, ""))
     logger.error("FAILED at %s%s: %s: %s", stage, f" ({context})" if context else "",
@@ -235,7 +246,7 @@ def log_failure(logger: logging.Logger, stage: str, exc: BaseException, **fields
             logger.error("  cause[%d].error: %s", depth, redact(hidden))
     logger.debug("Traceback for %s:\n%s", stage,
                  redact("".join(traceback.format_exception(type(exc), exc, exc.__traceback__))))
-    hint = diagnose(exc)
+    hint = config_hint(settings, detail_text(exc)) or diagnose(exc)
     if hint:
         logger.error("  hint: %s", hint)
 
@@ -304,7 +315,7 @@ def diagnose(exc: BaseException | str) -> str:
 
 
 def failure_message(exc: BaseException, *, detail: str = "", prefix: str = "",
-                    limit: int = 460) -> str:
+                    limit: int = 460, settings: dict | None = None) -> str:
     """Build a queue-row message that survives safe_error's 500-char truncation.
 
     The actionable hint goes first: yt-dlp's raw text is often longer than the
@@ -315,7 +326,7 @@ def failure_message(exc: BaseException, *, detail: str = "", prefix: str = "",
         text = redact(text).split(" (caused by ")[0].split("; please report this issue")[0].strip()
         return text[7:].strip() if text.startswith("ERROR: ") else text
 
-    hint = diagnose(detail or exc)
+    hint = config_hint(settings, detail_text(exc)) or diagnose(detail or exc)
     raw = tidy(str(exc)) or type(exc).__name__
     # A generic wrapper ("Failed to complete request.") hides the real cause in
     # an attribute or a chained exception. Prefer that text for the visible row.
@@ -336,6 +347,31 @@ def failure_message(exc: BaseException, *, detail: str = "", prefix: str = "",
         parts.append(body)
     parts.append("full log: ndm logs")
     return " | ".join(parts)
+
+
+_NETWORK_FAILURE = re.compile(
+    r"(?i)timed out|timeout|handshake|failed to resolve|getaddrinfo|name or service not known"
+    r"|connection refused|network is unreachable|connection reset|tls/ssl")
+
+
+def config_hint(settings: dict | None, exc: BaseException | str = "") -> str:
+    """Advice that depends on the user's settings, not just the error text.
+
+    With a SOCKS proxy and remote DNS off, requests resolves hostnames on this
+    machine before handing the proxy an IP. On a censored/poisoned resolver that
+    produces a handshake timeout that looks like a dead proxy exit, so name the
+    actual setting instead of sending the user to replace a working proxy.
+    """
+    data = settings or {}
+    if not data.get("proxy_enabled"):
+        return ""
+    url = str(data.get("proxy_url") or "")
+    if not url.lower().startswith(("socks5://", "socks://")):
+        return ""
+    if data.get("proxy_remote_dns") is False and (not exc or _NETWORK_FAILURE.search(str(exc))):
+        return ("Remote DNS is OFF, so hostnames are resolved on this machine before the proxy "
+                "sees them. Enable Options → Network → remote DNS (socks5h) and retry.")
+    return ""
 
 
 def environment(settings: dict | None = None) -> dict:

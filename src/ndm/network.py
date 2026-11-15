@@ -29,7 +29,9 @@ def proxy_url(settings: Settings | dict) -> str:
     username = data.get("proxy_username") or parsed.username or ""
     password = data.get("proxy_password") or parsed.password or ""
     scheme = parsed.scheme
-    if scheme == "socks5" and data.get("proxy_remote_dns", True):
+    # Treat only an explicit False as "off": a None from a partial payload must
+    # not silently downgrade to local DNS, which breaks censored-network lookups.
+    if scheme == "socks5" and data.get("proxy_remote_dns") is not False:
         scheme = "socks5h"
     auth = ""
     if username:

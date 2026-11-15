@@ -380,9 +380,10 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         except Exception as exc:
             if stop is not None and stop.is_set():
                 raise SpotifyCancelled() from exc
-            log_failure(log, "Spotify metadata refresh", exc, track=song.display_name)
+            log_failure(log, "Spotify metadata refresh", exc, settings=settings, track=song.display_name)
             raise ValueError(failure_message(
-                exc, prefix=f"Could not refresh Spotify metadata for {song.display_name}",
+                exc, settings=settings,
+                prefix=f"Could not refresh Spotify metadata for {song.display_name}",
             )) from exc
         song.artists = list(song.artists or [song.artist])
         song.artist = song.artist or (song.artists[0] if song.artists else "")
@@ -401,9 +402,10 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         except (LookupError, SpotifyCancelled):
             raise
         except Exception as exc:
-            log_failure(log, "YouTube Music matching (NDM)", exc, track=song.display_name)
+            log_failure(log, "YouTube Music matching (NDM)", exc, settings=settings, track=song.display_name)
             raise ValueError(failure_message(
-                exc, prefix=f"YouTube Music matching failed for {song.display_name}")) from exc
+                exc, settings=settings,
+                prefix=f"YouTube Music matching failed for {song.display_name}")) from exc
         song.download_url = found["url"]
         log.info("Matched %r -> %s (score %.1f via %s)", song.display_name, found["url"],
                  found["score"], found["matched_by"])
@@ -423,11 +425,11 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         # spotDL's view-count tie-breaker may inspect a candidate with yt-dlp and
         # wrap the real cause in AudioProviderError. Keep ranking unchanged, but
         # surface the underlying network/cookie/extractor failure to the queue.
-        log_failure(log, "YouTube Music matching", exc, track=song.display_name)
+        log_failure(log, "YouTube Music matching", exc, settings=settings, track=song.display_name)
         cause = exc.__cause__
         root = cause if cause is not None and cause is not exc else exc
         raise ValueError(failure_message(
-            root, detail=match_logger.summary(),
+            root, detail=match_logger.summary(), settings=settings,
             prefix=f"YouTube Music matching failed for {song.display_name}",
         )) from exc
     finally:
