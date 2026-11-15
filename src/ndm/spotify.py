@@ -393,6 +393,23 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
     log.info("Matching %r by %r (duration=%ss isrc=%s) proxy=%s cookies=%s",
              song.name, song.artist, song.duration, song.isrc or "-",
              bool((settings or {}).get("proxy_enabled")), bool((settings or {}).get("firefox_cookies")))
+    if (settings or {}).get("spotify_matcher") == "ndm":
+        from .matching import find_match
+
+        try:
+            found = find_match(song.json, settings=settings, stop=stop)
+        except (LookupError, SpotifyCancelled):
+            raise
+        except Exception as exc:
+            log_failure(log, "YouTube Music matching (NDM)", exc, track=song.display_name)
+            raise ValueError(failure_message(
+                exc, prefix=f"YouTube Music matching failed for {song.display_name}")) from exc
+        song.download_url = found["url"]
+        log.info("Matched %r -> %s (score %.1f via %s)", song.display_name, found["url"],
+                 found["score"], found["matched_by"])
+        return {"url": found["url"], "song": song.json, "provider": "YouTube Music via NDM",
+                "match_score": found["score"]}
+
     provider = YouTubeMusic()
     match_logger = YtdlpLogger("ndm.spotify.match", "[match]")
     try:

@@ -115,6 +115,10 @@ def main(argv: list[str] | None = None) -> None:
     logs.add_argument("--path", action="store_true", help="Print only the log file path")
     doctor = sub.add_parser("doctor", help="Test Spotify/YouTube connectivity and show tool versions")
     common(doctor)
+    compare = sub.add_parser("match-check", help="Compare the NDM and spotDL matchers without downloading")
+    common(compare)
+    compare.add_argument("url", help="Public Spotify track, album, or playlist URL")
+    compare.add_argument("--limit", type=int, default=10, help="How many tracks to compare")
     for name in ("pause", "resume", "remove"):
         p = sub.add_parser(name, help=f"{name.title()} a queued download")
         common(p)
@@ -143,6 +147,48 @@ def main(argv: list[str] | None = None) -> None:
             print(result["message"])
             print_result(request(data_dir, "spotify.queue", {"songs": [i["song"] for i in result["items"]],
                                                              "start_paused": args.paused}))
+        elif command == "match-check":
+            from . import spotify
+            from .diagnostics import setup_logging
+            from .models import Settings
+            from .store import Store
+            setup_logging(data_dir)
+            try:
+                settings = Settings.model_validate(Store(data_dir).get_meta("settings", {})).model_dump()
+            except Exception:
+                settings = Settings().model_dump()
+            listing = spotify.search(args.url, data_dir, limit=max(1, args.limit), settings=settings)
+            items = listing["items"][:max(1, args.limit)]
+            print(f"Comparing {len(items)} track(s). Nothing is downloaded.\n")
+            same = differ = errors = 0
+            for item in items:
+                song = item["song"]
+                label = f"{song.get('artist')} - {song.get('name')}"
+                outcomes = {}
+                for engine in ("spotdl", "ndm"):
+                    try:
+                        found = spotify.match_song(song, data_dir, stop=None,
+                                                   settings={**settings, "spotify_matcher": engine})
+                        outcomes[engine] = found["url"]
+                    except Exception as exc:
+                        outcomes[engine] = f"ERROR {type(exc).__name__}: {str(exc)[:110]}"
+                a, b = outcomes["spotdl"], outcomes["ndm"]
+                if a.startswith("ERROR") or b.startswith("ERROR"):
+                    errors += 1
+                    mark = "ERR "
+                elif a == b:
+                    same += 1
+                    mark = "SAME"
+                else:
+                    differ += 1
+                    mark = "DIFF"
+                print(f"{mark} {label}")
+                print(f"     spotdl: {a}")
+                print(f"     ndm   : {b}")
+            print(f"\n{same} identical, {differ} different, {errors} errored.")
+            if differ:
+                print("Open the differing links and listen before switching. To try NDM matching:")
+                print("  Options -> Source matcher -> NDM, or set spotify_matcher=ndm in settings.")
         elif command == "logs":
             from .diagnostics import log_path, tail
             if args.path:

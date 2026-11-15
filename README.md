@@ -100,6 +100,7 @@ ndm spotify https://open.spotify.com/playlist/...
 ndm logs                             # read the failure log after an error
 ndm logs --path                      # print only the log file location
 ndm doctor                           # test Spotify/YouTube reachability + tools
+ndm match-check <spotify-url>        # compare NDM vs spotDL matching (no download)
 ndm stop                             # stop the background daemon
 ```
 
@@ -233,6 +234,23 @@ source URL and transfer size. Stop is cooperative: matching or a
 conversion may finish before the track pauses. A paused/failed spotDL task
 starts the operation again; yt-dlp resume applies to the matched source, not to
 Spotify.
+
+NDM can also do the YouTube Music matching itself (`Options → Source matcher`).
+It calls `ytmusicapi` directly and scores candidates on normalized title,
+artists, duration, album, and verified status, penalizing versions you did not
+ask for (live, cover, sped up, karaoke). An ISRC hit short-circuits the search.
+Every candidate and its score is written to the diagnostics log.
+
+**spotDL remains the default matcher** because its scoring has more real-world
+tuning. Compare them on your own music before switching:
+
+```bash
+ndm match-check https://open.spotify.com/playlist/... --limit 10
+```
+
+That prints both choices per track and counts agreements/differences without
+downloading anything. Open the differing links, listen, then switch to
+`NDM (experimental)` in Options if you prefer its picks.
 
 NDM writes the tags itself (`Options → Tag writer → NDM`). Only fields that
 actually have a value are written, so a track with no ISRC, label, or release

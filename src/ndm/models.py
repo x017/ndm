@@ -31,7 +31,7 @@ PROXY_SCHEME_ALIASES = {"sockcs5": "socks5"}
 # Bump when the daemon's settings schema or local IPC payload contract changes
 # so the desktop can replace an out-of-date background daemon instead of sending
 # it fields it cannot accept.
-SETTINGS_SCHEMA_VERSION = 8
+SETTINGS_SCHEMA_VERSION = 9
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
@@ -200,6 +200,9 @@ class Settings(BaseModel):
     # "ndm" writes tags directly (None-safe); "spotdl" keeps upstream's embedder
     # as an escape hatch while the new writer is validated on real libraries.
     spotify_tagger: str = "ndm"
+    # Matching stays on spotDL until the NDM scorer is compared on real
+    # playlists; `ndm match-check URL` reports where the two disagree.
+    spotify_matcher: str = "spotdl"
     notifications: bool = True
 
     @field_validator("theme")
@@ -254,6 +257,13 @@ class Settings(BaseModel):
     def valid_spotify_format(cls, value: str) -> str:
         if value not in {"mp3", "m4a", "flac", "opus", "ogg"}:
             raise ValueError("Choose MP3, M4A, FLAC, Opus, or Ogg.")
+        return value
+
+    @field_validator("spotify_matcher")
+    @classmethod
+    def valid_spotify_matcher(cls, value: str) -> str:
+        if value not in {"ndm", "spotdl"}:
+            raise ValueError("Choose the NDM or spotDL matcher.")
         return value
 
     @field_validator("spotify_tagger")
@@ -316,6 +326,7 @@ class SettingsPatch(BaseModel):
     spotify_format: str | None = None
     spotify_bitrate: str | None = None
     spotify_tagger: str | None = None
+    spotify_matcher: str | None = None
     notifications: bool | None = None
 
 
