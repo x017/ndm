@@ -221,7 +221,14 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"Log: {path}")
                 print(text)
         elif command == "doctor":
-            from .diagnostics import check_connectivity, environment, log_path, setup_logging
+            from .diagnostics import (
+                check_connectivity,
+                code_fingerprint,
+                environment,
+                log_path,
+                setup_logging,
+            )
+            state: dict = {}
             try:
                 state = request(data_dir, "state", timeout=10)
                 settings = state.get("settings", {})
@@ -236,6 +243,17 @@ def main(argv: list[str] | None = None) -> None:
             print("Versions/tools:")
             for key, value in environment(settings).items():
                 print(f"  {key}: {value}")
+            disk = code_fingerprint()
+            running = (state.get("daemon", {}) if isinstance(state, dict) else {}).get("code_fingerprint")
+            print(f"\nCode on disk: {disk}")
+            if running is None:
+                print("Running daemon: not running, or too old to report its code version.")
+                print("  Start it with: ndm stop && ndm")
+            elif running != disk:
+                print(f"Running daemon: {running}  <-- STALE (old code in memory)")
+                print("  Restart it to use the code you just pulled: ndm stop && ndm")
+            else:
+                print(f"Running daemon: {running}  (up to date)")
             print(f"\nLog file: {log_path(data_dir)}")
             via = "your configured proxy" if settings.get("proxy_enabled") else "a direct connection"
             print(f"\nConnectivity (through {via}):")

@@ -10,6 +10,8 @@ values, and Authorization headers never reach the log file.
 """
 from __future__ import annotations
 
+import functools
+import hashlib
 import logging
 import logging.handlers
 import os
@@ -387,6 +389,40 @@ def config_hint(settings: dict | None, exc: BaseException | str = "") -> str:
         return ("Remote DNS is OFF, so hostnames are resolved on this machine before the proxy "
                 "sees them. Enable Options → Network → remote DNS (socks5h) and retry.")
     return ""
+
+
+@functools.lru_cache(maxsize=1)
+def code_fingerprint() -> str:
+    """Identify the source this process loaded, so a stale daemon is detectable.
+
+    Cached for the process lifetime on purpose: the daemon must keep reporting
+    the code it actually imported at startup. Recomputing from disk on every
+    request would make an old daemon read the newly pulled files and falsely
+    report itself as up to date.
+
+    The desktop only replaced a daemon when SETTINGS_SCHEMA_VERSION changed, so
+    a `git pull` that altered behaviour but not the settings shape left the old
+    process serving requests: new code on disk, old code in memory, and log
+    output that silently matched neither. This is especially easy to hit with
+    `uv run ndm` from a checkout, where the CLI is fresh on every invocation but
+    the daemon is long-lived.
+
+    Hash the package's .py contents (not mtimes, which a checkout rewrites) and
+    fall back to the version string if the source is unavailable, e.g. when
+    frozen or installed as a zip.
+    """
+    try:
+        root = Path(__file__).resolve().parent
+        digest = hashlib.sha256()
+        files = sorted(root.glob("*.py"))
+        if not files:
+            raise OSError("no source files")
+        for path in files:
+            digest.update(path.name.encode())
+            digest.update(path.read_bytes())
+        return digest.hexdigest()[:16]
+    except Exception:
+        return f"version-{os.environ.get('NDM_VERSION', 'unknown')}"
 
 
 def environment(settings: dict | None = None) -> dict:

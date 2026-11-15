@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from . import spotify
 from .diagnostics import (
     check_connectivity,
+    code_fingerprint,
     environment,
     log_environment,
     log_failure,
@@ -172,12 +173,14 @@ class NativeDaemon:
             log.debug("IPC %s payload=%s", operation, redact(payload))
         if operation == "health":
             return {"name": "ndm", "transport": "local-ipc", "pid": os.getpid(),
-                    "settings_schema": SETTINGS_SCHEMA_VERSION}
+                    "settings_schema": SETTINGS_SCHEMA_VERSION,
+                    "code_fingerprint": code_fingerprint()}
         if operation == "state":
             result = self.manager.snapshot()
             result["daemon"]["spotify"] = spotify.availability()
             result["daemon"]["transport"] = endpoint(self.data_dir)[1]
             result["daemon"]["settings_schema"] = SETTINGS_SCHEMA_VERSION
+            result["daemon"]["code_fingerprint"] = code_fingerprint()
             result["daemon"]["log_path"] = str(log_path(self.data_dir))
             return result
         if operation == "add":
@@ -269,8 +272,8 @@ def run_daemon(*, data_dir: Path | None = None, allow_private: bool = True) -> N
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    log.info("NDM native daemon ready (local IPC; no web server). pid=%s data_dir=%s",
-             os.getpid(), directory)
+    log.info("NDM native daemon ready (local IPC; no web server). pid=%s data_dir=%s code=%s",
+             os.getpid(), directory, code_fingerprint())
     daemon.serve()
 
 

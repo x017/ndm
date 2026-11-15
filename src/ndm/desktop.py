@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 import nexa as ui
 
 from .daemon import is_running, start_detached
-from .diagnostics import get_logger, log_failure, redact
+from .diagnostics import code_fingerprint, get_logger, log_failure, redact
 from .ipc import request
 from .ipc import stream as ipc_stream
 from .models import (
@@ -232,8 +232,14 @@ class Desktop:
 
     @staticmethod
     def _daemon_is_compatible(state: dict) -> bool:
-        schema = state.get("daemon", {}).get("settings_schema")
+        info = state.get("daemon", {})
+        schema = info.get("settings_schema")
         if schema is not None and schema != SETTINGS_SCHEMA_VERSION:
+            return False
+        # A pull that changes behaviour without changing the settings shape must
+        # still replace the daemon, or the desktop keeps talking to old code.
+        running = info.get("code_fingerprint")
+        if running is not None and running != code_fingerprint():
             return False
         settings = state.get("settings") or {}
         required = set(OPTIONS_KEYS) | {"colors", "theme", "accent", "engine_running"}
