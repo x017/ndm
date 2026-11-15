@@ -523,3 +523,76 @@ def test_clicking_any_column_selects_the_whole_row(tmp_path, monkeypatch):
         ctx.input_mouse_button(ui.MouseButton.LEFT, False)
         frame(desktop, ctx)
         assert desktop.selected == {"native-test"}
+
+
+def test_row_menu_opens_at_the_pointer(tmp_path, monkeypatch):
+    """The panel's left edge must land on the click, not on the filename cell."""
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    rects = {}
+    original = desktop._row_context_menu
+
+    def spy(ctx, task):
+        real_item = ctx.menu_item
+
+        def menu_item(label, **kwargs):
+            clicked = real_item(label, **kwargs)
+            if label.startswith("Resume"):
+                rect = ctx.get_rect(ctx.make_id(label))
+                if rect.w > 0:
+                    rects["first"] = rect
+            return clicked
+
+        ctx.menu_item = menu_item
+        try:
+            original(ctx, task)
+        finally:
+            ctx.menu_item = real_item
+
+    desktop._row_context_menu = spy
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(4):
+            frame(desktop, ctx)
+        row_y = _download_row_y(desktop, ctx)
+        assert row_y is not None
+        for pointer_x in (400, 700, 900):
+            ctx.input_key(ui.Key.ESCAPE, True)
+            frame(desktop, ctx)
+            ctx.input_key(ui.Key.ESCAPE, False)
+            frame(desktop, ctx)
+            rects.clear()
+            ctx.input_mouse_move(pointer_x, row_y)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, True)
+            frame(desktop, ctx)
+            ctx.input_mouse_button(ui.MouseButton.RIGHT, False)
+            for _ in range(4):
+                frame(desktop, ctx)
+            assert "first" in rects, f"menu did not open at x={pointer_x}"
+            # menu_item labels are inset 16px inside the panel.
+            panel_left = rects["first"].x - 16
+            assert abs(panel_left - pointer_x) <= 2, (pointer_x, panel_left)
+
+
+def test_sort_columns_shifted_for_the_anchor_column(tmp_path, monkeypatch):
+    """Column 0 is the menu anchor, so the sort keys must start at 1."""
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    assert desktop.sort.column == 7  # Last Try Date
+    tasks = [
+        {"id": "a", "name": "zeta.zip", "size": 300, "status": "paused", "category": "archive",
+         "url": "https://x/z", "host": "z.org", "created_at": 3, "speed": 0, "downloaded": 0},
+        {"id": "b", "name": "alpha.iso", "size": 100, "status": "paused", "category": "archive",
+         "url": "https://x/a", "host": "a.org", "created_at": 1, "speed": 0, "downloaded": 0},
+        {"id": "c", "name": "mid.mp4", "size": 200, "status": "paused", "category": "video",
+         "url": "https://x/m", "host": "m.org", "created_at": 2, "speed": 0, "downloaded": 0},
+    ]
+    state = {"downloads": tasks}
+    for column, expected in ((1, ["alpha.iso", "mid.mp4", "zeta.zip"]),
+                             (2, ["alpha.iso", "mid.mp4", "zeta.zip"]),
+                             (7, ["alpha.iso", "mid.mp4", "zeta.zip"])):
+        desktop.sort = ui.TableSort(column, False)
+        assert [t["name"] for t in desktop.visible_tasks(state)] == expected
