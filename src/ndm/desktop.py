@@ -148,7 +148,7 @@ def complete_settings(settings: dict | None) -> dict:
 OPTIONS_KEYS = [
     "download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
     "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
-    "firefox_cookies", "spotify_format", "spotify_bitrate", "proxy_enabled", "proxy_url", "proxy_username",
+    "firefox_cookies", "spotify_format", "spotify_bitrate", "spotify_tagger", "proxy_enabled", "proxy_url", "proxy_username",
     "proxy_password", "proxy_remote_dns",
 ]
 
@@ -1238,6 +1238,8 @@ class Desktop:
                         rates = ["auto", "128k", "192k", "256k", "320k", "disable"]
                         form["spotify_format"] = formats[ctx.select("spotify_format", [v.upper() for v in formats], formats.index(form["spotify_format"]), label="Audio file format", width=ui.FILL)]
                         form["spotify_bitrate"] = rates[ctx.select("spotify_bitrate", rates, rates.index(form["spotify_bitrate"]), label="Conversion bitrate (auto/disable use FFmpeg defaults)", width=ui.FILL)]
+                        taggers = ["ndm", "spotdl"]
+                        form["spotify_tagger"] = taggers[ctx.select("spotify_tagger", ["NDM (recommended)", "spotDL (legacy)"], taggers.index(form.get("spotify_tagger") or "ndm"), label="Tag writer", width=ui.FILL)]
                         info = state["daemon"]["spotify"]
                         ctx.text(f"spotDL {info['version'] or 'not installed'} · FFmpeg {'installed' if info['ffmpeg'] else 'missing'}", size=12)
                         ctx.text("spotDL selects the YouTube Music match; NDM's yt-dlp pipeline downloads and converts it. No spotDL web UI or downloader gateway is used.", width=ui.FILL, size=11)

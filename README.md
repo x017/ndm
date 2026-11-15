@@ -234,6 +234,15 @@ conversion may finish before the track pauses. A paused/failed spotDL task
 starts the operation again; yt-dlp resume applies to the matched source, not to
 Spotify.
 
+NDM writes the tags itself (`Options → Tag writer → NDM`). Only fields that
+actually have a value are written, so a track with no ISRC, label, or release
+date tags cleanly instead of failing after the audio was saved. Cover art is
+fetched through your proxy, and a cover that cannot be downloaded is logged and
+skipped rather than failing the track. Choose `spotDL (legacy)` to use upstream's
+embedder instead. NDM uses standard Vorbis `publisher`/`website` comments (spotDL
+used `encodedby`/`woas`) and the `com.apple.iTunes` M4A atoms that other tag
+editors read.
+
 Output defaults to MP3 at 192 kbps. `auto`/`disable` leave the bitrate to
 yt-dlp/FFmpeg defaults; a higher output bitrate does not improve source quality.
 Public metadata access and YouTube Music availability depend on region and

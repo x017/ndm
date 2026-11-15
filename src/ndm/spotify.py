@@ -25,7 +25,7 @@ from .diagnostics import (
     log_failure,
     redact,
 )
-from .models import safe_filename
+from .models import SpotifyCancelled, safe_filename
 from .network import (
     configure_environment,
     firefox_cookie_jar,
@@ -39,10 +39,6 @@ log = get_logger("ndm.spotify")
 
 _INIT_LOCK = threading.RLock()
 _CLIENT_INITIALIZED = False
-
-
-class SpotifyCancelled(Exception):
-    pass
 
 
 def supported_url(value: str) -> bool:
@@ -454,16 +450,30 @@ def _taggable(song_data: dict) -> dict:
     return data
 
 
-def tag_file(path: Path, song_data: dict, *, stop=None) -> None:
-    """Embed Spotify metadata/cover art after NDM has downloaded and converted audio."""
+def tag_file(path: Path, song_data: dict, *, stop=None, settings: dict | None = None) -> None:
+    """Embed Spotify metadata/cover art after NDM has downloaded and converted audio.
+
+    NDM writes the tags itself by default: only fields that actually have a
+    value are written, so a track with no ISRC/label/date tags cleanly instead
+    of failing after the audio was saved. "spotdl" keeps upstream's embedder.
+    """
     if stop is not None and stop.is_set():
         raise SpotifyCancelled()
-    from spotdl.types.song import Song
-    from spotdl.utils.metadata import embed_metadata
 
-    log.info("Tagging %s", path)
+    writer = (settings or {}).get("spotify_tagger") or "ndm"
+    log.info("Tagging %s with the %s writer", path, writer)
     try:
-        embed_metadata(path, Song.from_missing_data(**_taggable(song_data)))
+        if writer == "spotdl":
+            from spotdl.types.song import Song
+            from spotdl.utils.metadata import embed_metadata
+
+            embed_metadata(path, Song.from_missing_data(**_taggable(song_data)))
+        else:
+            from .tagging import write_tags
+
+            write_tags(path, song_data, settings=settings, stop=stop)
+    except SpotifyCancelled:
+        raise
     except Exception as exc:
         log_failure(log, "tagging", exc, path=str(path))
         cause = exc.__cause__ or exc
@@ -513,7 +523,7 @@ def download(song_data: dict, destination: Path, data_dir: Path, stop, progress,
     if stop.is_set():
         raise SpotifyCancelled()
     progress(None, None, "tagging", 99)
-    tag_file(path, matched["song"], stop=stop)
+    tag_file(path, matched["song"], stop=stop, settings=settings)
     if stop.is_set():
         raise SpotifyCancelled()
     return path

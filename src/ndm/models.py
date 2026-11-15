@@ -22,11 +22,16 @@ CUSTOM_COLOR_KEYS = {
 }
 PROXY_SCHEMES = {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}
 # Accept the common "sockcs5" typo and save it as the standard SOCKS5 scheme.
+class SpotifyCancelled(Exception):
+    """Cooperative stop for a Spotify job. Defined here so the tagger and the
+    Spotify adapter can both raise it without importing each other."""
+
+
 PROXY_SCHEME_ALIASES = {"sockcs5": "socks5"}
 # Bump when the daemon's settings schema or local IPC payload contract changes
 # so the desktop can replace an out-of-date background daemon instead of sending
 # it fields it cannot accept.
-SETTINGS_SCHEMA_VERSION = 7
+SETTINGS_SCHEMA_VERSION = 8
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
@@ -192,6 +197,9 @@ class Settings(BaseModel):
     firefox_cookies: bool = False
     spotify_format: str = "mp3"
     spotify_bitrate: str = "192k"
+    # "ndm" writes tags directly (None-safe); "spotdl" keeps upstream's embedder
+    # as an escape hatch while the new writer is validated on real libraries.
+    spotify_tagger: str = "ndm"
     notifications: bool = True
 
     @field_validator("theme")
@@ -248,6 +256,13 @@ class Settings(BaseModel):
             raise ValueError("Choose MP3, M4A, FLAC, Opus, or Ogg.")
         return value
 
+    @field_validator("spotify_tagger")
+    @classmethod
+    def valid_spotify_tagger(cls, value: str) -> str:
+        if value not in {"ndm", "spotdl"}:
+            raise ValueError("Choose the NDM or spotDL tag writer.")
+        return value
+
     @field_validator("spotify_bitrate")
     @classmethod
     def valid_spotify_bitrate(cls, value: str) -> str:
@@ -300,6 +315,7 @@ class SettingsPatch(BaseModel):
     firefox_cookies: bool | None = None
     spotify_format: str | None = None
     spotify_bitrate: str | None = None
+    spotify_tagger: str | None = None
     notifications: bool | None = None
 
 
