@@ -117,6 +117,11 @@ def main(argv: list[str] | None = None) -> None:
     logs.add_argument("--grep", default="", help="Show only lines containing this text (e.g. FAILED, STREAM)")
     logs.add_argument("--match", action="store_true",
                       help="Show only the Spotify matching trace (queries, candidates, scores, errors)")
+    config = sub.add_parser("config", help="Read or change a setting without opening the desktop")
+    common(config)
+    config.add_argument("key", nargs="?", help="Setting name, e.g. proxy_remote_dns")
+    config.add_argument("value", nargs="?", help="New value: true/false, a number, or text")
+    config.add_argument("--list", action="store_true", help="List the network/Spotify settings")
     doctor = sub.add_parser("doctor", help="Test Spotify/YouTube connectivity and show tool versions")
     common(doctor)
     compare = sub.add_parser("match-check", help="Compare the NDM and spotDL matchers without downloading")
@@ -220,6 +225,61 @@ def main(argv: list[str] | None = None) -> None:
                     text = "\n".join(rows[-wanted:]) or "No log lines matched that filter."
                 print(f"Log: {path}")
                 print(text)
+        elif command == "config":
+            from .models import Settings
+            fields = Settings.model_fields
+            from .models import redact_proxy_url
+            if args.list or not args.key:
+                state = request(data_dir, "state", timeout=10)
+                current = state.get("settings", {})
+                keys = [k for k in fields if k.startswith(("proxy_", "spotify_", "firefox_"))]
+                for key in keys:
+                    value = current.get(key)
+                    if key == "proxy_password" and value:
+                        value = "***"
+                    elif key == "proxy_url" and value:
+                        # Credentials can be embedded in the URL itself.
+                        value = redact_proxy_url(value)
+                    print(f"  {key} = {value}")
+                print("\nChange one with: ndm config <key> <value>")
+            else:
+                key = args.key
+                if key not in fields:
+                    raise ValueError(f"Unknown setting {key!r}. Run 'ndm config --list'.")
+                if args.value is None:
+                    state = request(data_dir, "state", timeout=10)
+                    value = state.get("settings", {}).get(key)
+                    if key == "proxy_password" and value:
+                        value = "***"
+                    elif key == "proxy_url" and value:
+                        value = redact_proxy_url(value)
+                    print(f"{key} = {value}")
+                else:
+                    raw = args.value
+                    annotation = fields[key].annotation
+                    if "bool" in str(annotation):
+                        if raw.strip().lower() not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+                            raise ValueError(f"{key} expects true or false, got {raw!r}.")
+                        value = raw.strip().lower() in {"true", "1", "yes", "on"}
+                    elif "int" in str(annotation):
+                        value = int(raw)
+                    else:
+                        value = raw
+                    result = request(data_dir, "settings", {key: value}, timeout=15)
+                    # The settings operation returns the Settings dump itself.
+                    saved = result if isinstance(result, dict) else {}
+                    saved = saved.get("settings", saved)
+                    shown = saved.get(key, value)
+                    if key == "proxy_password" and shown:
+                        shown = "***"
+                    elif key == "proxy_url" and shown:
+                        shown = redact_proxy_url(str(shown))
+                    print(f"{key} = {shown}")
+                    if key == "proxy_remote_dns":
+                        from .models import redact_proxy_url
+                        from .network import proxy_url
+                        print(f"Effective proxy URL: {redact_proxy_url(proxy_url(saved))}")
+                        print("Restart the daemon so in-flight jobs pick this up: ndm stop && ndm")
         elif command == "doctor":
             from .diagnostics import (
                 check_connectivity,
