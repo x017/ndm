@@ -207,10 +207,11 @@ the spotDL dialog instead.
 1. Click **Spotify** on the toolbar.
 2. Paste a public `open.spotify.com` track, album, or playlist URL (Ctrl+V also
    opens this dialog automatically when the clipboard contains a Spotify link).
-3. Click **Find Tracks**. A busy indicator and elapsed time stay visible while
-   spotDL expands the list; large playlists can take a while. Results show the
-   track count and the playlist/album title when available. Previews are capped
-   at 500 tracks, with a warning when the list is longer.
+3. Click **Find Tracks**. Titles, artists, albums, and durations appear in the
+   table as each Spotify page is read, so you can review or queue tracks while
+   the rest of a long playlist is still loading. The heading shows the live
+   count and the playlist/album title when available. Previews are capped at
+   500 tracks, with a warning when the list is longer.
 4. Select rows and click **Queue Selected**.
 
 The daemon processes tracks using its normal concurrency limit. Each row shows

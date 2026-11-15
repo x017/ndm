@@ -101,8 +101,13 @@ class NativeDaemon:
                 message = connection.recv()
                 if not isinstance(message, dict):
                     raise ValueError("Invalid local request.")
-                result = self.dispatch(message.get("operation"), message.get("payload", {}))
-                connection.send({"ok": True, "result": result})
+                if message.get("stream"):
+                    for result in self.dispatch_stream(message.get("operation"), message.get("payload", {})):
+                        connection.send({"ok": True, "result": result})
+                    connection.send({"ok": True, "done": True})
+                else:
+                    result = self.dispatch(message.get("operation"), message.get("payload", {}))
+                    connection.send({"ok": True, "result": result})
             except ValidationError as exc:
                 try:
                     connection.send({"ok": False, "error": validation_message(exc)})
@@ -121,6 +126,15 @@ class NativeDaemon:
                     connection.send({"ok": False, "error": "The daemon could not complete this request. See daemon.log."})
                 except (OSError, EOFError):
                     pass
+
+    def dispatch_stream(self, operation: str, payload: dict):
+        if not isinstance(payload, dict):
+            raise ValueError("Request payload must be an object.")
+        if operation == "spotify.search.stream":
+            command = SpotifySearch.model_validate(payload)
+            return spotify.search_stream(command.url, self.data_dir,
+                                         settings=self.manager.settings.model_dump())
+        raise ValueError("Unknown local daemon operation.")
 
     def dispatch(self, operation: str, payload: dict) -> dict:
         if not isinstance(payload, dict):

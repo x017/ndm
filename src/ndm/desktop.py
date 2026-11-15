@@ -12,6 +12,7 @@ import nexa as ui
 
 from .daemon import is_running, start_detached
 from .ipc import request
+from .ipc import stream as ipc_stream
 from .models import (
     ACCENTS,
     CUSTOM_COLOR_KEYS,
@@ -147,7 +148,8 @@ class Desktop:
         self.spotify_url = ""
         self.spotify_result = None
         self.spotify_selected: set[str] = set()
-        self.spotify_started = 0.0
+        self.spotify_search_id = 0
+        self.spotify_handle = None
         self.busy = ""
         self.library = []
         self.library_selection = -1
@@ -330,8 +332,16 @@ class Desktop:
 
     def _operation_error(self, exc: BaseException) -> None:
         self.busy = ""
-        self.spotify_started = 0.0
         self.error = safe_error(exc, self.state.get("settings", {}))
+
+    def _cancel_spotify_stream(self) -> None:
+        self.spotify_search_id += 1
+        handle = self.spotify_handle
+        self.spotify_handle = None
+        if handle is not None:
+            handle.cancel()
+        if self.busy == "spotify":
+            self.busy = ""
 
     def search_spotify(self) -> None:
         if self.busy:
@@ -342,18 +352,48 @@ class Desktop:
             return
         self.spotify_url = url
         self.busy = "spotify"
-        self.spotify_started = time.monotonic()
         self.error = ""
-        self.spotify_result = None
+        self.spotify_result = {"items": [], "truncated": False, "total": 0, "kind": "", "title": ""}
         self.spotify_selected.clear()
-        self.runner.submit(lambda: self.call("spotify.search", {"url": url}, timeout=300),
-                           on_done=self._spotify_loaded, on_error=self._operation_error)
+        self.spotify_search_id += 1
+        search_id = self.spotify_search_id
+        self.spotify_handle = self.runner.stream(
+            lambda: ipc_stream(self.data_dir, "spotify.search.stream", {"url": url}, timeout=300),
+            on_item=lambda event, sid=search_id: self._spotify_event(sid, event),
+            on_done=lambda sid=search_id: self._spotify_done(sid),
+            on_error=lambda exc, sid=search_id: self._spotify_error(sid, exc))
 
-    def _spotify_loaded(self, result: dict) -> None:
+    def _spotify_event(self, search_id: int, event: dict) -> None:
+        if search_id != self.spotify_search_id:
+            return
+        result = self.spotify_result
+        if result is None:
+            result = {"items": [], "truncated": False, "total": 0, "kind": "", "title": ""}
+            self.spotify_result = result
+        if event.get("type") == "meta":
+            result["kind"] = event.get("kind", "")
+            result["title"] = event.get("title") or ""
+            result["total"] = int(event.get("total") or 0)
+        elif event.get("type") == "items":
+            new_items = event.get("items") or []
+            result["items"].extend(new_items)
+            self.spotify_selected.update(item["id"] for item in new_items)
+        elif event.get("type") == "done":
+            result["total"] = int(event.get("total") or len(result["items"]))
+            result["truncated"] = bool(event.get("truncated"))
+
+    def _spotify_done(self, search_id: int) -> None:
+        if search_id != self.spotify_search_id:
+            return
+        self.spotify_handle = None
         self.busy = ""
-        self.spotify_started = 0.0
-        self.spotify_result = result
-        self.spotify_selected = {item["id"] for item in result["items"]}
+
+    def _spotify_error(self, search_id: int, exc: BaseException) -> None:
+        if search_id != self.spotify_search_id:
+            return
+        self.spotify_handle = None
+        self.busy = ""
+        self.error = safe_error(exc, self.state.get("settings", {}))
 
     def queue_spotify(self, all_tracks: bool = False) -> None:
         if not self.spotify_result:
@@ -366,6 +406,7 @@ class Desktop:
         try:
             result = self.call("spotify.queue", {"songs": songs, "start_paused": self.start_paused})
             self.notice = f"Queued {len(result['tasks'])} tracks through spotDL."
+            self._cancel_spotify_stream()
             self.dialog = ""
             self.category = "audio"
             self.refresh()
@@ -721,6 +762,7 @@ class Desktop:
             self.error = ""
             return
         if self.dialog == "spotify":
+            self._cancel_spotify_stream()
             self.spotify_url = text
             self.spotify_result = None
             self.spotify_selected.clear()
@@ -732,6 +774,7 @@ class Desktop:
             return
         from .spotify import supported_url
         if supported_url(text) or urlsplit(text).hostname == "spotify.link":
+            self._cancel_spotify_stream()
             self.open_dialog("spotify")
             self.spotify_url = text
             self.spotify_result = None
@@ -839,7 +882,7 @@ class Desktop:
                 self.spotify_url = ctx.input("spotify_address", self.spotify_url, label="Spotify link", placeholder="https://open.spotify.com/track/", width=ui.FILL, max_bytes=2048, autofocus=True)
                 self.start_paused = ctx.checkbox("Add tracks without starting", self.start_paused)
                 with ctx.row(gap=10, align=ui.Align.CENTER):
-                    if ctx.button("Finding tracks…" if self.busy == "spotify" else "Find Tracks", icon=ui.Icon.SEARCH,
+                    if ctx.button("Find Tracks", icon=ui.Icon.SEARCH,
                                   variant=ui.ButtonVariant.PRIMARY, disabled=bool(self.busy)):
                         self.search_spotify()
                     ctx.text(f"Output: {state['settings']['spotify_format'].upper()} · {state['settings']['spotify_bitrate']} · FFmpeg {'ready' if info['ffmpeg'] else 'required'}", size=11)
@@ -847,19 +890,16 @@ class Desktop:
                 if not info["installed"]:
                     ctx.alert("spotDL is missing. Run uv sync or pip install -e . to reinstall NDM's dependencies.", tone=ui.Tone.WARNING)
                 self._error_in_dialog(ctx)
-                if self.busy == "spotify":
-                    elapsed = max(0, int(time.monotonic() - self.spotify_started))
-                    ctx.progress(indeterminate=True, width=ui.FILL, label="Reading Spotify list")
-                    ctx.text(f"Working… {elapsed}s elapsed. Fetching Spotify metadata for each track; large playlists can take a little while.",
-                             size=11, color=ui.Color.TEXT_SECONDARY, width=ui.FILL)
-                if self.spotify_result:
+                if self.spotify_result is not None:
                     items = self.spotify_result["items"]
                     total = self.spotify_result.get("total", len(items))
                     title = self.spotify_result.get("title") or ""
-                    found = f"Found {len(items)} track" + ("" if len(items) == 1 else "s")
+                    heading = f"{len(items)} track" + ("" if len(items) == 1 else "s")
+                    if total > len(items):
+                        heading += f" of {total}"
                     if title:
-                        found += f" — {title}"
-                    ctx.text(found, size=13, font=ui.FontRole.MEDIUM, width=ui.FILL)
+                        heading += f" — {title}"
+                    ctx.text(heading, size=13, font=ui.FontRole.MEDIUM, width=ui.FILL)
                     if self.spotify_result["truncated"]:
                         detail = f"Showing the first {len(items)} of {total} tracks." if total > len(items) else f"Showing the first {len(items)} tracks."
                         ctx.alert(detail + " Queue these, then import the remaining playlist separately.", tone=ui.Tone.WARNING)
@@ -879,13 +919,15 @@ class Desktop:
                     ctx.text(f"{len(self.spotify_selected)} of {len(items)} tracks selected", size=11)
                 with ctx.dialog_footer():
                     if ctx.button("Close"):
+                        self._cancel_spotify_stream()
                         self.dialog = ""
-                    if self.spotify_result:
+                    if self.spotify_result and self.spotify_result["items"]:
                         if ctx.button("Select All"):
                             self.spotify_selected = {i["id"] for i in self.spotify_result["items"]}
                         if ctx.button("Queue Selected", icon=ui.Icon.DOWNLOAD, variant=ui.ButtonVariant.PRIMARY):
                             self.queue_spotify()
             if not dialog.open:
+                self._cancel_spotify_stream()
                 self.dialog = ""
 
     def _media_dialog(self, ctx: ui.UI, state: dict) -> None:

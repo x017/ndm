@@ -57,6 +57,23 @@ def request(data_dir: Path, operation: str, payload: dict | None = None, *, time
     return reply["result"]
 
 
+def stream(data_dir: Path, operation: str, payload: dict | None = None, *, timeout: float = 30.0):
+    """Yield incremental results from a daemon operation over one authenticated connection."""
+    with connect(data_dir, timeout=timeout) as connection:
+        connection.send({"operation": operation, "payload": payload or {}, "stream": True})
+        while True:
+            if not connection.poll(timeout):
+                raise TimeoutError("The local daemon did not respond in time.")
+            reply = connection.recv()
+            if not isinstance(reply, dict):
+                raise RuntimeError("Invalid response from the local daemon.")
+            if not reply.get("ok"):
+                raise ValueError(reply.get("error", "The local daemon rejected the request."))
+            if reply.get("done"):
+                return
+            yield reply["result"]
+
+
 def listener(data_dir: Path) -> Listener:
     address, family = endpoint(data_dir)
     if family == "AF_UNIX":
