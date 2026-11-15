@@ -172,6 +172,8 @@ class Desktop:
         self.selected: set[str] = set()
         self.last_row = None
         self.last_click = 0.0
+        self.frame_no = 0
+        self._select_frame = -1
         self.sort = ui.TableSort(6, True)
         self.dialog = ""
         self.error = ""
@@ -639,6 +641,7 @@ class Desktop:
         ctx.theme.text_body = 12
 
     def draw(self, ctx: ui.UI) -> None:
+        self.frame_no += 1
         with self.cache_lock:
             state = self.state
         settings = state["settings"]
@@ -818,6 +821,24 @@ class Desktop:
         tasks.sort(key=keys.get(self.sort.column, keys[6]), reverse=self.sort.descending)
         return tasks
 
+    def _select_row(self, ctx: ui.UI, task: dict) -> None:
+        """Shared selection + double-click handling for row and filename clicks."""
+        if self._select_frame == self.frame_no and self.last_row == task["id"]:
+            return
+        self._select_frame = self.frame_no
+        if ui.Mod.PRIMARY in ctx.modifiers:
+            self.selected.symmetric_difference_update({task["id"]})
+        else:
+            self.selected = {task["id"]}
+        now = time.monotonic()
+        if self.last_row == task["id"] and now - self.last_click < 0.4:
+            if task["status"] == "completed":
+                self.perform("open", {"id": task["id"]})
+            else:
+                self.details_id = task["id"]
+                self.open_dialog("details")
+        self.last_row, self.last_click = task["id"], now
+
     def _select_for_menu(self, task_id: str) -> None:
         """Right-click keeps a multi-selection, but focuses an unselected row.
 
@@ -917,25 +938,20 @@ class Desktop:
                 for task in tasks:
                     with ctx.id_scope(task["id"]):
                         clicked = table.row(task["id"] in self.selected)
-                        if clicked:
-                            if ui.Mod.PRIMARY in ctx.modifiers:
-                                self.selected.symmetric_difference_update({task["id"]})
-                            else:
-                                self.selected = {task["id"]}
-                            now = time.monotonic()
-                            if self.last_row == task["id"] and now - self.last_click < 0.4:
-                                if task["status"] == "completed":
-                                    self.perform("open", {"id": task["id"]})
-                                else:
-                                    self.details_id = task["id"]
-                                    self.open_dialog("details")
-                            self.last_row, self.last_click = task["id"], now
+                        table.cell()
+                        # A table row is not an interactive item, so a context
+                        # menu anchored to it never opens. The filename is a
+                        # ghost button instead: it looks like the old label but
+                        # gives the menu a real widget to anchor to.
+                        name_clicked = ctx.button(
+                            task["name"], variant=ui.ButtonVariant.GHOST, size=ui.ControlSize.SM,
+                            icon=CATEGORY_ICONS.get(task["category"], ui.Icon.FILE),
+                            full_width=True, selected=task["id"] in self.selected)
+                        if clicked or name_clicked:
+                            self._select_row(ctx, task)
                         with ctx.context_menu("row_actions") as menu:
                             if menu:
                                 self._row_context_menu(ctx, task)
-                        table.cell()
-                        ctx.icon(CATEGORY_ICONS.get(task["category"], ui.Icon.FILE), size=15, color=ui.Color.ACCENT)
-                        ctx.text(task["name"], size=12, nowrap=True)
                         table.cell_text(size_label(task))
                         table.cell_text(status_text(task))
                         table.cell()
@@ -1147,12 +1163,17 @@ class Desktop:
                         if table:
                             for item in items:
                                 with ctx.id_scope(item["id"]):
-                                    if table.row(item["id"] in self.spotify_selected):
+                                    row_clicked = table.row(item["id"] in self.spotify_selected)
+                                    table.cell()
+                                    title_clicked = ctx.button(
+                                        item["name"], variant=ui.ButtonVariant.GHOST,
+                                        size=ui.ControlSize.SM, full_width=True,
+                                        selected=item["id"] in self.spotify_selected)
+                                    if row_clicked or title_clicked:
                                         self.spotify_selected.symmetric_difference_update({item["id"]})
                                     with ctx.context_menu("spotify_row_actions") as menu:
                                         if menu:
                                             self._spotify_row_menu(ctx, item, items)
-                                    table.cell_text(item["name"])
                                     table.cell_text(item["artist"])
                                     table.cell_text(item["album"])
                                     duration = item["duration"]
@@ -1436,7 +1457,13 @@ class Desktop:
                     if table:
                         for index, track in enumerate(self.library):
                             with ctx.id_scope(str(index)):
-                                if table.row(index == self.library_selection):
+                                row_clicked = table.row(index == self.library_selection)
+                                table.cell()
+                                name_clicked = ctx.button(
+                                    track["name"], variant=ui.ButtonVariant.GHOST,
+                                    size=ui.ControlSize.SM, icon=ui.Icon.MUSIC, full_width=True,
+                                    selected=index == self.library_selection)
+                                if row_clicked or name_clicked:
                                     self.library_selection = index
                                     try:
                                         os_open_path(track["path"])
@@ -1455,7 +1482,6 @@ class Desktop:
                                         ctx.menu_separator()
                                         if ctx.menu_item("Copy file path", icon=ui.Icon.COPY):
                                             self._copy_to_clipboard(ctx, track["path"], "Path")
-                                table.cell_text(track["name"])
                                 table.cell_text(format_bytes(track["size"]))
                                 table.cell_text(track["folder"])
                 ctx.text("Click a file to open it in your desktop audio player. Files stay on this computer.", size=11, color=ui.Color.TEXT_SECONDARY)

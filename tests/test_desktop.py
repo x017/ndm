@@ -242,3 +242,117 @@ def test_options_accepts_settings_from_older_daemon(tmp_path, monkeypatch):
     desktop.refresh()
     desktop.open_dialog("options")
     assert desktop.settings_form["proxy_enabled"] is False
+
+
+def _right_click_until(desktop, ctx, x, ys, opened):
+    """Right-click down a column until a context menu body actually runs."""
+    for y in ys:
+        ctx.input_mouse_move(x, y)
+        ctx.input_mouse_button(ui.MouseButton.RIGHT, True)
+        frame(desktop, ctx)
+        ctx.input_mouse_button(ui.MouseButton.RIGHT, False)
+        frame(desktop, ctx)
+        if opened:
+            return y
+    return None
+
+
+def test_right_click_opens_row_menu_and_acts_on_selection(tmp_path, monkeypatch):
+    """A table row is not an interactive item, so ctx.context_menu anchored to it
+    never opens. The filename cell must stay a real widget for the menu to work.
+    """
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+
+    opened = []
+    original = desktop._row_context_menu
+
+    def spy(ctx, task):
+        opened.append(task["id"])
+        original(ctx, task)
+
+    desktop._row_context_menu = spy
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        assert _right_click_until(desktop, ctx, 300, range(90, 220, 4), opened) is not None
+        assert opened == ["native-test"] or opened[0] == "native-test"
+        assert desktop.selected == {"native-test"}
+
+
+def test_right_click_menu_item_reaches_the_daemon(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+
+    opened = []
+    original = desktop._row_context_menu
+
+    def spy(ctx, task):
+        opened.append(task["id"])
+        real_item = ctx.menu_item
+
+        def menu_item(label, **kwargs):
+            if label == "Stop":
+                return True
+            return real_item(label, **kwargs)
+
+        ctx.menu_item = menu_item
+        try:
+            original(ctx, task)
+        finally:
+            ctx.menu_item = real_item
+
+    desktop._row_context_menu = spy
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        assert _right_click_until(desktop, ctx, 300, range(90, 220, 4), opened) is not None
+    assert ("action", {"id": "native-test", "action": "pause"}) in client.calls
+
+
+def test_left_click_still_selects_without_opening_details(tmp_path, monkeypatch):
+    """The filename is now a button; it must not break plain row selection."""
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        for y in range(90, 220, 4):
+            ctx.input_mouse_move(300, y)
+            ctx.input_mouse_button(ui.MouseButton.LEFT, True)
+            frame(desktop, ctx)
+            ctx.input_mouse_button(ui.MouseButton.LEFT, False)
+            frame(desktop, ctx)
+            if desktop.selected:
+                break
+        assert desktop.selected == {"native-test"}
+        assert desktop.dialog == ""
+
+
+def test_right_click_opens_spotify_result_menu(tmp_path, monkeypatch):
+    LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    desktop.spotify_result = {
+        "items": [{"id": "t1", "name": "Flow", "artist": "Sade", "album": "Alb",
+                   "duration": 240, "url": "https://open.spotify.com/track/1"}],
+        "truncated": False, "total": 1}
+    desktop.open_dialog("spotify")
+    opened = []
+    original = desktop._spotify_row_menu
+
+    def spy(ctx, item, items):
+        opened.append(item["id"])
+        original(ctx, item, items)
+
+    desktop._spotify_row_menu = spy
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        assert _right_click_until(desktop, ctx, 420, range(150, 600, 5), opened) is not None
+        assert opened[0] == "t1"
