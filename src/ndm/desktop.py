@@ -44,6 +44,13 @@ def format_size(size: float, *, estimated: bool = False) -> str:
     return ("~" if estimated else "") + format_bytes(size)
 
 
+def hex_color(color: ui.Color, *, keep_alpha: bool = True) -> str:
+    value = f"#{color.r:02x}{color.g:02x}{color.b:02x}"
+    if keep_alpha and color.a != 255:
+        value += f"{color.a:02x}"
+    return value
+
+
 def mp3_size_estimate(item: dict) -> int:
     """192 kbps MP3 ≈ 24,000 bytes per second of audio."""
     try:
@@ -140,6 +147,7 @@ class Desktop:
         self.spotify_url = ""
         self.spotify_result = None
         self.spotify_selected: set[str] = set()
+        self.spotify_started = 0.0
         self.busy = ""
         self.library = []
         self.library_selection = -1
@@ -151,7 +159,8 @@ class Desktop:
         self.last_clipboard_check = 0.0
         self.completed_ids = {t["id"] for t in self.state["downloads"] if t["status"] == "completed"}
         self._following_system = False
-        self._theme_signature = None
+        self._theme_mode: int | None = None
+        self._theme_pending = False
         self._base_palettes: dict[int, dict] = {}
 
     def call(self, operation: str, payload: dict | None = None, *, timeout: float = 30.0):
@@ -321,21 +330,28 @@ class Desktop:
 
     def _operation_error(self, exc: BaseException) -> None:
         self.busy = ""
+        self.spotify_started = 0.0
         self.error = safe_error(exc, self.state.get("settings", {}))
 
     def search_spotify(self) -> None:
         if self.busy:
             return
+        url = self.spotify_url.strip()
+        if not url:
+            self.error = "Paste a public Spotify track, album, or playlist link first."
+            return
+        self.spotify_url = url
         self.busy = "spotify"
+        self.spotify_started = time.monotonic()
         self.error = ""
         self.spotify_result = None
         self.spotify_selected.clear()
-        url = self.spotify_url
         self.runner.submit(lambda: self.call("spotify.search", {"url": url}, timeout=300),
                            on_done=self._spotify_loaded, on_error=self._operation_error)
 
     def _spotify_loaded(self, result: dict) -> None:
         self.busy = ""
+        self.spotify_started = 0.0
         self.spotify_result = result
         self.spotify_selected = {item["id"] for item in result["items"]}
 
@@ -381,47 +397,63 @@ class Desktop:
                            on_done=lambda tracks: setattr(self, "library", tracks), on_error=self._operation_error)
 
     def apply_theme(self, ctx: ui.UI, settings: dict) -> None:
+        # Nexa animates set_theme/follow_system_theme retargets and only applies
+        # them at the next begin_frame. Keep theme motion at zero so the target
+        # palette snaps in, and never capture a base palette mid-transition.
+        ctx.theme.motion = 0
         mode = settings["theme"]
-        signature = (mode, settings["accent"], tuple(sorted(settings.get("colors", {}).items())))
         if mode == "system":
-            if not self._following_system:
+            if not self._following_system and self.app is not None:
+                previous = ctx.theme_mode
                 try:
                     self.app.follow_system_theme(True)
                     self._following_system = True
                 except RuntimeError:
                     ctx.theme_mode = ui.ThemeMode.LIGHT
+                if ctx.theme_mode != previous:
+                    self._theme_pending = True
         elif self._following_system:
-            self.app.follow_system_theme(False)
+            if self.app is not None:
+                self.app.follow_system_theme(False)
             self._following_system = False
-        # Reset the base palette only when appearance settings change. Calling
-        # set_theme every frame restarts Nexa's accent animation and fights the
-        # custom ACCENT token; other frames keep the exact overridden palette.
-        if signature != self._theme_signature:
-            # Custom palettes are exact values, not a spring animation target.
-            ctx.theme.motion = 0
-            if mode != "system":
-                ctx.theme_mode = ui.ThemeMode.DARK if mode == "dark" else ui.ThemeMode.LIGHT
-            base_key = int(ctx.theme_mode)
-            if base_key not in self._base_palettes:
-                self._base_palettes[base_key] = {
+        if mode != "system":
+            target = ui.ThemeMode.DARK if mode == "dark" else ui.ThemeMode.LIGHT
+            if ctx.theme_mode != target:
+                ctx.theme_mode = target
+                self._theme_pending = True
+        resolved = int(ctx.theme_mode)
+        if self._theme_pending:
+            # The retarget was requested during the previous frame (or just
+            # now). This frame's colors are still the old palette; wait one
+            # frame for Nexa to snap to the pristine target before capturing.
+            self._theme_pending = False
+            self._theme_mode = None
+        else:
+            if resolved != self._theme_mode or resolved not in self._base_palettes:
+                # First frame, an OS theme switch, or the frame after a requested
+                # mode change: ctx.theme is the untouched Nexa base palette.
+                self._base_palettes[resolved] = {
                     token: ctx.theme[token] for token in ui.Token
                     if token not in {ui.Token.NONE, ui.Token.COUNT}
                 }
-            # Restore the pristine base before applying overrides, so resetting
-            # one token cannot leave the previous custom value behind.
-            for token, color in self._base_palettes[base_key].items():
+                self._theme_mode = resolved
+            # Restore the pristine base every frame so resetting one token, or
+            # changing the accent, cannot leave stale custom values behind.
+            for token, color in self._base_palettes[resolved].items():
                 ctx.theme[token] = color
-            self._theme_signature = signature
-        accent = ui.Color.hex(settings["accent"])
-        for token in (ui.Token.ACCENT, ui.Token.ACCENT_STRONG, ui.Token.CONTROL_ON, ui.Token.SERIES_1):
-            ctx.theme[token] = accent
-        ctx.theme[ui.Token.ACCENT_SUBTLE] = ui.with_alpha(accent, 0.15)
-        ctx.theme[ui.Token.FOCUS_RING] = ui.with_alpha(accent, 0.5)
-        luminance = accent.r * .299 + accent.g * .587 + accent.b * .114
-        ctx.theme[ui.Token.ACCENT_FOREGROUND] = ui.Color.hex("#172033" if luminance > 165 else "#ffffff")
-        for key, value in settings.get("colors", {}).items():
-            if key in CUSTOM_COLOR_KEYS:
-                ctx.theme[ui.Token[key.upper()]] = ui.Color.hex(value)
+            accent = ui.Color.hex(settings["accent"])
+            for token in (ui.Token.ACCENT, ui.Token.ACCENT_STRONG, ui.Token.CONTROL_ON, ui.Token.SERIES_1):
+                ctx.theme[token] = accent
+            ctx.theme[ui.Token.ACCENT_SUBTLE] = ui.with_alpha(accent, 0.15)
+            ctx.theme[ui.Token.FOCUS_RING] = ui.with_alpha(accent, 0.5)
+            luminance = accent.r * .299 + accent.g * .587 + accent.b * .114
+            contrast = ui.Color.hex("#172033" if luminance > 165 else "#ffffff")
+            ctx.theme[ui.Token.ACCENT_FOREGROUND] = contrast
+            ctx.theme[ui.Token.CONTROL_GLYPH] = contrast
+            ctx.theme[ui.Token.CONTROL_THUMB_ON] = contrast
+            for key, value in settings.get("colors", {}).items():
+                if key in CUSTOM_COLOR_KEYS:
+                    ctx.theme[ui.Token[key.upper()]] = ui.Color.hex(value)
         # Dense, restrained desktop chrome rather than a dashboard theme.
         ctx.theme.radius_control = 3
         ctx.theme.radius_surface = 3
@@ -439,20 +471,6 @@ class Desktop:
                     ctx.toast("Download complete", description=task["name"], tone=ui.Tone.SUCCESS)
                     self.completed_ids.add(task["id"])
         self._capture_clipboard(ctx, settings)
-        # Handle global shortcuts before widgets consume the key event. A focused
-        # Nexa input keeps its native Ctrl+V text-pasting behavior.
-        if not ctx.wants_keyboard:
-            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.V) and self.dialog in {"", "add", "spotify", "media"}:
-                self.paste_url(ctx)
-            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.N):
-                self.open_dialog("add")
-            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.A):
-                self.selected = {t["id"] for t in self.visible_tasks(state)}
-            if ctx.key_pressed(ui.Key.DELETE) and self.selected:
-                self.ask_delete(list(self.selected))
-            if ctx.key_pressed(ui.Key.ENTER) and len(self.selected) == 1:
-                self.details_id = next(iter(self.selected))
-                self.open_dialog("details")
         with ctx.column(width=ui.FILL, height=ui.FILL, bg=ui.Color.BACKGROUND):
             self._menus(ctx, settings)
             self._toolbar(ctx)
@@ -482,9 +500,23 @@ class Desktop:
                 ctx.status_bar_text("Local daemon · no web server", icon=ui.Icon.SHIELD,
                                     tone=ui.Tone.SUCCESS if settings["engine_running"] else ui.Tone.WARNING)
         self._dialogs(ctx, state)
-        # Nexa's theme transition can animate semantic tokens during the frame;
-        # reassert exact user overrides afterwards so the palette stays stable.
-        self.apply_theme(ctx, settings)
+        # Handle global shortcuts only after every widget has run. Nexa clears
+        # its keyboard-owner flag at begin_frame, so checking wants_keyboard
+        # before the inputs are drawn is always false even when a field is
+        # focused; that let the global Ctrl+V replace the model value and the
+        # native field paste the same clipboard again (the doubled link).
+        if not ctx.wants_keyboard:
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.V) and self.dialog in {"", "add", "spotify", "media"}:
+                self.paste_url(ctx)
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.N):
+                self.open_dialog("add")
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.A):
+                self.selected = {t["id"] for t in self.visible_tasks(state)}
+            if ctx.key_pressed(ui.Key.DELETE) and self.selected:
+                self.ask_delete(list(self.selected))
+            if ctx.key_pressed(ui.Key.ENTER) and len(self.selected) == 1:
+                self.details_id = next(iter(self.selected))
+                self.open_dialog("details")
 
     def _menus(self, ctx: ui.UI, settings: dict) -> None:
         with ctx.menu_bar():
@@ -815,10 +847,22 @@ class Desktop:
                 if not info["installed"]:
                     ctx.alert("spotDL is missing. Run uv sync or pip install -e . to reinstall NDM's dependencies.", tone=ui.Tone.WARNING)
                 self._error_in_dialog(ctx)
+                if self.busy == "spotify":
+                    elapsed = max(0, int(time.monotonic() - self.spotify_started))
+                    ctx.progress(indeterminate=True, width=ui.FILL, label="Reading Spotify list")
+                    ctx.text(f"Working… {elapsed}s elapsed. Fetching Spotify metadata for each track; large playlists can take a little while.",
+                             size=11, color=ui.Color.TEXT_SECONDARY, width=ui.FILL)
                 if self.spotify_result:
                     items = self.spotify_result["items"]
+                    total = self.spotify_result.get("total", len(items))
+                    title = self.spotify_result.get("title") or ""
+                    found = f"Found {len(items)} track" + ("" if len(items) == 1 else "s")
+                    if title:
+                        found += f" — {title}"
+                    ctx.text(found, size=13, font=ui.FontRole.MEDIUM, width=ui.FILL)
                     if self.spotify_result["truncated"]:
-                        ctx.alert("Showing the first 500 tracks. Queue these, then import the remaining playlist separately.", tone=ui.Tone.WARNING)
+                        detail = f"Showing the first {len(items)} of {total} tracks." if total > len(items) else f"Showing the first {len(items)} tracks."
+                        ctx.alert(detail + " Queue these, then import the remaining playlist separately.", tone=ui.Tone.WARNING)
                     columns = [ui.TableColumn("Title", width=ui.GROW(1)), ui.TableColumn("Artist", width=180),
                                ui.TableColumn("Album", width=180), ui.TableColumn("Duration", width=75)]
                     with ctx.table("spotify_tracks", columns, height=245, compact=True, striped=True, selectable=True) as table:
@@ -914,25 +958,27 @@ class Desktop:
 
     def _appearance_options(self, ctx: ui.UI, state: dict) -> None:
         settings = state["settings"]
+        changes: dict = {}
+        overrides = dict(settings.get("colors", {}))
         modes = ["light", "dark", "system"]
         chosen = ctx.segmented("theme", ["Light", "Dark", "System"], modes.index(settings["theme"]))
         if modes[chosen] != settings["theme"]:
-            self.perform("settings", {"theme": modes[chosen]})
+            changes["theme"] = modes[chosen]
         with ctx.row(gap=8, align=ui.Align.CENTER):
             ctx.text("Base accent", size=12)
             self.custom_color = ctx.color_picker("accent", self.custom_color)
-            color = f"#{self.custom_color.r:02x}{self.custom_color.g:02x}{self.custom_color.b:02x}"
-            if color != settings["accent"]:
-                self.perform("settings", {"accent": color})
+            if ctx.changed:
+                changes["accent"] = hex_color(self.custom_color, keep_alpha=False)
             if ctx.button("Reset palette"):
                 self.color_hex = {}
-                self.perform("settings", {"colors": {}})
+                overrides.clear()
+                changes["colors"] = {}
         with ctx.row(gap=8, wrap=True):
             for accent in ACCENTS:
                 if ctx.button("##" + accent, color=accent, tooltip=accent):
-                    self.perform("settings", {"accent": accent})
+                    changes["accent"] = accent
                     self.custom_color = ui.Color.hex(accent)
-        ctx.text("Custom palette — every color below overrides the base theme. Changes apply immediately.", size=11, width=ui.FILL)
+        ctx.text("Custom palette — every color below overrides the base theme. Valid changes apply immediately.", size=11, width=ui.FILL)
         groups = [
             ("Surfaces & text", ["background", "surface", "surface_raised", "surface_muted", "foreground", "text_secondary", "text_muted"]),
             ("Borders & interaction", ["border", "border_subtle", "border_strong", "hover", "active", "scrim", "focus_ring"]),
@@ -940,7 +986,7 @@ class Desktop:
             ("Controls", ["control_on", "control_glyph", "control_track", "control_track_hover", "control_thumb", "control_thumb_on"]),
             ("Chart series", [f"series_{i}" for i in range(1, 7)]),
         ]
-        overrides = dict(settings.get("colors", {}))
+        colors_changed = False
         with ctx.scroll("custom_palette", height=235, width=ui.FILL, gap=6):
             for title, keys in groups:
                 ctx.text(title, size=12, font=ui.FontRole.MEDIUM)
@@ -952,28 +998,42 @@ class Desktop:
                     with ctx.id_scope(key), ctx.row(width=ui.FILL, gap=8, align=ui.Align.CENTER):
                         ctx.text(label, size=11, width=145)
                         picked = ctx.color_picker("picker", value)
-                        picked_hex = f"#{picked.r:02x}{picked.g:02x}{picked.b:02x}"
-                        draft = self.color_hex.get(key, current or f"#{value.r:02x}{value.g:02x}{value.b:02x}")
-                        edited = ctx.input("hex", draft, width=115, max_bytes=9)
-                        self.color_hex[key] = edited
-                        next_color = current
-                        if picked_hex != (current or f"#{value.r:02x}{value.g:02x}{value.b:02x}"):
-                            next_color = picked_hex
+                        if ctx.changed:
+                            # Nexa's picker edits RGB only; keep any alpha the
+                            # user already set in the hex field instead of
+                            # silently making a translucent token opaque.
+                            picked_hex = hex_color(picked, keep_alpha=False)
+                            if value.a != 255:
+                                picked_hex += f"{value.a:02x}"
+                            overrides[key] = picked_hex
                             self.color_hex[key] = picked_hex
-                        try:
-                            normalized = normalize_color(edited)
-                            if edited != current and normalized != current:
-                                next_color = normalized
-                        except ValueError:
-                            pass
-                        if next_color != current and next_color is not None:
-                            overrides[key] = next_color
-                            self.perform("settings", {"colors": overrides})
-                        if ctx.button("Reset", size=ui.ControlSize.SM, disabled=key not in overrides):
+                            colors_changed = True
+                        draft = self.color_hex.get(key, current or hex_color(value))
+                        edited = ctx.input("hex", draft, width=115, max_bytes=9)
+                        if ctx.changed:
+                            self.color_hex[key] = edited
+                            try:
+                                normalized = normalize_color(edited)
+                            except ValueError:
+                                pass
+                            else:
+                                self.color_hex.pop(key, None)
+                                if normalized != current:
+                                    overrides[key] = normalized
+                                    colors_changed = True
+                        if ctx.button("Reset", size=ui.ControlSize.SM,
+                                      disabled=key not in overrides and key not in self.color_hex):
                             overrides.pop(key, None)
                             self.color_hex.pop(key, None)
-                            self.perform("settings", {"colors": overrides})
+                            colors_changed = True
+        if colors_changed:
+            changes["colors"] = overrides
         ctx.text(f"{len(overrides)} custom colors · hex values accept #RRGGBB or #RRGGBBAA", size=10, color=ui.Color.TEXT_SECONDARY)
+        # One IPC write per frame at most, and only when a widget actually
+        # changed. The old code compared stale hex drafts every frame and could
+        # hammer the daemon while merely scrolling through the palette.
+        if changes:
+            self.perform("settings", changes)
 
     def _options_dialog(self, ctx: ui.UI, state: dict) -> None:
         form = self.settings_form

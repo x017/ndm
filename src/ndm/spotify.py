@@ -174,7 +174,11 @@ def search(url: str, data_dir: Path, *, limit: int = 500, settings: dict | None 
                       "artist": song.artist or ", ".join(song.artists or []),
                       "album": song.album_name or "", "duration": int(song.duration or 0),
                       "url": song.url, "song": data})
-    return {"items": items, "truncated": truncated,
+    path = urlsplit(url).path
+    kind = "playlist" if "/playlist/" in path else "album" if "/album/" in path else "track"
+    first = songs[0]
+    title = getattr(first, "list_name", None) or (first.album_name if kind == "album" else first.name if kind == "track" else None)
+    return {"items": items, "truncated": truncated, "total": len(songs), "kind": kind, "title": title,
             "message": "spotDL matches these tracks to YouTube Music. The result is not Spotify's protected audio and may differ from the original recording."}
 
 

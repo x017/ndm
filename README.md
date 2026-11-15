@@ -128,9 +128,11 @@ environment variables. Proxy passwords are stored in the local NDM state directo
 and masked in the UI/CLI status output; protect that directory like other secrets.
 The status bar shows the active proxy without credentials.
 
-Open **Options → Appearance** for the full palette. Changes apply immediately;
-**Reset** beside a row restores that token and **Reset palette** restores the base
-theme. The base accent presets remain available for a quick starting point.
+Open **Options → Appearance** for the full palette. Valid color edits apply
+immediately; incomplete hex text stays editable without being saved. Picker edits
+preserve an existing alpha value. **Reset** beside a row restores that token and
+**Reset palette** restores the base theme. The base accent presets remain
+available for a quick starting point.
 
 ## Using automatic media capture
 
@@ -205,7 +207,10 @@ the spotDL dialog instead.
 1. Click **Spotify** on the toolbar.
 2. Paste a public `open.spotify.com` track, album, or playlist URL (Ctrl+V also
    opens this dialog automatically when the clipboard contains a Spotify link).
-3. Click **Find Tracks**.
+3. Click **Find Tracks**. A busy indicator and elapsed time stay visible while
+   spotDL expands the list; large playlists can take a while. Results show the
+   track count and the playlist/album title when available. Previews are capped
+   at 500 tracks, with a warning when the list is longer.
 4. Select rows and click **Queue Selected**.
 
 The daemon processes tracks using its normal concurrency limit. Each row shows
