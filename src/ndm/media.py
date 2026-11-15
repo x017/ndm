@@ -273,14 +273,24 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
     }
     if rate_limit:
         options["ratelimit"] = rate_limit
-    if task.get("media_quality") == "audio":
+    spotdl_audio = task.get("source") == "spotdl"
+    convert_mp3 = task.get("media_quality") == "audio"
+    expected_ext = task.get("audio_ext", "mp3") if spotdl_audio else ("mp3" if convert_mp3 else None)
+    if spotdl_audio or convert_mp3:
         if not ffmpeg:
-            raise ValueError("MP3 conversion needs FFmpeg on PATH. Install FFmpeg, then retry.")
+            raise ValueError("Audio conversion needs FFmpeg on PATH. Install FFmpeg, then retry.")
         options["format"] = "bestaudio/best"
-        options["final_ext"] = "mp3"
-        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+        options["final_ext"] = expected_ext
+        bitrate = str(task.get("audio_bitrate") or "192k") if spotdl_audio else "192k"
+        quality = None if bitrate in {"auto", "disable"} else bitrate.removesuffix("k")
+        # yt-dlp names the Ogg/Vorbis encoder "vorbis"; the saved extension is still .ogg.
+        codec = "vorbis" if expected_ext == "ogg" else expected_ext
+        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": codec,
+                                      "preferredquality": quality}]
     elif ffmpeg:
         options["merge_output_format"] = "mp4" if task["category"] == "video" else task.get("audio_ext", "m4a")
+    if task.get("js_runtimes"):
+        options["js_runtimes"] = task["js_runtimes"]
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(task["url"], download=True)
         if stop.is_set():
@@ -289,13 +299,13 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
         for item in downloads:
             candidate = Path(item.get("filepath") or "")
             if candidate.is_file() and candidate.suffix != ".part":
-                if task.get("media_quality") == "audio":
-                    converted = candidate.with_suffix(".mp3")
+                if expected_ext:
+                    converted = candidate.with_suffix("." + expected_ext)
                     if converted.is_file():
                         return converted
                 return candidate
-        if task.get("media_quality") == "audio":
-            converted = destination.with_suffix(".mp3")
+        if expected_ext:
+            converted = destination.with_suffix("." + expected_ext)
             if converted.is_file():
                 return converted
         candidates = [p for p in destination.parent.glob(destination.stem + ".*")

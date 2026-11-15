@@ -21,8 +21,9 @@ The background daemon communicates over an authenticated Unix domain socket
   limit. Single-connection fallback when ranges are unavailable.
 - **spotDL integration:** public Spotify track, album, and playlist links are
   expanded with the upstream spotDL Python API, previewed in a native track
-  table, then queued individually. Audio is matched to YouTube Music and
-  converted/tagged by spotDL. Formats: MP3, M4A, FLAC, Opus, Ogg.
+  table, then queued individually. spotDL selects the YouTube Music match;
+  NDM's own yt-dlp pipeline downloads and converts it, then spotDL metadata is
+  embedded. Formats: MP3, M4A, FLAC, Opus, Ogg.
 - **yt-dlp media grabber:** media-page and direct-media inspection,
   format selection, background extraction, and one-click **MP3 conversion**
   (192 kbps audio extraction via FFmpeg). Every inspected item shows its file
@@ -39,8 +40,9 @@ The background daemon communicates over an authenticated Unix domain socket
   hover/active states, focus ring, scrim, and chart series). Pick visually or enter
   `#RRGGBB` / `#RRGGBBAA`; reset one token or the whole palette.
 - **HTTP and SOCKS5 proxy:** one daemon-wide proxy for segmented downloads,
-  media inspection/extraction, and spotDL metadata/audio. HTTP, HTTPS, SOCKS5,
-  and SOCKS5H URLs; optional username/password; remote DNS by default.
+  media inspection/extraction, spotDL metadata/matching, and NDM's matched-audio
+  transfers. HTTP, HTTPS, SOCKS5, and SOCKS5H URLs; optional username/password;
+  remote DNS by default.
 - **Ctrl+V URL paste:** copy a link anywhere, press Ctrl+V in NDM, and the Add
   Download dialog opens prefilled. Spotify links open the spotDL dialog instead.
   Focused text fields retain normal clipboard paste behavior.
@@ -59,7 +61,8 @@ recording may differ, may be unavailable, or may fail. This is not Spotify
 Premium offline caching and does not defeat DRM. Use it only for content you own
 or have permission to save, subject to the source's terms.
 
-No spotDL web UI is launched. NDM imports its downloader/search API directly;
+No spotDL web UI is launched. NDM imports spotDL's metadata/matching API to
+select the source, then downloads that source through NDM's own yt-dlp pipeline.
 spotDL's own web dependencies remain installed as part of the upstream package,
 but NDM never starts them.
 
@@ -77,7 +80,7 @@ python -m pip install -e .
 ndm
 ```
 
-Install **FFmpeg** on your PATH for spotDL conversion/tagging, yt-dlp merging,
+Install **FFmpeg** on your PATH for converting spotDL matches, yt-dlp merging,
 and Media Grabber MP3 conversion. Without FFmpeg the MP3 checkbox is disabled
 and the daemon rejects audio-extraction requests with an actionable error.
 Nexa bundles its native UI runtime in the `nexa-ui` package. Linux desktops also
@@ -165,19 +168,20 @@ Media Grabber inspections can use your existing Firefox login even when inbox
 and clipboard capture are off.
 
 When enabled, NDM reads a fresh cookie snapshot from the auto-detected Firefox
-profile for each new HTTP download, HTML inspection, yt-dlp operation, or spotDL
-YouTube Music search/audio transfer. This also works for downloads owned by the
-background daemon. Firefox can stay open; yt-dlp reads a temporary copy of its
-cookie database rather than modifying it. Only cookies matching the
-destination's domain, path, and security rules are sent. This does not bypass
-DRM or make an unauthorized account authorized.
+profile for each new HTTP download, HTML inspection, yt-dlp operation, spotDL
+YouTube Music match, or NDM transfer of a matched audio source. This also works
+for downloads owned by the background daemon. Firefox can stay open; yt-dlp
+reads a temporary copy of its cookie database rather than modifying it. Only
+cookies matching the destination's domain, path, and security rules are sent.
+This does not bypass DRM or make an unauthorized account authorized.
 
 Cookie values are not saved in NDM settings, queue entries, or a cookie-export
 file. Turn the checkbox off to stop reading Firefox cookies for new operations.
 If no readable Firefox profile is available, NDM shows an actionable error;
-install/sign in to Firefox or disable the option. For spotDL, the cookies apply
-to the YouTube Music matching/download clients; Spotify metadata still uses
-spotDL's normal anonymous or official API credentials, not browser cookies.
+install/sign in to Firefox or disable the option. For Spotify queues, the
+cookies apply to spotDL's YouTube Music matching client and to NDM's yt-dlp
+transfer of the matched source; Spotify metadata still uses spotDL's normal
+anonymous or official API credentials, not browser cookies.
 
 ## Using the Media Grabber
 
@@ -214,16 +218,25 @@ the spotDL dialog instead.
    500 tracks, with a warning when the list is longer.
 4. Select rows and click **Queue Selected**.
 
-The daemon processes tracks using its normal concurrency limit. Each row shows
-spotDL matching/conversion progress. Exact byte size and ETA are unavailable
-until a matched file finishes. Stop is cooperative: a conversion may finish
-before the track pauses. A paused/failed spotDL task starts the operation again;
-byte-range resume applies to direct HTTP downloads, not spotDL jobs.
+The daemon processes tracks using its normal concurrency limit. spotDL selects
+the YouTube Music match, then NDM's yt-dlp pipeline performs the transfer and
+FFmpeg conversion. Rows show matching, byte-level download progress, transfer
+speed/ETA while transferring, converting, and tagging. The Size column starts
+with a `~` estimate from track duration and the selected lossy bitrate. FLAC,
+`auto`, and `disable` have no final-size estimate, so active rows show
+`Estimating` or a `~` source-transfer length instead of `Unknown`; the real
+saved-file size replaces it at completion. Properties also shows the matched
+source URL and transfer size. Stop is cooperative: matching or a
+conversion may finish before the track pauses. A paused/failed spotDL task
+starts the operation again; yt-dlp resume applies to the matched source, not to
+Spotify.
 
-Output defaults to MP3 at 192 kbps. `auto` lets spotDL retain the matched source
-bitrate where supported; a higher output bitrate does not improve source quality.
-Public metadata access and YouTube Music availability depend on region, upstream
-services, and occasionally a JavaScript runtime for yt-dlp. NDM does not request
+Output defaults to MP3 at 192 kbps. `auto`/`disable` leave the bitrate to
+yt-dlp/FFmpeg defaults; a higher output bitrate does not improve source quality.
+Public metadata access and YouTube Music availability depend on region and
+upstream services. Some YouTube sources also need a JavaScript runtime: install
+Deno system-wide, or run `spotdl --download-deno` once; NDM reuses that local
+Deno for both matching and the matched-source transfer. NDM does not request
 Spotify account passwords or launch an OAuth web server. Advanced users can set
 `SPOTIPY_CLIENT_ID` and `SPOTIPY_CLIENT_SECRET` for their own official Spotify API
 application before launching NDM; default spotDL metadata access needs no login.
@@ -243,7 +256,8 @@ application before launching NDM; default spotDL metadata access needs no login.
   persist cookie values or transmit them to an NDM server. Upstream temporary
   database copies are removed after reading.
 - spotDL's upstream metadata cache is stored by spotDL in its usual per-user
-  config directory. Temporary files also use that package's cache directory.
+  config directory. Matched audio transfers use NDM's destination folder and
+  yt-dlp partial files, not spotDL's downloader temp directory.
 
 ## Development and verification
 
@@ -273,7 +287,7 @@ src/ndm/
   daemon.py       headless queue owner and validated local commands
   ipc.py          Unix socket / Windows pipe transport
   engine.py       segmented HTTP, queue, resume, capture, media workers
-  spotify.py      upstream spotDL metadata/search/download adapter
+  spotify.py      spotDL metadata/matching adapter; NDM owns the transfer
   media.py        direct media/HTML inspection and yt-dlp
   models.py       validated settings, colors, proxy URLs, and URL rules
   network.py      shared proxy configuration and opt-in Firefox cookies

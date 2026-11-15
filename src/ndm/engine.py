@@ -181,7 +181,7 @@ class DownloadManager:
 
     def add_spotify(self, song: dict, *, start_paused: bool = False) -> dict:
         """Queue a spotDL metadata match. This never accesses Spotify protected audio."""
-        from .spotify import display_name, supported_url
+        from .spotify import display_name, estimated_size, supported_url
 
         url = str(song.get("url", ""))
         if not supported_url(url) or "/track/" not in url:
@@ -193,12 +193,13 @@ class DownloadManager:
             name = display_name(song, self.settings.spotify_format)
             path = self._unique(self.root / "audio", name)
             task_id = uuid.uuid4().hex[:12]
+            estimate = estimated_size(song, self.settings.spotify_format, self.settings.spotify_bitrate)
             task = {
                 "id": task_id, "url": url, "name": name, "category": "audio",
-                "status": "paused" if start_paused else "queued", "size": 0,
-                "downloaded": 0, "speed": 0, "connections": 1, "segments": [],
+                "status": "paused" if start_paused else "queued", "size": estimate,
+                "downloaded": 0, "speed": 0, "connections": self.settings.connections, "segments": [],
                 "resumable": False, "etag": "", "last_modified": "", "mime": "audio/mpeg",
-                "error": "", "source": "spotdl", "size_estimated": False,
+                "error": "", "source": "spotdl", "size_estimated": bool(estimate),
                 "created_at": time.time(), "completed_at": None,
                 "path": str(path), "part_path": str(path) + ".part",
                 "host": "open.spotify.com", "final_url": "", "explicit_name": True,
@@ -460,16 +461,38 @@ class DownloadManager:
                 snapshot = dict(task)
                 settings = self.settings.model_dump()
 
-            def progress(downloaded, total, phase, percent):
+            def progress(downloaded, total, phase, percent=None, *, estimated=False):
+                with self.lock:
+                    current = self.tasks.get(task_id)
+                    if not current:
+                        stop.set()
+                        return
+                    if downloaded is not None:
+                        current["downloaded"] = int(downloaded)
+                    if total is not None:
+                        current["transfer_size"] = int(total)
+                        current["transfer_size_estimated"] = bool(estimated)
+                    if percent is None and downloaded is not None and total:
+                        percent = min(99.0, int(downloaded) / int(total) * 100)
+                    if percent is not None:
+                        current["percent"] = float(percent)
+                    current["phase"] = phase
+                    self._mark(task_id)
+
+            def on_match(matched: dict) -> None:
                 with self.lock:
                     current = self.tasks.get(task_id)
                     if current:
-                        current.update(phase=phase, percent=percent)
+                        current["final_url"] = matched.get("url", "")
+                        current["provider"] = matched.get("provider") or "YouTube Music via spotDL"
                         self._mark(task_id)
 
+            active = max(1, sum(t["status"] == "downloading" for t in self.tasks.values()))
             path = download(snapshot["spotify_song"], Path(snapshot["path"]), self.store.directory,
                             stop, progress, audio_format=snapshot["spotify_format"],
-                            bitrate=snapshot["spotify_bitrate"], settings=settings)
+                            bitrate=snapshot["spotify_bitrate"], settings=settings,
+                            rate_limit=self.settings.speed_limit // active,
+                            connections=snapshot["connections"], on_match=on_match)
             with self.lock:
                 task = self.tasks.get(task_id)
                 if not task:
@@ -477,19 +500,26 @@ class DownloadManager:
                     return
                 size = path.stat().st_size
                 task.update(path=str(path), name=path.name, status="completed", size=size,
-                            downloaded=size, speed=0, completed_at=time.time(), percent=100,
-                            phase="complete", error="")
+                            size_estimated=False, downloaded=size, speed=0, completed_at=time.time(),
+                            percent=100, phase="complete", error="")
                 self._mark(task_id)
                 self.store.event("spotDL match downloaded", task["name"], "success")
         except Exception as exc:
+            import yt_dlp
+
             with self.lock:
                 task = self.tasks.get(task_id)
                 if not task:
                     return
-                if stop.is_set() or isinstance(exc, SpotifyCancelled):
+                if stop.is_set() or isinstance(exc, (SpotifyCancelled, yt_dlp.utils.DownloadCancelled)):
                     task.update(status="paused", speed=0, phase="paused")
                 else:
-                    task.update(status="error", speed=0, phase="error", error=safe_error(exc, self.settings))
+                    if isinstance(exc, yt_dlp.cookies.CookieLoadError):
+                        message = FIREFOX_COOKIE_ERROR
+                    else:
+                        message = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+                    task.update(status="error", speed=0, phase="error",
+                                error=safe_error(ValueError(message), self.settings))
                     self.store.event("spotDL download needs attention", task["error"], "warning")
                 self._mark(task_id)
         finally:

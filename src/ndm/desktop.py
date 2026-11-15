@@ -76,20 +76,45 @@ def percent(task: dict) -> float:
     return min(100.0, task["downloaded"] / task["size"] * 100) if task["size"] else 0.0
 
 
+def size_label(task: dict) -> str:
+    """Prefer the final-file estimate; never leave an active Spotify row as Unknown."""
+    if task["size"]:
+        return format_size(task["size"], estimated=bool(task.get("size_estimated")))
+    if task["source"] == "spotdl":
+        transfer = task.get("transfer_size") or 0
+        if transfer:
+            return format_size(transfer, estimated=True)
+        if task["status"] in {"queued", "downloading"}:
+            return "Estimating"
+        return "—"
+    return format_size(0)
+
+
 def time_left(task: dict) -> str:
     if task["status"] == "completed":
         return ""
-    if task["status"] != "downloading" or task["source"] in {"spotdl", "ytdlp"}:
+    if task["status"] != "downloading":
         return "—"
-    if not task["size"] or not task["speed"]:
+    if task["source"] == "spotdl":
+        if task.get("phase") != "downloading":
+            return "—"
+        total = task.get("transfer_size") or 0
+        remaining = total - task["downloaded"]
+    elif task["source"] == "ytdlp":
+        return "—"
+    else:
+        total = task["size"]
+        remaining = total - task["downloaded"]
+    if not total or not task["speed"]:
         return "Estimating"
-    seconds = max(0, int((task["size"] - task["downloaded"]) / task["speed"]))
+    seconds = max(0, int(remaining / task["speed"]))
     return f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
 
 
 def status_text(task: dict) -> str:
     if task["status"] == "downloading":
-        return {"processing": "Converting", "paused": "Stopping"}.get(task.get("phase"), "Downloading")
+        return {"matching": "Matching", "processing": "Converting", "tagging": "Tagging",
+                "paused": "Stopping"}.get(task.get("phase"), "Downloading")
     return {"queued": "Queued", "paused": "Stopped", "completed": "Complete", "error": "Error"}.get(task["status"], task["status"])
 
 
@@ -722,7 +747,7 @@ class Desktop:
                         table.cell()
                         ctx.icon(CATEGORY_ICONS.get(task["category"], ui.Icon.FILE), size=15, color=ui.Color.ACCENT)
                         ctx.text(task["name"], size=12, nowrap=True)
-                        table.cell_text(format_size(task["size"], estimated=bool(task.get("size_estimated"))))
+                        table.cell_text(size_label(task))
                         table.cell_text(status_text(task))
                         table.cell()
                         ctx.progress(percent(task) / 100, width=ui.FILL, height=12,
@@ -1117,11 +1142,11 @@ class Desktop:
                         formats = ["mp3", "m4a", "flac", "opus", "ogg"]
                         rates = ["auto", "128k", "192k", "256k", "320k", "disable"]
                         form["spotify_format"] = formats[ctx.select("spotify_format", [v.upper() for v in formats], formats.index(form["spotify_format"]), label="Audio file format", width=ui.FILL)]
-                        form["spotify_bitrate"] = rates[ctx.select("spotify_bitrate", rates, rates.index(form["spotify_bitrate"]), label="Conversion bitrate (auto preserves source bitrate)", width=ui.FILL)]
+                        form["spotify_bitrate"] = rates[ctx.select("spotify_bitrate", rates, rates.index(form["spotify_bitrate"]), label="Conversion bitrate (auto/disable use FFmpeg defaults)", width=ui.FILL)]
                         info = state["daemon"]["spotify"]
                         ctx.text(f"spotDL {info['version'] or 'not installed'} · FFmpeg {'installed' if info['ffmpeg'] else 'missing'}", size=12)
-                        ctx.text("NDM calls the upstream spotDL Python API. Spotify supplies metadata; audio comes from a matching YouTube Music result. No spotDL web UI is launched.", width=ui.FILL, size=11)
-                        ctx.text("The Capture tab's Firefox cookie option also applies to spotDL's YouTube Music search and audio download requests.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                        ctx.text("spotDL selects the YouTube Music match; NDM's yt-dlp pipeline downloads and converts it. No spotDL web UI or downloader gateway is used.", width=ui.FILL, size=11)
+                        ctx.text("The Capture tab's Firefox cookie option also applies to spotDL's YouTube Music search and NDM's matched-audio transfer.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                         ctx.text("Use only audio you own or have permission to save. Pausing a spotDL track is cooperative; conversion may finish before it stops.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                     else:
                         self._appearance_options(ctx, state)
@@ -1138,12 +1163,18 @@ class Desktop:
         task = next((t for t in state["downloads"] if t["id"] == self.details_id), None)
         with ctx.dialog("Download Properties", bool(task), width=650) as dialog:
             if dialog and task:
-                for label, value in [("File name", task["name"]), ("Address", task["url"]), ("Saved to", task["path"]),
-                                     ("Status", status_text(task)),
-                                     ("Size", format_size(task["size"], estimated=bool(task.get("size_estimated")))),
-                                     ("Downloaded", format_bytes(task["downloaded"])), ("Source", task.get("provider") or task["host"]),
-                                     ("Connections", str(len(task["segments"]) or task["connections"])),
-                                     ("Range resume", "Supported" if task["resumable"] else "Not used for this transfer")]:
+                rows = [("File name", task["name"]), ("Address", task["url"]), ("Saved to", task["path"]),
+                        ("Status", status_text(task)),
+                        ("Size", format_size(task["size"], estimated=bool(task.get("size_estimated")))),
+                        ("Downloaded", format_bytes(task["downloaded"])), ("Source", task.get("provider") or task["host"]),
+                        ("Connections", str(len(task["segments"]) or task["connections"])),
+                        ("Range resume", "Supported" if task["resumable"] else "Not used for this transfer")]
+                if task["source"] == "spotdl":
+                    rows.insert(2, ("Matched source", task.get("final_url") or "Not matched yet"))
+                    rows.insert(5, ("Transfer size", format_size(task.get("transfer_size") or 0,
+                                                                  estimated=bool(task.get("transfer_size_estimated")))))
+                    rows.append(("Output", f"{task.get('spotify_format', 'mp3').upper()} · {task.get('spotify_bitrate', '192k')}"))
+                for label, value in rows:
                     with ctx.row(width=ui.FILL, gap=12):
                         ctx.text(label + ":", size=11, color=ui.Color.TEXT_SECONDARY, width=105)
                         ctx.text(value, size=11, selectable=True, width=ui.GROW(1))

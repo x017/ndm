@@ -44,29 +44,12 @@ def supported_url(value: str) -> bool:
 def availability() -> dict:
     try:
         # Inspect package metadata without importing spotdl's console/web entry
-        # point. Only its search/downloader modules are imported when requested.
+        # point. Only its metadata/matching modules are imported when requested.
         version = importlib.metadata.version("spotdl") if importlib.util.find_spec("spotdl") else None
     except (ImportError, importlib.metadata.PackageNotFoundError):
         version = None
     return {"installed": version is not None, "version": version, "ffmpeg": bool(shutil.which("ffmpeg")),
             "source": "YouTube Music (spotDL match)", "protected_spotify_audio": False}
-
-
-def _settings(data_dir: Path, output: Path, audio_format: str, bitrate: str,
-              settings: dict | None = None) -> dict:
-    return {
-        "audio_providers": ["youtube-music"], "lyrics_providers": [],
-        "output": str(output), "format": audio_format, "bitrate": bitrate,
-        "threads": 1, "simple_tui": True, "load_config": False,
-        "log_level": "ERROR", "overwrite": "force", "print_errors": False,
-        "generate_lrc": False, "sponsor_block": False, "scan_for_songs": False,
-        "only_verified_results": False, "fetch_albums": False,
-        "max_filename_length": 180, "m3u": None, "archive": None,
-        "save_file": None, "save_errors": None, "proxy": None,
-        # spotDL creates a second yt-dlp handler for the actual transfer. Its
-        # public extra-options setting reaches both that handler and the matcher.
-        "yt_dlp_args": "--cookies-from-browser firefox" if (settings or {}).get("firefox_cookies") else None,
-    }
 
 
 def _configure_proxy(settings: dict | None) -> None:
@@ -93,6 +76,7 @@ def _configure_proxy(settings: dict | None) -> None:
 def _configure_audio_provider(provider, settings: dict | None) -> None:
     data = settings or {}
     url = proxy_url(data)
+    proxies = requests_proxies(data)
     if url:
         provider.audio_handler.params["proxy"] = url
     cookie_options = firefox_cookie_options(data)
@@ -100,11 +84,14 @@ def _configure_audio_provider(provider, settings: dict | None) -> None:
         provider.audio_handler.params.update(cookie_options)
     else:
         provider.audio_handler.params.pop("cookiesfrombrowser", None)
-    if url or cookie_options:
-        # Upstream retries construct a fresh YTMusic client; keep both options there.
-        provider._create_client = lambda: _configured_ytmusic(data)
-        if getattr(provider, "client", None) is not None:
-            provider.client = provider._create_client()
+    # Upstream retries construct a fresh YTMusic client. Always route those through
+    # NDM's configured session so proxy, opt-in cookies, and a timeout are preserved.
+    provider._create_client = lambda: _configured_ytmusic(data)
+    client = getattr(provider, "client", None)
+    if client is not None:
+        if hasattr(client, "proxies"):
+            client.proxies = dict(proxies or {})
+        provider.client = provider._create_client()
 
 
 def _configured_ytmusic(settings: dict):
@@ -264,8 +251,9 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
     """Yield Spotify metadata as soon as each list page arrives.
 
     The desktop renders these events live, so titles/artists/albums appear while
-    the rest of a long playlist is still being read. Downloads still use spotDL;
-    missing per-track metadata is reinitialized by the downloader when queued.
+    the rest of a long playlist is still being read. spotDL still selects the
+    match; NDM transfers it. Missing per-track metadata is reinitialized before
+    matching/tagging when the row is queued.
     """
     url = _resolve_spotify_url(url, settings)
     if availability()["installed"] is False:
@@ -339,65 +327,134 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
            "truncated": truncated}
 
 
-def download(song_data: dict, destination: Path, data_dir: Path, stop, progress, *,
-             audio_format: str = "mp3", bitrate: str = "192k", settings: dict | None = None) -> Path:
-    """Run upstream's single-song downloader with a cooperative native progress hook."""
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("FFmpeg is required by spotDL. Install FFmpeg, then retry this track.")
-    availability_info = availability()
-    if not availability_info["installed"]:
+def estimated_size(song: dict, audio_format: str, bitrate: str) -> int:
+    """Approximate final bytes for explicit lossy bitrates; lossless/auto stay unknown."""
+    if audio_format == "flac" or bitrate in {"auto", "disable"}:
+        return 0
+    try:
+        duration = float(song.get("duration") or 0)
+        kilobits = int(str(bitrate).removesuffix("k"))
+    except (TypeError, ValueError):
+        return 0
+    return int(duration * kilobits * 125) if duration > 0 and kilobits > 0 else 0
+
+
+def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None, stop=None) -> dict:
+    """Use spotDL only to select a public YouTube Music match for a Spotify track.
+
+    The actual transfer is owned by NDM's media pipeline. spotDL may still inspect
+    candidate metadata while ranking matches, but it never downloads the audio.
+    """
+    if availability()["installed"] is False:
         raise RuntimeError("spotDL is missing. Run uv sync, or pip install -e ., to reinstall NDM's dependencies.")
     logging.getLogger("spotdl").setLevel(logging.ERROR)
     _initialize_client(data_dir)
     _configure_proxy(settings)
-    import asyncio
-
-    from spotdl.download.downloader import Downloader
+    from spotdl.providers.audio import YouTubeMusic
     from spotdl.types.song import Song
+    from spotdl.utils.search import reinit_song
 
     song = Song.from_missing_data(**song_data)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    # A per-task directory prevents upstream's filename template from escaping NDM's
-    # chosen destination or colliding with another queued track.
-    template = str(destination.parent / (destination.stem + ".{output-ext}"))
-    loop = asyncio.new_event_loop()
-    # spotDL constructs its semaphore before entering run_until_complete; bind it
-    # to this worker's loop explicitly (the daemon may have serviced earlier jobs).
-    asyncio.set_event_loop(loop)
-    downloader = Downloader(settings=_settings(data_dir, Path(template), audio_format, bitrate, settings), loop=loop)
-    # Downloader resets GlobalConfig during construction; restore NDM's full proxy map.
-    _configure_proxy(settings)
-    for provider in downloader.audio_providers:
-        _configure_audio_provider(provider, settings)
+    if not song.name or not (song.artists or song.artist):
+        raise ValueError("This Spotify track is missing the title/artist metadata needed for matching.")
+    song.artists = list(song.artists or [song.artist])
+    song.artist = song.artist or song.artists[0]
+    song.duration = int(song.duration or 0)
+    if stop is not None and stop.is_set():
+        raise SpotifyCancelled()
+    # Streamed playlist/album rows intentionally omit expensive per-track fields.
+    # Fill them before matching/tagging, exactly as upstream's downloader did.
+    if any(value is None for value in (song.genres, song.disc_count, song.tracks_count,
+                                       song.track_number, song.album_id, song.album_artist)):
+        song = reinit_song(song)
+        song.artists = list(song.artists or [song.artist])
+        song.artist = song.artist or (song.artists[0] if song.artists else "")
+        song.duration = int(song.duration or 0)
+    if stop is not None and stop.is_set():
+        raise SpotifyCancelled()
 
-    def on_update(tracker, message):
-        if stop.is_set():
-            raise SpotifyCancelled()
-        phase = "processing" if "convert" in message.lower() or "metadata" in message.lower() else "downloading"
-        progress(None, None, phase, min(99, int(tracker.progress)))
-
-    downloader.progress_handler.update_callback = on_update
+    provider = YouTubeMusic()
     try:
-        if stop.is_set():
-            raise SpotifyCancelled()
-        _, path = downloader.download_song(song)
-        if stop.is_set():
-            raise SpotifyCancelled()
-        if path is None or not Path(path).is_file():
-            detail = "; ".join(downloader.errors[-2:])
-            raise ValueError(detail or "spotDL could not find or download a matching audio source.")
-        return Path(path)
+        _configure_audio_provider(provider, settings)
+        matched_url = provider.search(song, only_verified=False)
+    except Exception as exc:
+        # spotDL's view-count tie-breaker may inspect a candidate with yt-dlp and
+        # wrap the real cause in AudioProviderError. Keep ranking unchanged, but
+        # surface the underlying network/cookie/extractor failure to the queue.
+        cause = exc.__cause__
+        if cause is not None and cause is not exc:
+            raise cause from exc
+        raise
     finally:
-        try:
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
+        provider.audio_handler.close()
+    if stop is not None and stop.is_set():
+        raise SpotifyCancelled()
+    if not matched_url:
+        raise LookupError(f"spotDL found no YouTube Music match for {song.display_name}.")
+    song.download_url = matched_url
+    return {"url": matched_url, "song": song.json, "provider": "YouTube Music via spotDL"}
+
+
+def tag_file(path: Path, song_data: dict, *, stop=None) -> None:
+    """Embed Spotify metadata/cover art after NDM has downloaded and converted audio."""
+    if stop is not None and stop.is_set():
+        raise SpotifyCancelled()
+    from spotdl.types.song import Song
+    from spotdl.utils.metadata import embed_metadata
+
+    try:
+        embed_metadata(path, Song.from_missing_data(**song_data))
+    except Exception as exc:
+        cause = exc.__cause__ or exc
+        raise RuntimeError(
+            f"Audio was saved to {path}, but tagging failed: {cause}. "
+            "Retry this track to tag the saved file again."
+        ) from exc
+    if stop is not None and stop.is_set():
+        raise SpotifyCancelled()
+
+
+def download(song_data: dict, destination: Path, data_dir: Path, stop, progress, *,
+             audio_format: str = "mp3", bitrate: str = "192k", settings: dict | None = None,
+             rate_limit: int = 0, connections: int = 1, on_match=None) -> Path:
+    """Match with spotDL, then transfer/convert through NDM's own yt-dlp pipeline."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("FFmpeg is required to convert spotDL matches. Install FFmpeg, then retry this track.")
+    if stop.is_set():
+        raise SpotifyCancelled()
+    progress(None, None, "matching", 0)
+    matched = match_song(song_data, data_dir, settings=settings, stop=stop)
+    if on_match is not None:
+        on_match(matched)
+    if stop.is_set():
+        raise SpotifyCancelled()
+
+    from spotdl.utils.deno import get_local_deno_yt_dlp_options
+
+    from .media import media_download
+
+    task = {
+        "url": matched["url"], "path": str(destination), "category": "audio",
+        "source": "spotdl", "media_format": "bestaudio/best",
+        "audio_ext": audio_format, "audio_bitrate": bitrate,
+        # Reuse a Deno binary the user already installed through spotDL. NDM does
+        # not download or execute an installer implicitly.
+        "js_runtimes": get_local_deno_yt_dlp_options().get("js_runtimes"),
+    }
+
+    def transfer_progress(downloaded, total, phase, *, estimated=False):
+        if stop.is_set():
+            raise SpotifyCancelled()
+        progress(downloaded, total, phase, None, estimated=estimated)
+
+    path = media_download(task, stop, transfer_progress, rate_limit, connections, settings=settings)
+    if stop.is_set():
+        raise SpotifyCancelled()
+    progress(None, None, "tagging", 99)
+    tag_file(path, matched["song"], stop=stop)
+    if stop.is_set():
+        raise SpotifyCancelled()
+    return path
 
 
 def display_name(song: dict, audio_format: str) -> str:
