@@ -661,12 +661,28 @@ class Desktop:
             if self.notice and not self.dialog:
                 if ctx.alert(self.notice, tone=ui.Tone.SUCCESS, dismissible=True):
                     self.notice = ""
-            with ctx.row(width=ui.FILL, height=38, pad_x=10, gap=8, align=ui.Align.CENTER, bg=ui.Color.SURFACE_MUTED):
-                ctx.icon(CATEGORY_ICONS[self.category], size=15)
+            with ctx.row(width=ui.FILL, height=46, pad_x=12, gap=10, align=ui.Align.CENTER,
+                         bg=ui.Color.SURFACE_MUTED):
+                ctx.icon(CATEGORY_ICONS[self.category], size=16, color=ui.Color.ACCENT)
                 ctx.text(CATEGORY_NAMES[self.category], size=12, font=ui.FontRole.MEDIUM)
                 ctx.spacer()
-                ctx.text("Find:", size=11)
-                self.search = ctx.input("find_downloads", self.search, placeholder="File name or address", width=245)
+                if self.search:
+                    shown = len(self.visible_tasks(state))
+                    total = len(state["downloads"])
+                    ctx.text(f"{shown} of {total}", size=11, color=ui.Color.TEXT_SECONDARY)
+                # A rounded pill reads as a search box; the input itself is
+                # transparent so the container owns the border and shape.
+                with ctx.row(width=300, height=32, pad_x=10, gap=6, align=ui.Align.CENTER,
+                             bg=ui.Color.SURFACE, border=1, border_color=ui.Color.BORDER,
+                             radius=16):
+                    ctx.icon(ui.Icon.SEARCH, size=14, color=ui.Color.TEXT_SECONDARY)
+                    # Match the border to the fill so the field blends into the
+                    # pill instead of drawing a second, square-cornered box.
+                    self.search = ctx.input(
+                        "find_downloads", self.search, placeholder="Search downloads…",
+                        clearable=True, width=ui.FILL, bg=ui.Color.SURFACE,
+                        border_color=ui.Color.SURFACE, focus_color=ui.Color.ACCENT,
+                        placeholder_color=ui.Color.TEXT_MUTED)
             with ctx.split("workspace", 0.18, min_first=175, min_second=620, width=ui.FILL, height=ui.FILL) as split:
                 self._categories(ctx, state)
                 split.next()
@@ -967,7 +983,7 @@ class Desktop:
                         name_clicked = ctx.button(
                             task["name"], variant=ui.ButtonVariant.GHOST, size=ui.ControlSize.SM,
                             icon=CATEGORY_ICONS.get(task["category"], ui.Icon.FILE),
-                            full_width=True, selected=task["id"] in self.selected)
+                            full_width=True)
                         if clicked or name_clicked:
                             self._select_row(ctx, task)
                         with self._row_popover(ctx, task["name"], band_top=band_top,
@@ -1191,8 +1207,7 @@ class Desktop:
                                     table.cell()
                                     title_clicked = ctx.button(
                                         item["name"], variant=ui.ButtonVariant.GHOST,
-                                        size=ui.ControlSize.SM, full_width=True,
-                                        selected=item["id"] in self.spotify_selected)
+                                        size=ui.ControlSize.SM, full_width=True)
                                     if row_clicked or title_clicked:
                                         self.spotify_selected.symmetric_difference_update({item["id"]})
                                     with self._row_popover(ctx, item["name"], band_top=spotify_band) as menu:
@@ -1487,8 +1502,7 @@ class Desktop:
                                 table.cell()
                                 name_clicked = ctx.button(
                                     track["name"], variant=ui.ButtonVariant.GHOST,
-                                    size=ui.ControlSize.SM, icon=ui.Icon.MUSIC, full_width=True,
-                                    selected=index == self.library_selection)
+                                    size=ui.ControlSize.SM, icon=ui.Icon.MUSIC, full_width=True)
                                 if row_clicked or name_clicked:
                                     self.library_selection = index
                                     try:

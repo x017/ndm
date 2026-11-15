@@ -467,3 +467,59 @@ def test_row_menu_suppressed_while_a_dialog_is_open(tmp_path, monkeypatch):
         ctx.input_mouse_button(ui.MouseButton.RIGHT, False)
         frame(desktop, ctx)
         assert not opened
+
+
+def test_search_field_filters_and_clear_button_resets(tmp_path, monkeypatch):
+    """The restyled search field must still filter, and its clear affordance works."""
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        desktop.search = "fixture"
+        for _ in range(2):
+            frame(desktop, ctx)
+        assert len(desktop.visible_tasks(desktop.state)) == 1
+        desktop.search = "no-such-file"
+        for _ in range(2):
+            frame(desktop, ctx)
+        assert desktop.visible_tasks(desktop.state) == []
+        desktop.search = "fixture"
+        for _ in range(2):
+            frame(desktop, ctx)
+        # The clear affordance sits at the right end of the rounded field.
+        ctx.input_mouse_move(1238, 94)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, True)
+        frame(desktop, ctx)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, False)
+        for _ in range(2):
+            frame(desktop, ctx)
+        assert desktop.search == ""
+        assert len(desktop.visible_tasks(desktop.state)) == 1
+
+
+def test_clicking_any_column_selects_the_whole_row(tmp_path, monkeypatch):
+    """Selection belongs to the row, not the filename button that anchors the menu."""
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        row_y = _download_row_y(desktop, ctx)
+        assert row_y is not None
+        ctx.input_key(ui.Key.ESCAPE, True)
+        frame(desktop, ctx)
+        ctx.input_key(ui.Key.ESCAPE, False)
+        frame(desktop, ctx)
+        desktop.selected.clear()
+        # Status column, far from the filename anchor.
+        ctx.input_mouse_move(790, row_y)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, True)
+        frame(desktop, ctx)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, False)
+        frame(desktop, ctx)
+        assert desktop.selected == {"native-test"}
