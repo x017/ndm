@@ -26,7 +26,7 @@ PROXY_SCHEME_ALIASES = {"sockcs5": "socks5"}
 # Bump when the daemon's settings schema or local IPC payload contract changes
 # so the desktop can replace an out-of-date background daemon instead of sending
 # it fields it cannot accept.
-SETTINGS_SCHEMA_VERSION = 6
+SETTINGS_SCHEMA_VERSION = 7
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
