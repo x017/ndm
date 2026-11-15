@@ -113,6 +113,8 @@ def main(argv: list[str] | None = None) -> None:
     common(logs)
     logs.add_argument("--lines", type=int, default=80, help="How many trailing lines to print")
     logs.add_argument("--path", action="store_true", help="Print only the log file path")
+    logs.add_argument("--job", default="", help="Show only lines for one download id (see the queue)")
+    logs.add_argument("--grep", default="", help="Show only lines containing this text (e.g. FAILED, STREAM)")
     doctor = sub.add_parser("doctor", help="Test Spotify/YouTube connectivity and show tool versions")
     common(doctor)
     compare = sub.add_parser("match-check", help="Compare the NDM and spotDL matchers without downloading")
@@ -194,15 +196,24 @@ def main(argv: list[str] | None = None) -> None:
             if args.path:
                 print(log_path(data_dir))
             else:
+                # Read a wider window before filtering so --job/--grep can reach back
+                # past other jobs' chatter, then keep only the requested trailing lines.
+                wanted = max(1, args.lines)
+                window = wanted * 40 if (args.job or args.grep) else wanted
                 try:
-                    result = request(data_dir, "diagnostics", {"lines": args.lines}, timeout=15)
+                    result = request(data_dir, "diagnostics", {"lines": window}, timeout=15)
                 except (OSError, ValueError, RuntimeError, EOFError):
                     # The daemon may be stopped; the log file is still readable.
-                    print(f"Log: {log_path(data_dir)}")
-                    print(tail(data_dir, args.lines))
+                    path, text = log_path(data_dir), tail(data_dir, window)
                 else:
-                    print(f"Log: {result['path']}")
-                    print(result["log"])
+                    path, text = result["path"], result["log"]
+                if args.job or args.grep:
+                    rows = [r for r in text.splitlines()
+                            if (not args.job or args.job in r)
+                            and (not args.grep or args.grep.lower() in r.lower())]
+                    text = "\n".join(rows[-wanted:]) or "No log lines matched that filter."
+                print(f"Log: {path}")
+                print(text)
         elif command == "doctor":
             from .diagnostics import check_connectivity, environment, log_path, setup_logging
             try:

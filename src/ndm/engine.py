@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 
+from .diagnostics import Tracker, get_logger, redact
 from .models import (
     MEDIA_EXTENSIONS,
     Settings,
@@ -32,6 +33,8 @@ from .network import (
     safe_error,
 )
 from .store import Store
+
+log = get_logger("ndm.engine")
 
 CHUNK = 128 * 1024
 USER_AGENT = "NDM/0.1 (personal download manager)"
@@ -125,6 +128,9 @@ class DownloadManager:
             self.tasks[task_id] = task
             self.store.save_downloads([task_id], self.tasks)
             self.store.event("Added to your downloads", task["name"])
+            log.info("[%s] QUEUED url=%s name=%r category=%s connections=%s paused=%s path=%s",
+                     task_id, redact(url), task["name"], kind, task["connections"],
+                     bool(start_paused), path)
             return dict(task)
 
     def add_media(self, *, url: str, format_id: str, name: str, category: str,
@@ -189,6 +195,8 @@ class DownloadManager:
         with self.lock:
             existing = next((t for t in self.tasks.values() if t["url"] == url and t["status"] != "error"), None)
             if existing:
+                log.info("QUEUE dedupe: %s already queued as [%s] (%s)", redact(url),
+                         existing["id"], existing["status"])
                 return dict(existing)
             name = display_name(song, self.settings.spotify_format)
             path = self._unique(self.root / "audio", name)
@@ -211,9 +219,17 @@ class DownloadManager:
             self.tasks[task_id] = task
             self.store.save_downloads([task_id], self.tasks)
             self.store.event("spotDL track queued", name)
+            log.info("[%s] QUEUED spotify track=%r artist=%r album=%r duration=%ss isrc=%s "
+                     "format=%s bitrate=%s estimate=%s paused=%s path=%s",
+                     task_id, song.get("name"), song.get("artist"), song.get("album_name"),
+                     song.get("duration"), song.get("isrc") or "-", task["spotify_format"],
+                     task["spotify_bitrate"], estimate or "n/a", bool(start_paused), path)
+            log.debug("[%s] spotify metadata: %s", task_id, redact(sorted(song)))
             return dict(task)
 
     def action(self, task_id: str, action: str) -> dict:
+        log.info("[%s] ACTION %s (status=%s)", task_id, action,
+                 self.tasks.get(task_id, {}).get("status", "missing"))
         with self.lock:
             task = self.tasks.get(task_id)
             if not task:
@@ -263,6 +279,7 @@ class DownloadManager:
     def update_settings(self, patch: SettingsPatch) -> Settings:
         data = self.settings.model_dump()
         changes = patch.model_dump(exclude_none=True)
+        log.info("SETTINGS changed keys=%s", sorted(changes))
         candidate = Settings.model_validate({**data, **changes})
         with self.lock:
             was_running = self.settings.engine_running
@@ -372,6 +389,9 @@ class DownloadManager:
         task["error"] = ""
         task["_sample_bytes"] = task["downloaded"]
         task["_sample_time"] = time.monotonic()
+        log.info("[%s] START source=%s name=%r connections=%s speed_limit=%s",
+                 task_id, task.get("source"), task["name"], task.get("connections"),
+                 self.settings.speed_limit or "unlimited")
         thread = threading.Thread(target=self._run, args=(task_id, event), name=f"ndm-{task_id}", daemon=True)
         self.threads[task_id] = thread
         thread.start()
@@ -391,6 +411,13 @@ class DownloadManager:
         if self.tasks.get(task_id, {}).get("source") == "ytdlp":
             self._run_ytdlp(task_id, stop)
             return
+        track = Tracker(log, task_id)
+        initial = self.tasks.get(task_id, {})
+        track.stage("connecting", url=redact(initial.get("url", "")), name=initial.get("name"),
+                    connections=initial.get("connections"))
+        track.detail("config proxy=%s cookies=%s speed_limit=%s",
+                     bool(self.settings.proxy_enabled), bool(self.settings.firefox_cookies),
+                     self.settings.speed_limit or "unlimited")
         try:
             with httpx.Client(timeout=httpx.Timeout(20, read=30), follow_redirects=True,
                               headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
@@ -401,6 +428,8 @@ class DownloadManager:
                         self._transfer(task_id, stop, client)
                         break
                     except RangeLost:
+                        log.warning("[%s] server dropped range support; restarting with 1 connection", task_id)
+                        track.stage("restart-single-connection")
                         if attempt == 1:
                             raise
                         with self.lock:
@@ -430,6 +459,8 @@ class DownloadManager:
                     task.update(status="completed", size=size, size_estimated=False,
                                 downloaded=size, speed=0, completed_at=time.time(), error="")
                     self.store.event("Download complete", task["name"], "success")
+                    track.stage("completed", file=task["path"], bytes=size)
+                    track.done(bytes=size, file=task["name"])
                 self._mark(task_id)
         except Exception as exc:
             with self.lock:
@@ -439,6 +470,8 @@ class DownloadManager:
                                 error=safe_error(exc, self.settings))
                     self._mark(task_id)
                     self.store.event("Download needs attention", task["name"] + ": " + task["error"], "warning")
+                    track.failed(exc, settings=self.settings.model_dump(),
+                                 url=redact(task.get("url", "")))
         finally:
             with self.lock:
                 self.threads.pop(task_id, None)
@@ -453,6 +486,7 @@ class DownloadManager:
     def _run_spotdl(self, task_id: str, stop: threading.Event) -> None:
         from .spotify import SpotifyCancelled, download
 
+        track = Tracker(log, task_id)
         try:
             with self.lock:
                 task = self.tasks.get(task_id)
@@ -460,6 +494,16 @@ class DownloadManager:
                     return
                 snapshot = dict(task)
                 settings = self.settings.model_dump()
+            song = snapshot["spotify_song"]
+            track.stage("queued", track=f"{song.get('artist')} - {song.get('name')}",
+                        format=snapshot["spotify_format"], bitrate=snapshot["spotify_bitrate"])
+            track.detail("config proxy=%s remote_dns=%s cookies=%s matcher=%s tagger=%s "
+                         "rate_limit=%s connections=%s ffmpeg=%s",
+                         bool(settings.get("proxy_enabled")), settings.get("proxy_remote_dns"),
+                         bool(settings.get("firefox_cookies")), settings.get("spotify_matcher"),
+                         settings.get("spotify_tagger"), self.settings.speed_limit or "unlimited",
+                         snapshot["connections"], bool(shutil.which("ffmpeg")))
+            track.stage("matching")
 
             def progress(downloaded, total, phase, percent=None, *, estimated=False):
                 with self.lock:
@@ -476,7 +520,10 @@ class DownloadManager:
                         percent = min(99.0, int(downloaded) / int(total) * 100)
                     if percent is not None:
                         current["percent"] = float(percent)
+                    if phase != current.get("phase"):
+                        track.stage(phase or "downloading")
                     current["phase"] = phase
+                    track.progress(current.get("downloaded"), current.get("transfer_size"), phase or "")
                     self._mark(task_id)
 
             def on_match(matched: dict) -> None:
@@ -485,6 +532,9 @@ class DownloadManager:
                     if current:
                         current["final_url"] = matched.get("url", "")
                         current["provider"] = matched.get("provider") or "YouTube Music via spotDL"
+                        track.detail("matched source=%s provider=%s score=%s",
+                                     redact(matched.get("url", "")), current["provider"],
+                                     matched.get("match_score", "n/a"))
                         self._mark(task_id)
 
             active = max(1, sum(t["status"] == "downloading" for t in self.tasks.values()))
@@ -504,6 +554,8 @@ class DownloadManager:
                             percent=100, phase="complete", error="")
                 self._mark(task_id)
                 self.store.event("spotDL match downloaded", task["name"], "success")
+            track.stage("completed", file=str(path), bytes=size)
+            track.done(bytes=size, file=path.name)
         except Exception as exc:
             import yt_dlp
 
@@ -512,6 +564,8 @@ class DownloadManager:
                 if not task:
                     return
                 if stop.is_set() or isinstance(exc, (SpotifyCancelled, yt_dlp.utils.DownloadCancelled)):
+                    log.info("[%s] PAUSED (%s) after %.2fs", task_id,
+                             type(exc).__name__, time.monotonic() - track.started)
                     task.update(status="paused", speed=0, phase="paused")
                 else:
                     if isinstance(exc, yt_dlp.cookies.CookieLoadError):
@@ -521,6 +575,7 @@ class DownloadManager:
                     task.update(status="error", speed=0, phase="error",
                                 error=safe_error(ValueError(message), self.settings))
                     self.store.event("spotDL download needs attention", task["error"], "warning")
+                    track.failed(exc, settings=settings, task=task["name"])
                 self._mark(task_id)
         finally:
             with self.lock:
@@ -534,6 +589,8 @@ class DownloadManager:
         import yt_dlp
 
         from .media import media_download
+
+        track = Tracker(log, task_id)
         try:
             with self.lock:
                 task = self.tasks.get(task_id)
@@ -541,6 +598,10 @@ class DownloadManager:
                     return
                 snapshot = dict(task)
                 settings = self.settings.model_dump()
+            track.stage("extracting", url=redact(snapshot["url"]), name=snapshot["name"])
+            track.detail("config proxy=%s cookies=%s quality=%s format=%s",
+                         bool(settings.get("proxy_enabled")), bool(settings.get("firefox_cookies")),
+                         snapshot.get("media_quality"), snapshot.get("media_format") or "auto")
 
             def progress(downloaded, total, phase, *, estimated=False):
                 with self.lock:
@@ -553,7 +614,10 @@ class DownloadManager:
                     if total is not None:
                         current["size"] = total
                         current["size_estimated"] = bool(estimated)
+                    if phase != current.get("phase"):
+                        track.stage(phase or "downloading")
                     current["phase"] = phase
+                    track.progress(current.get("downloaded"), current.get("size"), phase or "")
                     self._mark(task_id)
 
             active = max(1, sum(t["status"] == "downloading" for t in self.tasks.values()))
@@ -570,6 +634,8 @@ class DownloadManager:
                             completed_at=time.time(), phase="complete", error="")
                 self._mark(task_id)
                 self.store.event("Media download complete", task["name"], "success")
+            track.stage("completed", file=str(path), bytes=size)
+            track.done(bytes=size, file=path.name)
         except Exception as exc:
             with self.lock:
                 task = self.tasks.get(task_id)
@@ -581,6 +647,7 @@ class DownloadManager:
                     message = FIREFOX_COOKIE_ERROR if isinstance(exc, yt_dlp.cookies.CookieLoadError) else str(exc)
                     task.update(status="error", speed=0, error=safe_error(ValueError(message), self.settings), phase="error")
                     self.store.event("Media download needs attention", task["error"], "warning")
+                    track.failed(exc, settings=settings, url=redact(snapshot["url"]))
                 self._mark(task_id)
         finally:
             with self.lock:
@@ -618,6 +685,9 @@ class DownloadManager:
             disposition = response.headers.get("content-disposition", "")
             name_match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"?([^\";]+)", disposition, re.I)
             suggested = (name_match.group(1) or name_match.group(2)) if name_match else Path(unquote(urlsplit(final_url).path)).name
+        log.info("[%s] PROBE status=%s bytes=%s resumable=%s mime=%s etag=%s final=%s",
+                 task_id, response.status_code, total or "unknown", resumable, mime or "-",
+                 (etag or "-")[:24], redact(final_url))
         if mime == "text/html" and Path(part).suffix.lower() not in {".html", ".htm"}:
             raise ValueError("This URL returns a webpage, not a file. Paste it into Media grabber to find its media.")
         with self.lock:
@@ -647,6 +717,8 @@ class DownloadManager:
                     if total and resumable:
                         handle.truncate(total)
             segments = [dict(s) for s in task["segments"]]
+            log.info("[%s] TRANSFER segments=%d resumed_bytes=%d part=%s",
+                     task_id, len(segments), sum(x["done"] for x in segments), task["part_path"])
             task["downloaded"] = sum(s["done"] for s in segments)
             self._mark(task_id)
         if stop.is_set():
@@ -686,6 +758,8 @@ class DownloadManager:
                 if resumable and done >= end - start + 1:
                     return
                 headers = {"Range": f"bytes={start + done}-{end}" if end else f"bytes={start + done}-"} if resumable else {}
+                log.debug("[%s] segment %d attempt %d range=%s done=%d", task_id, index,
+                          attempt + 1, headers.get("Range", "full"), done)
                 if done and task["etag"] and not task["etag"].startswith('W/'):
                     headers["If-Range"] = task["etag"]
                 elif done and task["last_modified"]:
@@ -747,7 +821,9 @@ class DownloadManager:
                 return
             except RangeLost:
                 raise
-            except (httpx.HTTPError, OSError):
+            except (httpx.HTTPError, OSError) as exc:
+                log.warning("[%s] segment %d attempt %d failed: %s: %s", task_id, index,
+                            attempt + 1, type(exc).__name__, redact(exc))
                 if attempt == 2 or stop.is_set():
                     raise
                 stop.wait(0.7 * (2 ** attempt))

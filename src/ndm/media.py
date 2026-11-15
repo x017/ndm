@@ -309,6 +309,13 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
         options["merge_output_format"] = "mp4" if task["category"] == "video" else task.get("audio_ext", "m4a")
     if task.get("js_runtimes"):
         options["js_runtimes"] = task["js_runtimes"]
+    log.info("yt-dlp options: format=%s final_ext=%s bitrate=%s proxy=%s cookies=%s "
+             "rate_limit=%s fragments=%s ffmpeg=%s postprocessors=%s",
+             options.get("format"), expected_ext, options.get("audio_bitrate") or
+             (options.get("postprocessors") or [{}])[0].get("preferredquality"),
+             bool(options.get("proxy")), bool(options.get("cookiesfrombrowser")),
+             rate_limit or "unlimited", connections, bool(ffmpeg),
+             [p.get("key") for p in options.get("postprocessors") or []])
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(task["url"], download=True)
@@ -331,7 +338,9 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
                           if p.is_file() and p.suffix not in {".part", ".ytdl", ".json"}]
             if not candidates:
                 raise OSError("The extractor finished without creating a media file.")
-            return max(candidates, key=lambda p: p.stat().st_mtime)
+            chosen = max(candidates, key=lambda p: p.stat().st_mtime)
+            log.info("yt-dlp produced %s (%s bytes)", chosen, chosen.stat().st_size)
+            return chosen
     except yt_dlp.utils.DownloadCancelled:
         raise
     except Exception as exc:

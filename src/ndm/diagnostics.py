@@ -17,6 +17,7 @@ import platform
 import re
 import shutil
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -460,3 +461,82 @@ def tail(data_dir: Path, lines: int = 60) -> str:
             return "".join(handle.readlines()[-max(1, lines):])
     except OSError as exc:
         return f"Could not read {path}: {exc}"
+
+
+class Tracker:
+    """Stage-by-stage progress for one job, with elapsed timings.
+
+    Every line carries the job id so a single track can be followed through
+    queueing, matching, transfer, conversion, and tagging even when several
+    downloads interleave. Byte progress is throttled so a fast transfer cannot
+    flood the log, but phase changes and the final totals always print.
+    """
+
+    def __init__(self, logger: logging.Logger, job: str, *, interval: float = 2.0) -> None:
+        self.log = logger
+        self.job = job
+        self.interval = interval
+        self.started = time.monotonic()
+        self._stage_at = self.started
+        self._last_progress = 0.0
+        self._last_phase = ""
+        self._progress_phase = ""
+        self._last_bytes = -1
+
+    def _emit(self, level: int, message: str, *args) -> None:
+        self.log.log(level, "[%s] " + message, self.job, *args)
+
+    def stage(self, name: str, /, **fields) -> None:
+        """Enter a stage. Logs the duration of the stage that just finished."""
+        if name == self._last_phase:
+            # The engine and the progress callback can announce the same phase.
+            return
+        now = time.monotonic()
+        extra = " ".join(f"{k}={redact(v)}" for k, v in fields.items() if v not in (None, ""))
+        self._emit(logging.INFO, "stage=%s (+%.2fs total=%.2fs)%s", name,
+                   now - self._stage_at, now - self.started, f" {extra}" if extra else "")
+        self._stage_at = now
+        self._last_phase = name
+
+    def detail(self, message: str, *args) -> None:
+        """Always-on informational detail within a stage."""
+        self._emit(logging.INFO, message, *args)
+
+    def debug(self, message: str, *args) -> None:
+        self._emit(logging.DEBUG, message, *args)
+
+    def progress(self, downloaded, total, phase: str = "", /, *, force: bool = False) -> None:
+        """Throttled byte progress; a phase change always emits."""
+        now = time.monotonic()
+        changed = phase != self._progress_phase
+        if not force and not changed and now - self._last_progress < self.interval:
+            return
+        if not force and not changed and downloaded == self._last_bytes:
+            return
+        self._last_progress = now
+        self._last_bytes = downloaded if downloaded is not None else -1
+        self._progress_phase = phase
+        elapsed = max(0.01, now - self.started)
+        rate = (downloaded or 0) / elapsed
+        percent = f"{(downloaded or 0) / total * 100:.1f}%" if total else "n/a"
+        self._emit(logging.INFO, "progress phase=%s bytes=%s/%s (%s) avg=%s/s",
+                   phase or "-", downloaded if downloaded is not None else "?",
+                   total if total else "?", percent, _bytes(rate))
+
+    def done(self, **fields) -> None:
+        extra = " ".join(f"{k}={redact(v)}" for k, v in fields.items() if v not in (None, ""))
+        self._emit(logging.INFO, "DONE in %.2fs%s", time.monotonic() - self.started,
+                   f" {extra}" if extra else "")
+
+    def failed(self, exc: BaseException, /, **fields) -> None:
+        self._emit(logging.ERROR, "FAILED after %.2fs at stage=%s", time.monotonic() - self.started,
+                   self._last_phase or "-")
+        log_failure(self.log, f"job {self.job}", exc, **fields)
+
+
+def _bytes(value: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(value) < 1024 or unit == "GB":
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}GB"

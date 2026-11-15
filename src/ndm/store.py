@@ -14,6 +14,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .diagnostics import get_logger
+
+log = get_logger("ndm.store")
+
 
 class Store:
     def __init__(self, directory: Path):
@@ -29,6 +33,7 @@ class Store:
                 fcntl.flock(self._lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError) as exc:
             self._lockfile.close()
+            log.error("Data directory %s is already locked by another daemon: %s", directory, exc)
             raise RuntimeError("Another NDM daemon already owns this data directory.") from exc
         self.db = sqlite3.connect(directory / "ndm.sqlite3", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -43,6 +48,8 @@ class Store:
             );
         """)
         self.db.commit()
+        log.info("Store opened at %s (schema=%s)", directory / "ndm.sqlite3",
+                 self.db.execute("PRAGMA user_version").fetchone()[0])
 
     def load_downloads(self) -> dict[str, dict[str, Any]]:
         with self.lock:

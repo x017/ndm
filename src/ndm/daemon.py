@@ -17,7 +17,9 @@ from .diagnostics import (
     check_connectivity,
     environment,
     log_environment,
+    log_failure,
     log_path,
+    redact,
     setup_logging,
     tail,
 )
@@ -104,11 +106,13 @@ class NativeDaemon:
             threading.Thread(target=self._handle, args=(connection,), name="ndm-ipc-request", daemon=True).start()
 
     def _handle(self, connection) -> None:
+        operation = "?"
         with connection:
             try:
                 message = connection.recv()
                 if not isinstance(message, dict):
                     raise ValueError("Invalid local request.")
+                operation = str(message.get("operation") or "?")
                 if message.get("stream"):
                     for result in self.dispatch_stream(message.get("operation"), message.get("payload", {})):
                         connection.send({"ok": True, "result": result})
@@ -117,18 +121,26 @@ class NativeDaemon:
                     result = self.dispatch(message.get("operation"), message.get("payload", {}))
                     connection.send({"ok": True, "result": result})
             except ValidationError as exc:
+                log.warning("IPC %s rejected: %s", operation, validation_message(exc))
                 try:
                     connection.send({"ok": False, "error": validation_message(exc)})
                 except (OSError, EOFError):
                     pass
             except (ValueError, KeyError, RuntimeError, OSError) as exc:
+                # This is the branch that carries Spotify/TLS/proxy failures. It used to
+                # reply to the UI without writing anything, so the log looked empty even
+                # though the request had failed. Always record it, with the cause chain.
+                log_failure(log, f"IPC {operation}", exc,
+                            settings=self.manager.settings.model_dump())
                 try:
                     connection.send({"ok": False, "error": str(exc)})
                 except (OSError, EOFError):
                     pass
             except (AuthenticationError, EOFError, OSError):
                 pass
-            except Exception:
+            except Exception as exc:
+                log_failure(log, f"IPC {operation} (unexpected)", exc,
+                            settings=self.manager.settings.model_dump())
                 log.exception("Unhandled native daemon request")
                 try:
                     connection.send({"ok": False, "error": "The daemon could not complete this request. See daemon.log."})
@@ -138,6 +150,7 @@ class NativeDaemon:
     def dispatch_stream(self, operation: str, payload: dict):
         if not isinstance(payload, dict):
             raise ValueError("Request payload must be an object.")
+        log.info("IPC stream %s url=%s", operation, redact(payload.get("url", "")))
         if operation == "spotify.search.stream":
             command = SpotifySearch.model_validate(payload)
             return spotify.search_stream(command.url, self.data_dir,
@@ -147,6 +160,12 @@ class NativeDaemon:
     def dispatch(self, operation: str, payload: dict) -> dict:
         if not isinstance(payload, dict):
             raise ValueError("Request payload must be an object.")
+        # "state" polls several times a second; logging it would bury everything else.
+        if operation not in {"state", "health"}:
+            keys = sorted(payload)
+            count = len(payload.get("songs") or []) if operation == "spotify.queue" else ""
+            log.info("IPC %s%s keys=%s", operation, f" songs={count}" if count != "" else "", keys)
+            log.debug("IPC %s payload=%s", operation, redact(payload))
         if operation == "health":
             return {"name": "ndm", "transport": "local-ipc", "pid": os.getpid(),
                     "settings_schema": SETTINGS_SCHEMA_VERSION}
@@ -246,7 +265,8 @@ def run_daemon(*, data_dir: Path | None = None, allow_private: bool = True) -> N
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    log.info("NDM native daemon ready (local IPC; no web server).")
+    log.info("NDM native daemon ready (local IPC; no web server). pid=%s data_dir=%s",
+             os.getpid(), directory)
     daemon.serve()
 
 

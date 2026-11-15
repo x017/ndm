@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import nexa as ui
 
 from .daemon import is_running, start_detached
+from .diagnostics import get_logger, log_failure, redact
 from .ipc import request
 from .ipc import stream as ipc_stream
 from .models import (
@@ -22,6 +23,8 @@ from .models import (
     normalize_color,
 )
 from .network import proxy_label, safe_error
+
+log = get_logger("ndm.desktop")
 
 CATEGORY_NAMES = {"all": "All Downloads", "unfinished": "Unfinished", "finished": "Finished",
                   "archive": "Compressed", "document": "Documents", "audio": "Music",
@@ -322,7 +325,9 @@ class Desktop:
             self.error = ""
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
-            self.error = safe_error(exc, self.state.get("settings", {}))
+            settings = self.state.get("settings", {})
+            log_failure(log, f"UI action {operation}", exc, settings=settings)
+            self.error = safe_error(exc, settings)
 
     def targets(self) -> list[dict]:
         return [t for t in self.state["downloads"] if t["id"] in self.selected]
@@ -472,6 +477,7 @@ class Desktop:
         self.spotify_selected.clear()
         self.spotify_search_id += 1
         search_id = self.spotify_search_id
+        log.info("UI Spotify search #%s url=%s", search_id, redact(url))
         self.spotify_handle = self.runner.stream(
             lambda: ipc_stream(self.data_dir, "spotify.search.stream", {"url": url}, timeout=300),
             on_item=lambda event, sid=search_id: self._spotify_event(sid, event),
@@ -502,13 +508,18 @@ class Desktop:
             return
         self.spotify_handle = None
         self.busy = ""
+        result = self.spotify_result or {}
+        log.info("UI Spotify search #%s done: %s track(s) truncated=%s", search_id,
+                 len(result.get("items") or []), bool(result.get("truncated")))
 
     def _spotify_error(self, search_id: int, exc: BaseException) -> None:
         if search_id != self.spotify_search_id:
             return
         self.spotify_handle = None
         self.busy = ""
-        self.error = safe_error(exc, self.state.get("settings", {}))
+        settings = self.state.get("settings", {})
+        log_failure(log, f"Spotify search #{search_id}", exc, settings=settings)
+        self.error = safe_error(exc, settings)
 
     def queue_spotify(self, all_tracks: bool = False) -> None:
         if not self.spotify_result:
@@ -518,15 +529,20 @@ class Desktop:
         if not songs:
             self.error = "Select at least one track."
             return
+        log.info("UI queueing %s Spotify track(s) start_paused=%s", len(songs), self.start_paused)
         try:
             result = self.call("spotify.queue", {"songs": songs, "start_paused": self.start_paused})
+            log.info("UI queued %s Spotify track(s): %s", len(result["tasks"]),
+                     ", ".join(str(t.get("id", "?")) for t in result["tasks"][:12]))
             self.notice = f"Queued {len(result['tasks'])} tracks through spotDL."
             self._cancel_spotify_stream()
             self.dialog = ""
             self.category = "audio"
             self.refresh()
         except (OSError, ValueError, RuntimeError, EOFError) as exc:
-            self.error = safe_error(exc, self.state.get("settings", {}))
+            settings = self.state.get("settings", {})
+            log_failure(log, f"queue {len(songs)} Spotify track(s)", exc, settings=settings)
+            self.error = safe_error(exc, settings)
 
     def save_options(self) -> None:
         payload = {key: self.settings_form[key] for key in OPTIONS_KEYS}

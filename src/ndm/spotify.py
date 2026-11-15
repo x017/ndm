@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from collections.abc import Iterator
 from functools import partial
 from pathlib import Path
@@ -67,6 +68,8 @@ def _configure_proxy(settings: dict | None) -> None:
     """
     configure_environment(settings or {})
     proxies = requests_proxies(settings or {})
+    log.info("Proxy wiring for Spotify/YouTube clients: %s",
+             ", ".join(f"{k}={redact(v)}" for k, v in (proxies or {}).items()) or "direct (no proxy)")
     from spotdl.utils.config import GlobalConfig
     GlobalConfig.set_parameter("proxies", proxies)
     with _INIT_LOCK:
@@ -127,6 +130,12 @@ def _initialize_client(data_dir: Path) -> None:
         # Upstream's default metadata backend needs no browser login. Users may opt into
         # their own official API application with environment variables; no user_auth
         # callback server is opened by this desktop application.
+        # This step reaches the rotating-TOTP secret host and clienttoken.spotify.com.
+        # It is a distinct network leg from the search itself and fails independently.
+        official = bool(os.environ.get("SPOTIPY_CLIENT_ID"))
+        log.info("Initializing Spotify metadata client (official_api=%s cache=%s)",
+                 official, data_dir / "spotify-token-cache")
+        begun = time.monotonic()
         SpotifyClient.init(
             client_id=os.environ.get("SPOTIPY_CLIENT_ID", SPOTIFY_OPTIONS["client_id"]),
             client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET", SPOTIFY_OPTIONS["client_secret"]),
@@ -135,6 +144,7 @@ def _initialize_client(data_dir: Path) -> None:
             cache_path=str(data_dir / "spotify-token-cache"),
         )
         _CLIENT_INITIALIZED = True
+        log.info("Spotify metadata client ready in %.2fs", time.monotonic() - begun)
 
 
 def _resolve_spotify_url(url: str, settings: dict | None) -> str:
@@ -216,12 +226,20 @@ def _album_song(track, album: dict, *, list_position: int, list_length: int):
 def search(url: str, data_dir: Path, *, limit: int = 500, settings: dict | None = None) -> dict:
     if urlsplit(url.strip()).hostname == "spotify.link":
         import httpx
+        log.info("Resolving spotify.link short URL through proxy=%s",
+                 bool((settings or {}).get("proxy_enabled")))
         with httpx.Client(timeout=20, follow_redirects=True, **httpx_options(settings or {})) as client:
-            url = str(client.head(url.strip()).url)
+            resolved = str(client.head(url.strip()).url)
+        log.info("Resolved %s -> %s", redact(url), redact(resolved))
+        url = resolved
     if not supported_url(url):
         raise ValueError("Paste a full Spotify track, album, or playlist link from open.spotify.com.")
     if availability()["installed"] is False:
         raise RuntimeError("spotDL is not installed. Run uv sync, or pip install -e ., to install NDM's dependencies.")
+    log.info("SEARCH url=%s limit=%s proxy=%s remote_dns=%s cookies=%s", redact(url), limit,
+             bool((settings or {}).get("proxy_enabled")), (settings or {}).get("proxy_remote_dns"),
+             bool((settings or {}).get("firefox_cookies")))
+    started = time.monotonic()
     configure_upstream_logging()
     _initialize_client(data_dir)
     _configure_proxy(settings)
@@ -234,6 +252,7 @@ def search(url: str, data_dir: Path, *, limit: int = 500, settings: dict | None 
 
     # parse_query is the same metadata expansion used by spotdl.Spotdl.search.
     songs = parse_query([url.strip()], threads=2)
+    log.info("SEARCH returned %d track(s) in %.2fs", len(songs or []), time.monotonic() - started)
     if not songs:
         raise ValueError("spotDL returned no tracks. Check that the link is public and available in your region.")
     truncated = len(songs) > limit
@@ -264,17 +283,25 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
     url = _resolve_spotify_url(url, settings)
     if availability()["installed"] is False:
         raise RuntimeError("spotDL is not installed. Run uv sync, or pip install -e ., to install NDM's dependencies.")
+    log.info("STREAM url=%s limit=%s proxy=%s remote_dns=%s cookies=%s", redact(url), limit,
+             bool((settings or {}).get("proxy_enabled")), (settings or {}).get("proxy_remote_dns"),
+             bool((settings or {}).get("firefox_cookies")))
+    started = time.monotonic()
     configure_upstream_logging()
     _initialize_client(data_dir)
     _configure_proxy(settings)
     from spotdl.types.song import Song
     from spotdl.utils.spotify import SpotifyClient
 
+    begun = time.monotonic()
     client = SpotifyClient()
+    log.info("STREAM Spotify client acquired in %.2fs", time.monotonic() - begun)
     path = urlsplit(url).path
     kind = "playlist" if "/playlist/" in path else "album" if "/album/" in path else "track"
+    log.info("STREAM kind=%s", kind)
     if kind == "track":
         song = Song.from_url(url)
+        log.info("STREAM track metadata loaded: %r by %r", song.name, song.artist)
         yield {"type": "meta", "kind": kind, "title": song.name, "total": 1}
         yield {"type": "items", "items": [_song_item(song)]}
         yield {"type": "done", "total": 1, "truncated": False}
@@ -286,6 +313,7 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
             raise ValueError("Invalid playlist URL.")
         title = playlist.get("name") or ""
         total = int((playlist.get("tracks") or {}).get("total") or 0)
+        log.info("STREAM playlist=%r total=%s", title, total)
         yield {"type": "meta", "kind": kind, "title": title, "total": total}
         page = client.playlist_items(url)
         if page is None:
@@ -298,6 +326,7 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
             raise ValueError("Couldn't get album metadata. Check that the album id is correct.")
         title = album.get("name") or ""
         total = int(album.get("total_tracks") or (album.get("tracks") or {}).get("total") or 0)
+        log.info("STREAM album=%r total=%s", title, total)
         yield {"type": "meta", "kind": kind, "title": title, "total": total}
         page = client.album_tracks(url)
         if page is None:
@@ -321,14 +350,19 @@ def search_stream(url: str, data_dir: Path, *, limit: int = 500,
             batch.append(_song_item(song))
             count += 1
         if batch:
+            log.info("STREAM page: +%d rows (total streamed=%d, elapsed=%.2fs)",
+                     len(batch), count, time.monotonic() - started)
             yield {"type": "items", "items": batch}
         if truncated or not page.get("next"):
             break
+        log.debug("STREAM fetching next page after position=%d", position)
         page = client.next(page)
         if page is None:
             break
     if count == 0:
         raise ValueError("spotDL returned no tracks. Check that the link is public and available in your region.")
+    log.info("STREAM done: %d track(s) in %.2fs truncated=%s", count,
+             time.monotonic() - started, truncated)
     yield {"type": "done", "total": max(total, count) if truncated else count,
            "truncated": truncated}
 
@@ -375,6 +409,7 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         # This refetches Spotify metadata over the network and can fail before
         # matching starts. Log it like any other stage; spotapi hides the real
         # cause in RequestError.error rather than __cause__.
+        log.info("Refreshing sparse Spotify metadata for %r (network)", song.display_name)
         try:
             song = reinit_song(song)
         except Exception as exc:
@@ -513,6 +548,8 @@ def download(song_data: dict, destination: Path, data_dir: Path, stop, progress,
         raise RuntimeError("FFmpeg is required to convert spotDL matches. Install FFmpeg, then retry this track.")
     if stop.is_set():
         raise SpotifyCancelled()
+    log.info("DOWNLOAD start track=%r artist=%r format=%s bitrate=%s destination=%s",
+             song_data.get("name"), song_data.get("artist"), audio_format, bitrate, destination)
     progress(None, None, "matching", 0)
     matched = match_song(song_data, data_dir, settings=settings, stop=stop)
     if on_match is not None:
@@ -538,9 +575,14 @@ def download(song_data: dict, destination: Path, data_dir: Path, stop, progress,
             raise SpotifyCancelled()
         progress(downloaded, total, phase, None, estimated=estimated)
 
+    log.info("DOWNLOAD transferring source=%s rate_limit=%s connections=%s js_runtimes=%s",
+             redact(matched["url"]), rate_limit or "unlimited", connections,
+             bool(task.get("js_runtimes")))
     path = media_download(task, stop, transfer_progress, rate_limit, connections, settings=settings)
     if stop.is_set():
         raise SpotifyCancelled()
+    log.info("DOWNLOAD transfer finished: %s (%s bytes); tagging next", path,
+             path.stat().st_size if path.is_file() else "?")
     progress(None, None, "tagging", 99)
     tag_file(path, matched["song"], stop=stop, settings=settings)
     if stop.is_set():
