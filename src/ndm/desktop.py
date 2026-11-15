@@ -818,6 +818,89 @@ class Desktop:
         tasks.sort(key=keys.get(self.sort.column, keys[6]), reverse=self.sort.descending)
         return tasks
 
+    def _select_for_menu(self, task_id: str) -> None:
+        """Right-click keeps a multi-selection, but focuses an unselected row.
+
+        The menu body runs every frame while open, so this must be idempotent:
+        assigning unconditionally used to collapse a multi-row selection down to
+        the clicked row and make "Remove" act on one file instead of all of them.
+        """
+        if task_id not in self.selected:
+            self.selected = {task_id}
+
+    def _copy_to_clipboard(self, ctx: ui.UI, text: str, label: str) -> None:
+        if not text:
+            return
+        ctx.set_clipboard(text)
+        self.notice = f"{label} copied to clipboard."
+
+    def _open_containing_folder(self, path: str) -> None:
+        """Reveal a download in the platform file manager, not the file itself."""
+        import subprocess
+        import sys
+        target = Path(path)
+        folder = target if target.is_dir() else target.parent
+        try:
+            if sys.platform == "win32":
+                if target.is_file():
+                    subprocess.Popen(["explorer", f"/select,{target}"])
+                else:
+                    os.startfile(str(folder))  # noqa: S606
+            elif sys.platform == "darwin":
+                # -R reveals the file in Finder; a directory just opens.
+                args = ["open", "-R", str(target)] if target.is_file() else ["open", str(folder)]
+                subprocess.Popen(args)
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except OSError as exc:
+            self.error = safe_error(exc, self.state.get("settings", {}))
+
+    def _row_context_menu(self, ctx: ui.UI, task: dict) -> None:
+        """Right-click actions for one row, applied to the whole selection."""
+        self._select_for_menu(task["id"])
+        chosen = self.targets() or [task]
+        many = len(chosen) > 1
+        suffix = f" ({len(chosen)})" if many else ""
+        statuses = {t["status"] for t in chosen}
+        can_resume = bool(statuses & {"paused", "error", "queued"})
+        can_stop = bool(statuses & {"downloading", "queued"})
+        completed = [t for t in chosen if t["status"] == "completed"]
+
+        if ctx.menu_item(f"Resume{suffix}", icon=ui.Icon.PLAY, disabled=not can_resume):
+            for item in chosen:
+                self.perform("action", {"id": item["id"], "action": "resume"})
+        if ctx.menu_item(f"Stop{suffix}", icon=ui.Icon.PAUSE, disabled=not can_stop):
+            for item in chosen:
+                self.perform("action", {"id": item["id"], "action": "pause"})
+        if ctx.menu_item(f"Retry{suffix}", icon=ui.Icon.DOWNLOAD,
+                         disabled=not bool(statuses & {"error", "completed"})):
+            for item in chosen:
+                self.perform("action", {"id": item["id"], "action": "retry"})
+        ctx.menu_separator()
+        if ctx.menu_item("Open file", icon=ui.Icon.PLAY,
+                         disabled=many or not completed or not Path(task["path"]).exists()):
+            try:
+                os_open_path(task["path"])
+            except OSError as exc:
+                self.error = safe_error(exc, self.state.get("settings", {}))
+        if ctx.menu_item("Open containing folder", icon=ui.Icon.FOLDER, disabled=many):
+            self._open_containing_folder(task["path"])
+        ctx.menu_separator()
+        if ctx.menu_item("Copy download link", icon=ui.Icon.CLIPBOARD, disabled=many or not task.get("url")):
+            self._copy_to_clipboard(ctx, task.get("url", ""), "Link")
+        if ctx.menu_item("Copy file path", icon=ui.Icon.COPY, disabled=many):
+            self._copy_to_clipboard(ctx, task["path"], "Path")
+        if ctx.menu_item("Diagnostics…", icon=ui.Icon.INFO,
+                         disabled=many or task["status"] != "error"):
+            self.details_id = task["id"]
+            self.open_dialog("details")
+        ctx.menu_separator()
+        if ctx.menu_item("Properties", icon=ui.Icon.INFO, disabled=many):
+            self.details_id = task["id"]
+            self.open_dialog("details")
+        if ctx.menu_item(f"Remove…{suffix}", icon=ui.Icon.TRASH, danger=True):
+            self.ask_delete([t["id"] for t in chosen])
+
     def _download_table(self, ctx: ui.UI, state: dict) -> None:
         tasks = self.visible_tasks(state)
         columns = [ui.TableColumn("File Name", width=ui.GROW(1), sortable=True),
@@ -849,16 +932,7 @@ class Desktop:
                             self.last_row, self.last_click = task["id"], now
                         with ctx.context_menu("row_actions") as menu:
                             if menu:
-                                self.selected = {task["id"]}
-                                if ctx.menu_item("Resume", icon=ui.Icon.PLAY):
-                                    self.perform("action", {"id": task["id"], "action": "resume"})
-                                if ctx.menu_item("Stop", icon=ui.Icon.PAUSE):
-                                    self.perform("action", {"id": task["id"], "action": "pause"})
-                                if ctx.menu_item("Remove…", icon=ui.Icon.TRASH, danger=True):
-                                    self.ask_delete([task["id"]])
-                                if ctx.menu_item("Properties", icon=ui.Icon.INFO):
-                                    self.details_id = task["id"]
-                                    self.open_dialog("details")
+                                self._row_context_menu(ctx, task)
                         table.cell()
                         ctx.icon(CATEGORY_ICONS.get(task["category"], ui.Icon.FILE), size=15, color=ui.Color.ACCENT)
                         ctx.text(task["name"], size=12, nowrap=True)
@@ -1016,6 +1090,28 @@ class Desktop:
             if not dialog.open:
                 self.dialog = ""
 
+    def _spotify_row_menu(self, ctx: ui.UI, item: dict, items: list[dict]) -> None:
+        """Right-click a Spotify result to queue it or copy its link."""
+        if item["id"] not in self.spotify_selected:
+            self.spotify_selected = {item["id"]}
+        count = len(self.spotify_selected)
+        if ctx.menu_item(f"Queue selected ({count})", icon=ui.Icon.DOWNLOAD):
+            self.queue_spotify()
+        if ctx.menu_item("Queue only this track", icon=ui.Icon.MUSIC):
+            self.spotify_selected = {item["id"]}
+            self.queue_spotify()
+        ctx.menu_separator()
+        if ctx.menu_item("Copy Spotify link", icon=ui.Icon.CLIPBOARD, disabled=not item.get("url")):
+            self._copy_to_clipboard(ctx, item.get("url", ""), "Spotify link")
+        if ctx.menu_item("Copy title and artist", icon=ui.Icon.COPY):
+            self._copy_to_clipboard(ctx, f"{item.get('artist', '')} - {item.get('name', '')}".strip(" -"),
+                                    "Track")
+        ctx.menu_separator()
+        if ctx.menu_item("Select all", icon=ui.Icon.CHECK):
+            self.spotify_selected = {i["id"] for i in items}
+        if ctx.menu_item("Clear selection", icon=ui.Icon.X, disabled=not self.spotify_selected):
+            self.spotify_selected.clear()
+
     def _spotify_dialog(self, ctx: ui.UI, state: dict) -> None:
         info = state["daemon"]["spotify"]
         with ctx.dialog("Download Spotify Link — spotDL", True, width=820) as dialog:
@@ -1053,6 +1149,9 @@ class Desktop:
                                 with ctx.id_scope(item["id"]):
                                     if table.row(item["id"] in self.spotify_selected):
                                         self.spotify_selected.symmetric_difference_update({item["id"]})
+                                    with ctx.context_menu("spotify_row_actions") as menu:
+                                        if menu:
+                                            self._spotify_row_menu(ctx, item, items)
                                     table.cell_text(item["name"])
                                     table.cell_text(item["artist"])
                                     table.cell_text(item["album"])
@@ -1343,6 +1442,19 @@ class Desktop:
                                         os_open_path(track["path"])
                                     except OSError as exc:
                                         self.error = safe_error(exc, self.state.get("settings", {}))
+                                with ctx.context_menu("library_row_actions") as menu:
+                                    if menu:
+                                        self.library_selection = index
+                                        if ctx.menu_item("Play file", icon=ui.Icon.PLAY):
+                                            try:
+                                                os_open_path(track["path"])
+                                            except OSError as exc:
+                                                self.error = safe_error(exc, self.state.get("settings", {}))
+                                        if ctx.menu_item("Open containing folder", icon=ui.Icon.FOLDER):
+                                            self._open_containing_folder(track["path"])
+                                        ctx.menu_separator()
+                                        if ctx.menu_item("Copy file path", icon=ui.Icon.COPY):
+                                            self._copy_to_clipboard(ctx, track["path"], "Path")
                                 table.cell_text(track["name"])
                                 table.cell_text(format_bytes(track["size"]))
                                 table.cell_text(track["folder"])
