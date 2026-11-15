@@ -13,7 +13,6 @@ import shutil
 import threading
 import time
 from collections.abc import Iterator
-from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -29,7 +28,6 @@ from .diagnostics import (
 from .models import SpotifyCancelled, safe_filename
 from .network import (
     configure_environment,
-    firefox_cookie_jar,
     firefox_cookie_options,
     httpx_options,
     proxy_url,
@@ -132,19 +130,14 @@ def _bootstrap_ytmusic(client, settings: dict | None):
 
 
 def _configured_ytmusic(settings: dict):
-    import requests
-    from ytmusicapi import YTMusic
+    """Build a YTMusic client with NDM's proxy, opt-in cookies, and a timeout.
 
-    jar = firefox_cookie_jar(settings)
-    proxies = requests_proxies(settings)
-    session = requests.Session()
-    session.request = partial(session.request, timeout=30)
-    session.trust_env = not proxies
-    if jar is not None:
-        # Requests applies domain/path/secure matching to session cookies. Do not
-        # flatten the jar into a header, which would leak cookies across hosts.
-        session.cookies.update(jar)
-    return YTMusic(language="de", proxies=proxies, requests_session=session)
+    Delegates to matching.create_client: this used to be a second copy of the
+    same session wiring, which meant a proxy or cookie fix had to be made twice.
+    """
+    from .matching import create_client
+
+    return create_client(settings)
 
 
 def _initialize_client(data_dir: Path) -> None:

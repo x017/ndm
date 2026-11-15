@@ -38,7 +38,6 @@ log = get_logger("ndm.engine")
 
 CHUNK = 128 * 1024
 USER_AGENT = "NDM/0.1 (personal download manager)"
-TERMINAL = {"completed", "error"}
 
 
 class RangeLost(Exception):

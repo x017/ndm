@@ -87,8 +87,6 @@ class Candidate:
     duration: float
     verified: bool
     album: str = ""
-    explicit: bool = False
-    views: str = ""
     url: str = ""
     score: float = 0.0
     reasons: list[str] = field(default_factory=list)
@@ -115,8 +113,6 @@ def candidates_from(raw: list[dict]) -> list[Candidate]:
             duration=parse_duration(row.get("duration_seconds") or row.get("duration")),
             verified=verified,
             album=str(album.get("name") or "") if isinstance(album, dict) else "",
-            explicit=bool(row.get("isExplicit")),
-            views=str(row.get("views") or ""),
             url=f"https://{'music' if verified else 'www'}.youtube.com/watch?v={row['videoId']}",
         ))
     return results
@@ -212,6 +208,22 @@ def _search(client, query: str, filter_: str | None, stop) -> list[Candidate]:
     return candidates_from(client.search(query, **kwargs))
 
 
+def strip_artist_prefix(title: str, artists: list[str]) -> str:
+    """Drop a leading "Artist - " credit from a YouTube title.
+
+    Callers pass the channel/uploader first and the wanted Spotify artists as a
+    fallback, because the channel is often a VEVO or label account rather than
+    the artist named in the title.
+    """
+    for credit in artists:
+        if not credit:
+            continue
+        prefix = re.compile(r"^\s*" + re.escape(str(credit)) + r"\s*[-\u2013\u2014:]\s+", re.I)
+        if prefix.search(title):
+            return prefix.sub("", title, count=1)
+    return title
+
+
 def candidates_from_ytdlp(entries: list[dict]) -> list[Candidate]:
     """Convert yt-dlp search rows into candidates.
 
@@ -227,22 +239,16 @@ def candidates_from_ytdlp(entries: list[dict]) -> list[Candidate]:
         if not channel:
             continue
         artist = re.sub(r"\s*-\s*Topic$", "", channel).strip() or channel
-        title = str(row.get("title") or "")
         # YouTube titles are usually "Artist - Title", while Spotify stores the
         # bare title. Strip a leading artist credit so the shared scorer compares
         # like with like; without this an exact match scored ~68 instead of ~100.
-        for credit in {artist, channel}:
-            prefix = re.compile(r"^\s*" + re.escape(credit) + r"\s*[-\u2013\u2014:]\s+", re.I)
-            if prefix.search(title):
-                title = prefix.sub("", title, count=1)
-                break
+        title = strip_artist_prefix(str(row.get("title") or ""), [artist, channel])
         results.append(Candidate(
             video_id=str(row["id"]),
             title=title,
             artists=[artist],
             duration=float(row.get("duration") or 0),
             verified=channel.lower().endswith("- topic"),
-            views=str(row.get("view_count") or ""),
             url=f"https://www.youtube.com/watch?v={row['id']}",
         ))
     return results
@@ -277,21 +283,6 @@ def search_ytdlp(query: str, *, settings: dict | None = None, stop=None, limit: 
     found = candidates_from_ytdlp(entries)
     log.info("yt-dlp search %r returned %d candidate(s)", redact(query), len(found))
     return found
-
-
-def strip_artist_prefix(title: str, artists: list[str]) -> str:
-    """Drop a leading "Artist - " credit from a YouTube title.
-
-    The channel is often a VEVO/label account rather than the artist, so the
-    converter cannot always do this; match against the wanted artists too.
-    """
-    for credit in artists:
-        if not credit:
-            continue
-        prefix = re.compile(r"^\s*" + re.escape(str(credit)) + r"\s*[-\u2013\u2014:]\s+", re.I)
-        if prefix.search(title):
-            return prefix.sub("", title, count=1)
-    return title
 
 
 def find_match_ytdlp(song: dict, *, settings: dict | None = None, stop=None) -> dict:
