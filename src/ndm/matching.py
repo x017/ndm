@@ -212,6 +212,111 @@ def _search(client, query: str, filter_: str | None, stop) -> list[Candidate]:
     return candidates_from(client.search(query, **kwargs))
 
 
+def candidates_from_ytdlp(entries: list[dict]) -> list[Candidate]:
+    """Convert yt-dlp search rows into candidates.
+
+    A flat YouTube search has no artist array or song/video flag, so the channel
+    name stands in for the artist and a "- Topic" channel (YouTube's auto-generated
+    artist channels) is treated as the verified equivalent.
+    """
+    results: list[Candidate] = []
+    for row in entries or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        channel = str(row.get("channel") or row.get("uploader") or "").strip()
+        if not channel:
+            continue
+        artist = re.sub(r"\s*-\s*Topic$", "", channel).strip() or channel
+        title = str(row.get("title") or "")
+        # YouTube titles are usually "Artist - Title", while Spotify stores the
+        # bare title. Strip a leading artist credit so the shared scorer compares
+        # like with like; without this an exact match scored ~68 instead of ~100.
+        for credit in {artist, channel}:
+            prefix = re.compile(r"^\s*" + re.escape(credit) + r"\s*[-\u2013\u2014:]\s+", re.I)
+            if prefix.search(title):
+                title = prefix.sub("", title, count=1)
+                break
+        results.append(Candidate(
+            video_id=str(row["id"]),
+            title=title,
+            artists=[artist],
+            duration=float(row.get("duration") or 0),
+            verified=channel.lower().endswith("- topic"),
+            views=str(row.get("view_count") or ""),
+            url=f"https://www.youtube.com/watch?v={row['id']}",
+        ))
+    return results
+
+
+def search_ytdlp(query: str, *, settings: dict | None = None, stop=None, limit: int = 10) -> list[Candidate]:
+    """Search YouTube through yt-dlp instead of the YouTube Music API.
+
+    ytmusicapi talks to music.youtube.com over requests; when that endpoint is
+    blocked or its visitor-id handshake stalls, matching dies even though yt-dlp
+    can still reach YouTube and download. This uses the same stack as the media
+    grabber, so a working grabber means a working search.
+    """
+    import yt_dlp
+
+    from .diagnostics import YtdlpLogger, debug_enabled
+    from .network import ytdlp_options
+
+    if stop is not None and stop.is_set():
+        raise SpotifyCancelled()
+    options = {
+        "quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+        "extract_flat": "in_playlist", "socket_timeout": 20, "extractor_retries": 1,
+        "logger": YtdlpLogger("ndm.matching.ytdlp", "[yt-search]"),
+        "verbose": debug_enabled(), **ytdlp_options(settings or {}),
+    }
+    target = f"ytsearch{max(1, limit)}:{query}"
+    log.info("yt-dlp search %r", redact(query))
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(target, download=False)
+    entries = list((info or {}).get("entries") or [])
+    found = candidates_from_ytdlp(entries)
+    log.info("yt-dlp search %r returned %d candidate(s)", redact(query), len(found))
+    return found
+
+
+def strip_artist_prefix(title: str, artists: list[str]) -> str:
+    """Drop a leading "Artist - " credit from a YouTube title.
+
+    The channel is often a VEVO/label account rather than the artist, so the
+    converter cannot always do this; match against the wanted artists too.
+    """
+    for credit in artists:
+        if not credit:
+            continue
+        prefix = re.compile(r"^\s*" + re.escape(str(credit)) + r"\s*[-\u2013\u2014:]\s+", re.I)
+        if prefix.search(title):
+            return prefix.sub("", title, count=1)
+    return title
+
+
+def find_match_ytdlp(song: dict, *, settings: dict | None = None, stop=None) -> dict:
+    """Match a Spotify track using yt-dlp search and NDM's own scoring."""
+    title = str(song.get("name") or "").strip()
+    artists = [a for a in (song.get("artists") or [song.get("artist")]) if a]
+    if not title or not artists:
+        raise ValueError("This Spotify track is missing the title/artist metadata needed for matching.")
+    query = f"{' '.join(artists)} {title}".strip()
+    found = search_ytdlp(query, settings=settings, stop=stop)
+    if not found:
+        raise LookupError(f"No YouTube results for {', '.join(artists)} - {title}. "
+                          "Check the track title/artist, or retry. Full log: ndm logs")
+    for candidate in found:
+        candidate.title = strip_artist_prefix(candidate.title, artists)
+    ranked = sorted((score(song, c) for c in found), key=lambda c: c.score, reverse=True)
+    for hit in ranked[:5]:
+        log.info("yt-dlp candidate %s score=%.1f %s | %s", hit.url, hit.score,
+                 hit.title, " ".join(hit.reasons))
+    best = ranked[0]
+    log.info("Best yt-dlp match %s score=%.1f (%s)", best.url, best.score, " ".join(best.reasons))
+    return {"url": best.url, "score": best.score, "title": best.title,
+            "artists": best.artists, "matched_by": "yt-dlp search"}
+
+
 def find_match(song: dict, *, settings: dict | None = None, stop=None, client=None) -> dict:
     """Return {'url', 'score', 'title', 'artists'} for the best YouTube source."""
     title = str(song.get("name") or "").strip()

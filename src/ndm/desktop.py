@@ -1262,8 +1262,8 @@ class Desktop:
                         form["spotify_bitrate"] = rates[ctx.select("spotify_bitrate", rates, rates.index(form["spotify_bitrate"]), label="Conversion bitrate (auto/disable use FFmpeg defaults)", width=ui.FILL)]
                         taggers = ["ndm", "spotdl"]
                         form["spotify_tagger"] = taggers[ctx.select("spotify_tagger", ["NDM (recommended)", "spotDL (legacy)"], taggers.index(form.get("spotify_tagger") or "ndm"), label="Tag writer", width=ui.FILL)]
-                        matchers = ["spotdl", "ndm"]
-                        form["spotify_matcher"] = matchers[ctx.select("spotify_matcher", ["spotDL (default)", "NDM (experimental)"], matchers.index(form.get("spotify_matcher") or "spotdl"), label="Source matcher", width=ui.FILL)]
+                        matchers = ["spotdl", "ndm", "ytdlp"]
+                        form["spotify_matcher"] = matchers[ctx.select("spotify_matcher", ["spotDL (default)", "NDM (experimental)", "yt-dlp (same as grabber)"], matchers.index(form.get("spotify_matcher") or "spotdl"), label="Source matcher", width=ui.FILL)]
                         info = state["daemon"]["spotify"]
                         ctx.text(f"spotDL {info['version'] or 'not installed'} · FFmpeg {'installed' if info['ffmpeg'] else 'missing'}", size=12)
                         ctx.text("spotDL selects the YouTube Music match; NDM's yt-dlp pipeline downloads and converts it. No spotDL web UI or downloader gateway is used.", width=ui.FILL, size=11)

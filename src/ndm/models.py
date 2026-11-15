@@ -262,8 +262,8 @@ class Settings(BaseModel):
     @field_validator("spotify_matcher")
     @classmethod
     def valid_spotify_matcher(cls, value: str) -> str:
-        if value not in {"ndm", "spotdl"}:
-            raise ValueError("Choose the NDM or spotDL matcher.")
+        if value not in {"ndm", "spotdl", "ytdlp"}:
+            raise ValueError("Choose the spotDL, NDM, or yt-dlp matcher.")
         return value
 
     @field_validator("spotify_tagger")

@@ -401,6 +401,34 @@ def estimated_size(song: dict, audio_format: str, bitrate: str) -> int:
     return int(duration * kilobits * 125) if duration > 0 and kilobits > 0 else 0
 
 
+def _network_failure(exc: BaseException) -> bool:
+    """True when the failure is transport-level, so another route may still work."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__.lower()
+        if any(token in name for token in ("timeout", "connection", "ssl", "proxy", "transport")):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _match_via_ytdlp(song, settings: dict | None, stop) -> dict:
+    """Match through yt-dlp's search, then hand the URL to the normal transfer."""
+    from .matching import find_match_ytdlp
+
+    begun = time.monotonic()
+    found = find_match_ytdlp(song.json, settings=settings, stop=stop)
+    if stop is not None and stop.is_set():
+        raise SpotifyCancelled()
+    song.download_url = found["url"]
+    log.info("Matched %r -> %s (score %.1f via %s in %.2fs)", song.display_name,
+             found["url"], found["score"], found["matched_by"], time.monotonic() - begun)
+    return {"url": found["url"], "song": song.json,
+            "provider": "YouTube via yt-dlp", "match_score": found["score"]}
+
+
 def _js_runtimes() -> dict | None:
     """Locate a JS runtime for yt-dlp without downloading or installing one.
 
@@ -522,6 +550,9 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         return {"url": found["url"], "song": song.json, "provider": "YouTube Music via NDM",
                 "match_score": found["score"]}
 
+    if (settings or {}).get("spotify_matcher") == "ytdlp":
+        return _match_via_ytdlp(song, settings, stop)
+
     provider = YouTubeMusic()
     match_logger = YtdlpLogger("ndm.spotify.match", "[match]")
     try:
@@ -539,6 +570,15 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         # wrap the real cause in AudioProviderError. Keep ranking unchanged, but
         # surface the underlying network/cookie/extractor failure to the queue.
         log_failure(log, "YouTube Music matching", exc, settings=settings, track=song.display_name)
+        if _network_failure(exc) and (settings or {}).get("spotify_matcher") != "ndm":
+            # The Music API is unreachable, but yt-dlp reaches YouTube fine (the
+            # media grabber works). Search through that stack instead of failing.
+            log.warning("YouTube Music API unreachable; falling back to yt-dlp search")
+            try:
+                return _match_via_ytdlp(song, settings, stop)
+            except Exception as fallback_exc:
+                log_failure(log, "yt-dlp search fallback", fallback_exc,
+                            settings=settings, track=song.display_name)
         cause = exc.__cause__
         root = cause if cause is not None and cause is not exc else exc
         raise ValueError(failure_message(
