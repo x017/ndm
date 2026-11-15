@@ -174,12 +174,7 @@ class Desktop:
         self.last_click = 0.0
         self.frame_no = 0
         self._select_frame = -1
-        self._menu_row = ""
-        self._menu_x = 0.0
-        self._menu_dx = 0.0
-        self._anchor_base: dict[str, float] = {}
-        self._anchor_dx: dict[str, float] = {}
-        self.sort = ui.TableSort(7, True)
+        self.sort = ui.TableSort(6, True)
         self.dialog = ""
         self.error = ""
         self.notice = ""
@@ -836,30 +831,22 @@ class Desktop:
             if self.search and self.search.lower() not in (task["name"] + " " + task["url"]).lower():
                 continue
             tasks.append(task)
-        # Column 0 is the zero-width menu anchor, so the data columns start at 1.
-        keys = {1: lambda t: t["name"].lower(), 2: lambda t: t["size"], 3: lambda t: status_text(t),
-                4: lambda t: percent(t), 5: lambda t: time_left(t), 6: lambda t: t["speed"],
-                7: lambda t: t.get("completed_at") or t["created_at"], 8: lambda t: t["host"]}
-        tasks.sort(key=keys.get(self.sort.column, keys[7]), reverse=self.sort.descending)
+        keys = {0: lambda t: t["name"].lower(), 1: lambda t: t["size"], 2: lambda t: status_text(t),
+                3: lambda t: percent(t), 4: lambda t: time_left(t), 5: lambda t: t["speed"],
+                6: lambda t: t.get("completed_at") or t["created_at"], 7: lambda t: t["host"]}
+        tasks.sort(key=keys.get(self.sort.column, keys[6]), reverse=self.sort.descending)
         return tasks
 
-    MENU_WIDTH = 230.0
-    ANCHOR_LABEL = "\u200b"
+    def _row_popover(self, ctx: ui.UI, anchor_label: str, *, band_top: float | None = None,
+                     enabled: bool = True):
+        """Right-click menu for the whole row, not just the filename cell.
 
-    def _row_popover(self, ctx: ui.UI, anchor_label: str, *, row_id: str,
-                     band_top: float | None = None, enabled: bool = True):
-        """Right-click menu for the whole row, opened at the pointer.
-
-        Nexa has no absolute popup positioning: a popover anchors to the last
-        item and Placement only picks a side. So each row owns a 1px anchor
-        button in a zero-width first column, pushed right by a gap. BOTTOM_END
-        right-aligns the panel to that anchor, which makes the panel's left edge
-        land on the pointer for any non-negative gap. The offset lives in its own
-        fixed-width column because a gap inside a real column resizes it.
-
-        The anchor rect is only resolved after a frame, so the gap is derived
-        from the previous frame's anchor position minus the gap it used; it
-        settles on the exact offset on the following frame.
+        ctx.context_menu anchors to the last interactive item, so it only ever
+        covered the filename. A table row exposes no rect of its own, but the
+        filename button spans the row's full height, so its band identifies the
+        row. A right-click anywhere in that band opens a popover anchored to the
+        button. band_top is the previous row's bottom, which claims the padding
+        between rows without letting two rows match the same click.
         """
         rect = ctx.get_rect(ctx.make_id(anchor_label))
         self._row_band_bottom = rect.y + rect.h
@@ -867,34 +854,8 @@ class Desktop:
         top = rect.y if band_top is None else min(band_top, rect.y)
         if (enabled and rect.h > 0 and top <= mouse.y <= rect.y + rect.h
                 and mouse.x >= rect.x and ctx.mouse_clicked(ui.MouseButton.RIGHT)):
-            self._menu_row = row_id
-            self._menu_x = mouse.x
-            self._menu_dx = 0.0
             ctx.popover_open("row_menu")
-        active = self._menu_row == row_id
-        if active and not ctx.popover_is_open("row_menu"):
-            # Dismissed by Escape or an outside click; stop reserving the offset.
-            active = False
-            self._menu_row = ""
-            self._menu_dx = 0.0
-        dx = self._menu_dx if active else 0.0
-        ctx.gap(dx)
-        # A zero-width space keeps the anchor invisible but gives it a stable id;
-        # an empty label does not resolve through make_id inside a table cell.
-        ctx.button(self.ANCHOR_LABEL, variant=ui.ButtonVariant.GHOST,
-                   size=ui.ControlSize.SM, width=1)
-        anchor = ctx.get_rect(ctx.make_id(self.ANCHOR_LABEL))
-        # get_rect returns last frame's layout, so the anchor is only at its
-        # resting place once the previous frame also drew it with no offset.
-        # Caching it one frame after the menu closes would capture the shifted
-        # position and permanently skew the next opening.
-        if anchor.w > 0 and not active and self._anchor_dx.get(row_id, 0.0) == 0.0:
-            self._anchor_base[row_id] = anchor.x
-        self._anchor_dx[row_id] = dx
-        base = self._anchor_base.get(row_id)
-        if active and base is not None:
-            self._menu_dx = max(0.0, self._menu_x + self.MENU_WIDTH - 1.0 - base)
-        return ctx.popover("row_menu", placement=ui.Placement.BOTTOM_END, width=self.MENU_WIDTH)
+        return ctx.popover("row_menu", placement=ui.Placement.BOTTOM_START, width=230)
 
     def _select_row(self, ctx: ui.UI, task: dict) -> None:
         """Shared selection + double-click handling for row and filename clicks."""
@@ -984,8 +945,6 @@ class Desktop:
         ctx.menu_separator()
         if ctx.menu_item("Copy download link", icon=ui.Icon.CLIPBOARD, disabled=many or not task.get("url")):
             self._copy_to_clipboard(ctx, task.get("url", ""), "Link")
-        if ctx.menu_item("Copy file path", icon=ui.Icon.COPY, disabled=many):
-            self._copy_to_clipboard(ctx, task["path"], "Path")
         if ctx.menu_item("Properties", icon=ui.Icon.INFO, disabled=many):
             self.details_id = task["id"]
             self.open_dialog("details")
@@ -994,8 +953,7 @@ class Desktop:
 
     def _download_table(self, ctx: ui.UI, state: dict) -> None:
         tasks = self.visible_tasks(state)
-        columns = [ui.TableColumn("", width=1),
-                   ui.TableColumn("File Name", width=ui.GROW(1), sortable=True),
+        columns = [ui.TableColumn("File Name", width=ui.GROW(1), sortable=True),
                    ui.TableColumn("Size", width=85, align=ui.TextAlign.RIGHT, sortable=True),
                    ui.TableColumn("Status", width=100, sortable=True),
                    ui.TableColumn("Progress", width=115, sortable=True),
@@ -1011,19 +969,21 @@ class Desktop:
                     with ctx.id_scope(task["id"]):
                         clicked = table.row(task["id"] in self.selected)
                         table.cell()
-                        with self._row_popover(ctx, task["name"], row_id=task["id"],
-                                               band_top=band_top,
-                                               enabled=not self.dialog) as menu:
-                            if menu:
-                                self._row_context_menu(ctx, task)
-                        band_top = self._row_band_bottom
-                        table.cell()
+                        # A table row is not an interactive item, so a context
+                        # menu anchored to it never opens. The filename is a
+                        # ghost button instead: it looks like the old label but
+                        # gives the menu a real widget to anchor to.
                         name_clicked = ctx.button(
                             task["name"], variant=ui.ButtonVariant.GHOST, size=ui.ControlSize.SM,
                             icon=CATEGORY_ICONS.get(task["category"], ui.Icon.FILE),
                             full_width=True)
                         if clicked or name_clicked:
                             self._select_row(ctx, task)
+                        with self._row_popover(ctx, task["name"], band_top=band_top,
+                                               enabled=not self.dialog) as menu:
+                            if menu:
+                                self._row_context_menu(ctx, task)
+                        band_top = self._row_band_bottom
                         table.cell_text(size_label(task))
                         table.cell_text(status_text(task))
                         table.cell()
@@ -1229,8 +1189,7 @@ class Desktop:
                     if self.spotify_result["truncated"]:
                         detail = f"Showing the first {len(items)} of {total} tracks." if total > len(items) else f"Showing the first {len(items)} tracks."
                         ctx.alert(detail + " Queue these, then import the remaining playlist separately.", tone=ui.Tone.WARNING)
-                    columns = [ui.TableColumn("", width=1),
-                               ui.TableColumn("Title", width=ui.GROW(1)), ui.TableColumn("Artist", width=180),
+                    columns = [ui.TableColumn("Title", width=ui.GROW(1)), ui.TableColumn("Artist", width=180),
                                ui.TableColumn("Album", width=180), ui.TableColumn("Duration", width=75)]
                     with ctx.table("spotify_tracks", columns, height=245, compact=True, striped=True, selectable=True) as table:
                         if table:
@@ -1239,17 +1198,15 @@ class Desktop:
                                 with ctx.id_scope(item["id"]):
                                     row_clicked = table.row(item["id"] in self.spotify_selected)
                                     table.cell()
-                                    with self._row_popover(ctx, item["name"], row_id=item["id"],
-                                                           band_top=spotify_band) as menu:
-                                        if menu:
-                                            self._spotify_row_menu(ctx, item, items)
-                                    spotify_band = self._row_band_bottom
-                                    table.cell()
                                     title_clicked = ctx.button(
                                         item["name"], variant=ui.ButtonVariant.GHOST,
                                         size=ui.ControlSize.SM, full_width=True)
                                     if row_clicked or title_clicked:
                                         self.spotify_selected.symmetric_difference_update({item["id"]})
+                                    with self._row_popover(ctx, item["name"], band_top=spotify_band) as menu:
+                                        if menu:
+                                            self._spotify_row_menu(ctx, item, items)
+                                    spotify_band = self._row_band_bottom
                                     table.cell_text(item["artist"])
                                     table.cell_text(item["album"])
                                     duration = item["duration"]
@@ -1528,9 +1485,7 @@ class Desktop:
                             except (OSError, ValueError, RuntimeError) as exc:
                                 self.error = safe_error(exc, self.state.get("settings", {}))
                 self._error_in_dialog(ctx)
-                columns = [ui.TableColumn("", width=1),
-                           ui.TableColumn("File", width=ui.GROW(1)), ui.TableColumn("Size", width=90),
-                           ui.TableColumn("Folder", width=280)]
+                columns = [ui.TableColumn("File", width=ui.GROW(1)), ui.TableColumn("Size", width=90), ui.TableColumn("Folder", width=280)]
                 with ctx.table("local_audio", columns, height=330, compact=True, striped=True, selectable=True) as table:
                     if table:
                         library_band = None
@@ -1538,8 +1493,16 @@ class Desktop:
                             with ctx.id_scope(str(index)):
                                 row_clicked = table.row(index == self.library_selection)
                                 table.cell()
-                                with self._row_popover(ctx, track["name"], row_id=str(index),
-                                                       band_top=library_band) as menu:
+                                name_clicked = ctx.button(
+                                    track["name"], variant=ui.ButtonVariant.GHOST,
+                                    size=ui.ControlSize.SM, icon=ui.Icon.MUSIC, full_width=True)
+                                if row_clicked or name_clicked:
+                                    self.library_selection = index
+                                    try:
+                                        os_open_path(track["path"])
+                                    except OSError as exc:
+                                        self.error = safe_error(exc, self.state.get("settings", {}))
+                                with self._row_popover(ctx, track["name"], band_top=library_band) as menu:
                                     if menu:
                                         self.library_selection = index
                                         if ctx.menu_item("Play file", icon=ui.Icon.PLAY):
@@ -1553,16 +1516,6 @@ class Desktop:
                                         if ctx.menu_item("Copy file path", icon=ui.Icon.COPY):
                                             self._copy_to_clipboard(ctx, track["path"], "Path")
                                 library_band = self._row_band_bottom
-                                table.cell()
-                                name_clicked = ctx.button(
-                                    track["name"], variant=ui.ButtonVariant.GHOST,
-                                    size=ui.ControlSize.SM, icon=ui.Icon.MUSIC, full_width=True)
-                                if row_clicked or name_clicked:
-                                    self.library_selection = index
-                                    try:
-                                        os_open_path(track["path"])
-                                    except OSError as exc:
-                                        self.error = safe_error(exc, self.state.get("settings", {}))
                                 table.cell_text(format_bytes(track["size"]))
                                 table.cell_text(track["folder"])
                 ctx.text("Click a file to open it in your desktop audio player. Files stay on this computer.", size=11, color=ui.Color.TEXT_SECONDARY)
