@@ -401,6 +401,22 @@ def estimated_size(song: dict, audio_format: str, bitrate: str) -> int:
     return int(duration * kilobits * 125) if duration > 0 and kilobits > 0 else 0
 
 
+def _js_runtimes() -> dict | None:
+    """Locate a JS runtime for yt-dlp without downloading or installing one.
+
+    yt-dlp finds Deno on PATH by itself, so returning None is safe when nothing
+    explicit is configured; this only pins a runtime when one is actually found.
+    """
+    system = shutil.which("deno")
+    if system:
+        return {"deno": {"path": system}}
+    try:
+        from spotdl.utils.deno import get_local_deno_yt_dlp_options
+        return get_local_deno_yt_dlp_options().get("js_runtimes")
+    except Exception:
+        return None
+
+
 def _trace_search(provider, song, settings: dict | None) -> None:
     """Log the real YouTube Music search: query, candidates, and failures.
 
@@ -619,17 +635,17 @@ def download(song_data: dict, destination: Path, data_dir: Path, stop, progress,
     if stop.is_set():
         raise SpotifyCancelled()
 
-    from spotdl.utils.deno import get_local_deno_yt_dlp_options
-
     from .media import media_download
 
     task = {
         "url": matched["url"], "path": str(destination), "category": "audio",
         "source": "spotdl", "media_format": "bestaudio/best",
         "audio_ext": audio_format, "audio_bitrate": bitrate,
-        # Reuse a Deno binary the user already installed through spotDL. NDM does
-        # not download or execute an installer implicitly.
-        "js_runtimes": get_local_deno_yt_dlp_options().get("js_runtimes"),
+        # YouTube needs a JS runtime to decipher signatures. Prefer one already
+        # on PATH; spotDL's helper only looks in its own private directory, so a
+        # system Deno was ignored and the transfer failed where the media
+        # grabber (which lets yt-dlp find Deno itself) succeeded.
+        "js_runtimes": _js_runtimes(),
     }
 
     def transfer_progress(downloaded, total, phase, *, estimated=False):

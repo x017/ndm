@@ -133,6 +133,7 @@ def setup_logging(data_dir: Path, *, debug: bool | None = None, rotate: bool = T
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s"))
     handler.addFilter(_RedactingFilter())
+    handler.addFilter(_UpstreamScoringFilter())
     # The file always keeps upstream's matching detail (MATCH=5 and DEBUG).
     # NDM's own debug stays opt-in via the root level below.
     handler.setLevel(_MATCH_LEVEL)
@@ -153,7 +154,7 @@ def setup_logging(data_dir: Path, *, debug: bool | None = None, rotate: bool = T
     # Upstream chatter stays in the file; it must not spam the user's terminal.
     # Matching detail is always recorded, because a failed match is otherwise
     # indistinguishable from a failed transfer.
-    logging.getLogger("spotdl").setLevel(_MATCH_LEVEL)
+    _configure_spotdl_level()
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     _CONFIGURED = path
@@ -164,9 +165,31 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
+def _configure_spotdl_level() -> None:
+    # The scoring filter lives on the handler: a filter attached to the "spotdl"
+    # logger would not see records propagated up from spotdl.utils.matching.
+    logging.getLogger("spotdl").setLevel(_MATCH_LEVEL)
+
+
+class _UpstreamScoringFilter(logging.Filter):
+    """Drop spotDL's per-candidate score arithmetic unless NDM_DEBUG=1.
+
+    spotDL emits ~25 MATCH lines for every candidate it considers, so a playlist
+    produced tens of thousands of lines and pushed the actual transfer result out
+    of both `ndm logs` and the rotating file. NDM already logs the candidate list
+    and the winning score itself, so the arithmetic is only worth keeping when
+    the user explicitly asks for verbose output.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno != _MATCH_LEVEL or not record.name.startswith("spotdl"):
+            return True
+        return debug_enabled()
+
+
 def configure_upstream_logging() -> None:
     """Keep spotDL's matching detail available in the log instead of discarding it."""
-    logging.getLogger("spotdl").setLevel(_MATCH_LEVEL)
+    _configure_spotdl_level()
 
 
 class YtdlpLogger:
