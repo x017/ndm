@@ -40,6 +40,12 @@ log = get_logger("ndm.spotify")
 
 _INIT_LOCK = threading.RLock()
 _CLIENT_INITIALIZED = False
+# When the YouTube Music API is unreachable, every track would otherwise pay the
+# full 30s timeout before falling back. Remember the outage briefly so a playlist
+# routes straight to the working path instead of stalling once per track.
+_YTM_DOWN_LOCK = threading.Lock()
+_YTM_DOWN_UNTIL = 0.0
+_YTM_OUTAGE_SECONDS = 300.0
 
 
 def supported_url(value: str) -> bool:
@@ -401,6 +407,24 @@ def estimated_size(song: dict, audio_format: str, bitrate: str) -> int:
     return int(duration * kilobits * 125) if duration > 0 and kilobits > 0 else 0
 
 
+def _ytm_api_down() -> bool:
+    with _YTM_DOWN_LOCK:
+        return time.monotonic() < _YTM_DOWN_UNTIL
+
+
+def _mark_ytm_down() -> None:
+    global _YTM_DOWN_UNTIL
+    with _YTM_DOWN_LOCK:
+        _YTM_DOWN_UNTIL = time.monotonic() + _YTM_OUTAGE_SECONDS
+
+
+def _clear_ytm_down() -> None:
+    """A successful API match proves the outage is over; resume normal matching."""
+    global _YTM_DOWN_UNTIL
+    with _YTM_DOWN_LOCK:
+        _YTM_DOWN_UNTIL = 0.0
+
+
 def _network_failure(exc: BaseException) -> bool:
     """True when the failure is transport-level, so another route may still work."""
     seen: set[int] = set()
@@ -552,6 +576,15 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
 
     if (settings or {}).get("spotify_matcher") == "ytdlp":
         return _match_via_ytdlp(song, settings, stop)
+    if _ytm_api_down() and (settings or {}).get("spotify_matcher") != "ndm":
+        log.info("YouTube Music API marked unreachable; using yt-dlp search directly")
+        try:
+            return _match_via_ytdlp(song, settings, stop)
+        except Exception as exc:
+            log_failure(log, "yt-dlp search", exc, settings=settings, track=song.display_name)
+            raise ValueError(failure_message(
+                exc, settings=settings,
+                prefix=f"YouTube search failed for {song.display_name}")) from exc
 
     provider = YouTubeMusic()
     match_logger = YtdlpLogger("ndm.spotify.match", "[match]")
@@ -573,7 +606,9 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         if _network_failure(exc) and (settings or {}).get("spotify_matcher") != "ndm":
             # The Music API is unreachable, but yt-dlp reaches YouTube fine (the
             # media grabber works). Search through that stack instead of failing.
-            log.warning("YouTube Music API unreachable; falling back to yt-dlp search")
+            _mark_ytm_down()
+            log.warning("YouTube Music API unreachable; falling back to yt-dlp search "
+                        "(next tracks skip it for %.0fs)", _YTM_OUTAGE_SECONDS)
             try:
                 return _match_via_ytdlp(song, settings, stop)
             except Exception as fallback_exc:
@@ -593,6 +628,7 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
         log.error("No YouTube Music match for %r", song.display_name)
         raise LookupError(f"spotDL found no YouTube Music match for {song.display_name}. "
                           "Retry, or check the track title/artist. Full log: ndm logs")
+    _clear_ytm_down()
     log.info("Matched %r -> %s", song.display_name, matched_url)
     song.download_url = matched_url
     return {"url": matched_url, "song": song.json, "provider": "YouTube Music via spotDL"}
