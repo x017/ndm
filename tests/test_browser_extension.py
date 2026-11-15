@@ -324,3 +324,36 @@ def test_doctor_passes_with_a_working_host(daemon, tmp_path, monkeypatch):
     names = {c["name"]: c["ok"] for c in report["checks"]}
     assert names["ping ok"] and names["daemon running"]
     assert names["browser integration enabled"]
+
+
+def test_config_can_enable_the_handoff_without_the_gui(daemon, capsys):
+    """The doctor tells users to run this, so it must work and be listed."""
+    import ndm
+
+    directory = str(daemon.data_dir)
+    ndm.main(["config", "browser_integration", "true", "--data-dir", directory])
+    assert "browser_integration = True" in capsys.readouterr().out
+    assert request(daemon.data_dir, "state")["settings"]["browser_integration"] is True
+    ndm.main(["config", "--list", "--data-dir", directory])
+    listed = capsys.readouterr().out
+    assert "browser_integration" in listed
+    assert "browser_ask" in listed
+
+
+def test_doctor_names_the_toggle_when_only_it_is_off(daemon, tmp_path, monkeypatch, capsys):
+    """A correct install with the switch off must not say 're-run install'."""
+    import os
+
+    import ndm
+
+    monkeypatch.setattr(extension, "host_manifest_dir", lambda: tmp_path / "hosts")
+    extension.install(daemon.data_dir)
+    src_root = str(Path(ndm.__file__).resolve().parent.parent)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
+        filter(None, [src_root, os.environ.get("PYTHONPATH", "")])))
+    daemon.manager.update_settings(SettingsPatch(browser_integration=False))
+    ndm.main(["extension", "doctor", "--data-dir", str(daemon.data_dir)])
+    out = capsys.readouterr().out
+    assert "Everything is installed correctly" in out
+    assert "ndm config browser_integration true" in out
+    assert "re-run: uv run ndm extension install" not in out

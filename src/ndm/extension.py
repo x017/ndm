@@ -187,5 +187,6 @@ def doctor(data_dir: Path) -> dict:
             record("ping ok", bool(reply.get("ok")), json.dumps(reply) if reply else "no reply")
             if reply.get("ok"):
                 record("browser integration enabled", bool(reply.get("enabled")),
-                       "Options → Capture → Hand Firefox downloads to NDM")
+                       "Turn it on: uv run ndm config browser_integration true "
+                       "(or Options → Capture → Hand Firefox downloads to NDM)")
     return {"checks": checks, "reply": reply, "ok": all(c["ok"] for c in checks)}

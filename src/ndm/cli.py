@@ -160,7 +160,10 @@ def main(argv: list[str] | None = None) -> None:
                 print("  1. Open about:debugging#/runtime/this-firefox")
                 print("  2. Click 'Load Temporary Add-on…'")
                 print(f"  3. Pick {info['extension']}/manifest.json")
-                print("\nThen enable Options → Capture → 'Hand Firefox downloads to NDM'.")
+                print("\nTurn the handoff on (either one):")
+                print("  uv run ndm config browser_integration true")
+                print("  or Options → Capture → 'Hand Firefox downloads to NDM'")
+                print("\nCheck it with: uv run ndm extension doctor")
                 print("Temporary add-ons are removed when Firefox closes; reload it next session.")
             elif args.action == "uninstall":
                 info = ext.uninstall(data_dir)
@@ -172,10 +175,19 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"  [{mark}] {check['name']}")
                     if check["detail"] and not check["ok"]:
                         print(f"         {check['detail']}")
-                print("\nAll checks passed." if report["ok"] else
-                      "\nSomething failed above. Fix it, then re-run: uv run ndm extension install")
-                if not report["ok"]:
-                    print("After reinstalling, reload the add-on in about:debugging (remove, then Load Temporary Add-on).")
+                if report["ok"]:
+                    print("\nAll checks passed. Firefox downloads will now ask in the app.")
+                else:
+                    names = {c["name"] for c in report["checks"] if not c["ok"]}
+                    print()
+                    if names == {"browser integration enabled"}:
+                        # Everything is wired up; only the switch is off. Saying
+                        # "re-run install" here sent the user round in circles.
+                        print("Everything is installed correctly. Turn the handoff on:")
+                        print("  uv run ndm config browser_integration true")
+                    else:
+                        print("Something failed above. Fix it, then re-run: uv run ndm extension install")
+                        print("Then reload the add-on in about:debugging (remove, then Load Temporary Add-on).")
             else:
                 info = ext.status(data_dir)
                 print(f"Registered:        {'yes' if info['installed'] else 'no'}")
@@ -274,7 +286,8 @@ def main(argv: list[str] | None = None) -> None:
             if args.list or not args.key:
                 state = request(data_dir, "state", timeout=10)
                 current = state.get("settings", {})
-                keys = [k for k in fields if k.startswith(("proxy_", "spotify_", "firefox_"))]
+                keys = [k for k in fields
+                        if k.startswith(("proxy_", "spotify_", "firefox_", "browser_"))]
                 for key in keys:
                     value = current.get(key)
                     if key == "proxy_password" and value:

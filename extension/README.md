@@ -43,10 +43,23 @@ the browser never sees the IPC key.
    Temporary add-ons are removed when Firefox closes; load it again next
    session. For a permanent install the extension must be signed by Mozilla.
 
-3. In NDM: **Options → Capture → Hand Firefox downloads to NDM**.
-   Leave **Ask me in the app before each browser download** checked.
+3. Turn the handoff on — either from the shell:
 
-4. Start NDM (`uv run ndm`). The extension popup should say it is running.
+   ```sh
+   uv run ndm config browser_integration true
+   ```
+
+   or in NDM: **Options → Capture → Hand Firefox downloads to NDM**.
+   Leave **Ask me in the app before each browser download** checked
+   (`browser_ask`, also settable via `ndm config`).
+
+4. Start NDM (`uv run ndm`) and confirm:
+
+   ```sh
+   uv run ndm extension doctor
+   ```
+
+   Every line should read `[OK]`. The extension popup should say NDM is running.
 
 ## Controls
 
@@ -73,7 +86,7 @@ dismissed the dialog.
 | Symptom | Check |
 | --- | --- |
 | Popup says "not reachable" | Run `uv run ndm extension doctor` — it launches the host exactly as Firefox does and prints the real error. Then re-install and **reload the add-on**. |
-| "integration is off" | Options → Capture → Hand Firefox downloads to NDM. |
+| "integration is off" | `uv run ndm config browser_integration true` |
 | Nothing is offered | Popup filters: enabled, size threshold, file type. |
 | Host path warning | `uv run ndm extension status` — re-run install if it differs. |
 
