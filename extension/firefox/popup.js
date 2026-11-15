@@ -55,7 +55,16 @@ async function status() {
       : "NDM is running, but browser integration is off. Enable it in Options → Capture.";
   } else {
     statusEl.className = "status bad";
-    statusEl.textContent = "NDM is not reachable. Start it, then run: uv run ndm extension install";
+    const detail = reply && reply.error ? String(reply.error) : "";
+    statusEl.textContent = "NDM is not reachable. Start it, then run: uv run ndm extension doctor";
+    if (detail) {
+      // The real cause (missing host, import error, stopped daemon) beats a
+      // generic hint; show it verbatim so it can be reported.
+      const pre = document.createElement("div");
+      pre.style.cssText = "margin-top:6px;font-size:11px;word-break:break-word;opacity:.85";
+      pre.textContent = detail;
+      statusEl.append(pre);
+    }
   }
 }
 

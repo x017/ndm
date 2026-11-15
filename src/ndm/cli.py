@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("id")
     extension = sub.add_parser("extension", help="Register the Firefox download-handoff extension host")
     common(extension)
-    extension.add_argument("action", choices=["install", "uninstall", "status"])
+    extension.add_argument("action", choices=["install", "uninstall", "status", "doctor"])
     service = sub.add_parser("service", help="Install/remove a Linux or macOS sign-in service")
     common(service)
     service.add_argument("action", choices=["install", "uninstall"])
@@ -165,6 +165,17 @@ def main(argv: list[str] | None = None) -> None:
             elif args.action == "uninstall":
                 info = ext.uninstall(data_dir)
                 print("Removed the native host." if info["removed"] else "No native host was registered.")
+            elif args.action == "doctor":
+                report = ext.doctor(data_dir)
+                for check in report["checks"]:
+                    mark = "OK  " if check["ok"] else "FAIL"
+                    print(f"  [{mark}] {check['name']}")
+                    if check["detail"] and not check["ok"]:
+                        print(f"         {check['detail']}")
+                print("\nAll checks passed." if report["ok"] else
+                      "\nSomething failed above. Fix it, then re-run: uv run ndm extension install")
+                if not report["ok"]:
+                    print("After reinstalling, reload the add-on in about:debugging (remove, then Load Temporary Add-on).")
             else:
                 info = ext.status(data_dir)
                 print(f"Registered:        {'yes' if info['installed'] else 'no'}")

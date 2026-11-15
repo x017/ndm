@@ -72,9 +72,23 @@ dismissed the dialog.
 
 | Symptom | Check |
 | --- | --- |
-| Popup says "not reachable" | Is NDM running? Re-run `uv run ndm extension install`. |
+| Popup says "not reachable" | Run `uv run ndm extension doctor` — it launches the host exactly as Firefox does and prints the real error. Then re-install and **reload the add-on**. |
 | "integration is off" | Options → Capture → Hand Firefox downloads to NDM. |
 | Nothing is offered | Popup filters: enabled, size threshold, file type. |
 | Host path warning | `uv run ndm extension status` — re-run install if it differs. |
+
+### Diagnosing
+
+```sh
+uv run ndm extension doctor
+```
+
+This checks the manifest, the launcher's permissions, the running daemon, then
+spawns the launcher with Firefox's arguments and reports the ping reply and any
+stderr. An import error there means the launcher points at the wrong
+interpreter — re-run `install` from the same environment you use for `uv run ndm`.
+
+After re-installing, **remove and reload the temporary add-on** in
+`about:debugging`; Firefox keeps the old connection otherwise.
 
 Uninstall the host with `uv run ndm extension uninstall`.

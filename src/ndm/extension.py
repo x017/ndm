@@ -38,7 +38,11 @@ def write_launcher(data_dir: Path) -> Path:
     """Pin the current interpreter so the host works without a system install."""
     data_dir.mkdir(parents=True, exist_ok=True)
     path = launcher_path(data_dir)
-    python = Path(sys.executable).resolve()
+    # Never resolve() this: a venv's bin/python is a symlink to the base
+    # interpreter, and dereferencing it drops the venv's site-packages, so the
+    # host dies with ModuleNotFoundError and Firefox reports "not reachable".
+    # abspath makes it absolute without following symlinks.
+    python = os.path.abspath(sys.executable)
     target = str(data_dir.expanduser().resolve())
     if os.name == "nt":
         path.write_text(
@@ -111,3 +115,77 @@ def status(data_dir: Path) -> dict:
         result["path_matches"] = recorded.get("path") == str(launcher)
         result["allowed_extensions"] = recorded.get("allowed_extensions", [])
     return result
+
+
+def doctor(data_dir: Path) -> dict:
+    """Run the launcher the way Firefox does and report what actually happens.
+
+    The popup can only say "not reachable"; this reproduces the invocation
+    locally so an import error, a bad path, or a stopped daemon is visible.
+    """
+    import subprocess
+
+    from .browser_host import read_message, write_message
+    from .ipc import request
+
+    checks: list[dict] = []
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    manifest_path = host_manifest_dir() / MANIFEST_NAME
+    record("host manifest", manifest_path.is_file(), str(manifest_path))
+    registered = ""
+    if manifest_path.is_file():
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            data = {}
+            record("manifest readable", False, str(exc))
+        registered = data.get("path", "")
+        allowed = data.get("allowed_extensions") or []
+        record("extension id allowed", EXTENSION_ID in allowed, ", ".join(allowed))
+    launcher = Path(registered or launcher_path(data_dir))
+    record("launcher exists", launcher.is_file(), str(launcher))
+    if launcher.is_file() and os.name != "nt":
+        record("launcher executable", os.access(launcher, os.X_OK), oct(launcher.stat().st_mode & 0o777))
+    folder = extension_dir()
+    record("extension files", (folder / "manifest.json").is_file(), str(folder))
+    try:
+        request(data_dir, "health", timeout=5)
+        record("daemon running", True, str(data_dir))
+    except (OSError, ValueError, RuntimeError, TimeoutError, EOFError) as exc:
+        record("daemon running", False, str(exc))
+
+    reply: dict = {}
+    if launcher.is_file():
+        # Firefox appends the manifest path and the extension origin to argv.
+        argv = [str(launcher), str(manifest_path), f"chrome-extension://{EXTENSION_ID}/"]
+        try:
+            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
+        except OSError as exc:
+            record("launcher starts", False, str(exc))
+        else:
+            record("launcher starts", True)
+            try:
+                write_message({"type": "ping"}, process.stdin)
+                reply = read_message(process.stdout) or {}
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                record("ping reply", False, str(exc))
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            stderr = process.stderr.read().decode("utf-8", "replace").strip()
+            record("host stderr clean", not stderr, stderr[-600:])
+            record("ping ok", bool(reply.get("ok")), json.dumps(reply) if reply else "no reply")
+            if reply.get("ok"):
+                record("browser integration enabled", bool(reply.get("enabled")),
+                       "Options → Capture → Hand Firefox downloads to NDM")
+    return {"checks": checks, "reply": reply, "ok": all(c["ok"] for c in checks)}

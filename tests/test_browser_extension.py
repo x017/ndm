@@ -258,3 +258,69 @@ def test_launcher_pins_the_data_dir(tmp_path):
     body = launcher.read_text(encoding="utf-8")
     assert "--data-dir" in body
     assert str((tmp_path / "custom-state").resolve()) in body
+
+
+def test_launcher_keeps_the_venv_interpreter_not_its_target(tmp_path, monkeypatch):
+    """A venv's bin/python is a symlink; resolving it loses site-packages.
+
+    Regression: resolve() turned .venv/bin/python into /usr/bin/python3, which
+    cannot import ndm, so the host died and Firefox said "not reachable".
+    """
+    import sys
+
+    real = tmp_path / "base-python"
+    real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    real.chmod(0o755)
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    link = venv_bin / "python"
+    link.symlink_to(real)
+    assert link.resolve() == real.resolve()
+    monkeypatch.setattr(sys, "executable", str(link))
+    launcher = extension.write_launcher(tmp_path / "state")
+    body = launcher.read_text(encoding="utf-8")
+    assert str(link) in body
+    assert str(real) not in body
+
+
+def test_doctor_reports_a_missing_host(tmp_path, monkeypatch):
+    monkeypatch.setattr(extension, "host_manifest_dir", lambda: tmp_path / "hosts")
+    report = extension.doctor(tmp_path / "state")
+    assert report["ok"] is False
+    names = {c["name"]: c["ok"] for c in report["checks"]}
+    assert names["host manifest"] is False
+    assert names["launcher exists"] is False
+
+
+def test_doctor_runs_the_launcher_and_surfaces_stderr(tmp_path, monkeypatch):
+    """A launcher that cannot import ndm must be reported, not silently pass."""
+    monkeypatch.setattr(extension, "host_manifest_dir", lambda: tmp_path / "hosts")
+    info = extension.install(tmp_path / "state")
+    broken = Path(info["launcher"])
+    broken.write_text("#!/bin/sh\necho 'ModuleNotFoundError: No module named ndm' >&2\nexit 1\n",
+                      encoding="utf-8")
+    broken.chmod(0o755)
+    report = extension.doctor(tmp_path / "state")
+    assert report["ok"] is False
+    failed = {c["name"]: c["detail"] for c in report["checks"] if not c["ok"]}
+    assert "host stderr clean" in failed
+    assert "ModuleNotFoundError" in failed["host stderr clean"]
+    assert "ping ok" in failed
+
+
+def test_doctor_passes_with_a_working_host(daemon, tmp_path, monkeypatch):
+    import os
+
+    import ndm
+
+    monkeypatch.setattr(extension, "host_manifest_dir", lambda: tmp_path / "hosts")
+    extension.install(daemon.data_dir)
+    # The spawned host needs the same import path the tests use.
+    src_root = str(Path(ndm.__file__).resolve().parent.parent)
+    existing = os.environ.get("PYTHONPATH", "")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src_root, existing])))
+    report = extension.doctor(daemon.data_dir)
+    assert report["reply"].get("ok") is True
+    names = {c["name"]: c["ok"] for c in report["checks"]}
+    assert names["ping ok"] and names["daemon running"]
+    assert names["browser integration enabled"]
