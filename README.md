@@ -24,7 +24,10 @@ The background daemon communicates over an authenticated Unix domain socket
   table, then queued individually. Audio is matched to YouTube Music and
   converted/tagged by spotDL. Formats: MP3, M4A, FLAC, Opus, Ogg.
 - **yt-dlp media grabber:** media-page and direct-media inspection,
-  format selection, and background extraction.
+  format selection, background extraction, and one-click **MP3 conversion**
+  (192 kbps audio extraction via FFmpeg). Every inspected item shows its file
+  size — exact when the source reports it, `~` when estimated, and the real
+  byte count replaces the estimate once the download finishes.
 - **Optional Firefox cookies:** a boolean Capture option automatically reads
   local Firefox cookies for authenticated downloads, media inspection, and
   spotDL audio matching. Off by default; no extension or cookie file is needed.
@@ -74,7 +77,9 @@ python -m pip install -e .
 ndm
 ```
 
-Install **FFmpeg** on your PATH for spotDL conversion/tagging and yt-dlp merging.
+Install **FFmpeg** on your PATH for spotDL conversion/tagging, yt-dlp merging,
+and Media Grabber MP3 conversion. Without FFmpeg the MP3 checkbox is disabled
+and the daemon rejects audio-extraction requests with an actionable error.
 Nexa bundles its native UI runtime in the `nexa-ui` package. Linux desktops also
 need working OpenGL/display libraries.
 
@@ -171,6 +176,29 @@ If no readable Firefox profile is available, NDM shows an actionable error;
 install/sign in to Firefox or disable the option. For spotDL, the cookies apply
 to the YouTube Music matching/download clients; Spotify metadata still uses
 spotDL's normal anonymous or official API credentials, not browser cookies.
+
+## Using the Media Grabber
+
+1. Click **Grabber** on the toolbar (or paste a media URL with Ctrl+V and open
+   the grabber).
+2. Enter a page URL, a direct media link, or a yt-dlp-supported site URL and
+   click **Find Media**.
+3. Each result row shows the format quality, file size, and a note. Sizes are
+   exact when the source reports a byte count, prefixed with `~` when estimated
+   (extractor approximation, duration × bitrate, or a 192 kbps MP3 projection),
+   and shown as **Unknown** when the server provides no length. HEAD and
+   one-byte ranged GET probes fill in sizes for direct and page-scanned links
+   without downloading the body.
+4. Optionally check **Convert to MP3** to extract audio at 192 kbps instead of
+   saving the original video. This requires FFmpeg on PATH; the checkbox is
+   disabled and the daemon refuses the request when FFmpeg is missing. MP3 and
+   video downloads of the same URL are queued as separate tasks.
+5. Click **Download** (or **Download MP3**) to queue the item. The background
+   daemon handles extraction/conversion; the Size column and Properties dialog
+   show the estimate until the real file size is known at completion.
+
+Protected streams and DRM are never bypassed. Spotify links are redirected to
+the spotDL dialog instead.
 
 ## Using spotDL
 

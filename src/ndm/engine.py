@@ -95,7 +95,7 @@ class DownloadManager:
 
     def add(self, *, url: str, filename: str | None = None, category: str | None = None,
             connections: int | None = None, start_paused: bool = False,
-            source: str = "manual") -> dict:
+            source: str = "manual", dedupe: bool = True) -> dict:
         from .media import spotify_link
         if spotify_link(url):
             raise ValueError("Use the Spotify toolbar button or ndm spotify command for Spotify links.")
@@ -104,9 +104,10 @@ class DownloadManager:
         name = safe_filename(filename or Path(unquote(parsed.path)).name or "download")
         kind = category or category_for(name)
         with self.lock:
-            for task in self.tasks.values():
-                if task["url"] == url and task["status"] not in {"error", "completed"}:
-                    return dict(task)
+            if dedupe:
+                for task in self.tasks.values():
+                    if task["url"] == url and task["status"] not in {"error", "completed"}:
+                        return dict(task)
             directory = self.root / kind
             path = self._unique(directory, name)
             task_id = uuid.uuid4().hex[:12]
@@ -115,7 +116,7 @@ class DownloadManager:
                 "status": "paused" if start_paused else "queued", "size": 0,
                 "downloaded": 0, "speed": 0, "connections": connections or self.settings.connections,
                 "segments": [], "resumable": False, "etag": "", "last_modified": "",
-                "mime": "", "error": "", "source": source,
+                "mime": "", "error": "", "source": source, "size_estimated": False,
                 "created_at": time.time(), "completed_at": None,
                 "path": str(path), "part_path": str(path) + ".part",
                 "host": parsed.hostname or "", "final_url": "", "explicit_name": bool(filename),
@@ -127,13 +128,32 @@ class DownloadManager:
             return dict(task)
 
     def add_media(self, *, url: str, format_id: str, name: str, category: str,
-                  quality: str = "best", ext: str = "mp4") -> dict:
-        from .media import media_download, spotify_link, uses_ytdlp  # noqa: F401
+                  quality: str = "best", ext: str = "mp4", size: int = 0,
+                  size_estimated: bool = False) -> dict:
+        from .media import spotify_link, uses_ytdlp
         url = self.validate_target(url)
         if spotify_link(url):
             raise ValueError("Use the Spotify toolbar button or ndm spotify command to queue this link through spotDL.")
-        if not uses_ytdlp(url):
-            return self.add(url=url, filename=name, category=category, source="media")
+        convert_mp3 = quality == "audio"
+        if convert_mp3:
+            if not shutil.which("ffmpeg"):
+                raise ValueError("MP3 conversion needs FFmpeg on PATH. Install FFmpeg, then retry.")
+            category, ext, format_id = "audio", "mp3", "best"
+        if not uses_ytdlp(url) and not convert_mp3:
+            with self.lock:
+                # A direct media download must not dedupe onto an MP3 conversion
+                # of the same URL (source="ytdlp"); those are separate outputs.
+                existing = next((t for t in self.tasks.values() if t["url"] == url
+                                 and t.get("source") != "ytdlp"
+                                 and t["status"] not in {"error", "completed"}), None)
+                if existing:
+                    return dict(existing)
+                task = self.add(url=url, filename=name, category=category, source="media", dedupe=False)
+                current = self.tasks[task["id"]]
+                if size > 0:
+                    current.update(size=size, size_estimated=size_estimated)
+                self.store.save_downloads([task["id"]], self.tasks)
+                return dict(current)
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", format_id):
             raise ValueError("Invalid media format. Inspect the link again.")
         if category not in {"video", "audio"}:
@@ -142,16 +162,22 @@ class DownloadManager:
         name = safe_filename(name, "media") + "." + ext
         with self.lock:
             existing = next((t for t in self.tasks.values() if t["url"] == url
-                             and t.get("format_id") == format_id and t["status"] != "error"), None)
+                             and t.get("format_id") == format_id
+                             and t.get("media_quality", "best") == quality
+                             and t["status"] != "error"), None)
             if existing:
                 return dict(existing)
-            task = self.add(url=url, filename=name, category=category, source="ytdlp")
-            task = self.tasks[task["id"]]
-            task["format_id"] = format_id
-            task["media_quality"] = quality
-            task["media_format"] = (f"{format_id}+bestaudio/best" if category == "video" else format_id) if format_id != "best" else None
+            task = self.add(url=url, filename=name, category=category, source="ytdlp", dedupe=False)
+            current = self.tasks[task["id"]]
+            current["format_id"] = format_id
+            current["media_quality"] = quality
+            current["media_format"] = (f"{format_id}+bestaudio/best" if category == "video" else format_id) if format_id != "best" else None
+            if convert_mp3:
+                current["audio_ext"] = "mp3"
+            if size > 0:
+                current.update(size=size, size_estimated=size_estimated)
             self.store.save_downloads([task["id"]], self.tasks)
-            return dict(task)
+            return dict(current)
 
     def add_spotify(self, song: dict, *, start_paused: bool = False) -> dict:
         """Queue a spotDL metadata match. This never accesses Spotify protected audio."""
@@ -172,7 +198,7 @@ class DownloadManager:
                 "status": "paused" if start_paused else "queued", "size": 0,
                 "downloaded": 0, "speed": 0, "connections": 1, "segments": [],
                 "resumable": False, "etag": "", "last_modified": "", "mime": "audio/mpeg",
-                "error": "", "source": "spotdl",
+                "error": "", "source": "spotdl", "size_estimated": False,
                 "created_at": time.time(), "completed_at": None,
                 "path": str(path), "part_path": str(path) + ".part",
                 "host": "open.spotify.com", "final_url": "", "explicit_name": True,
@@ -400,8 +426,8 @@ class DownloadManager:
                         task["name"] = destination.name
                     os.replace(task["part_path"], destination)
                     Path(task["path"] + ".ndm.json").unlink(missing_ok=True)
-                    task.update(status="completed", size=size, downloaded=size, speed=0,
-                                completed_at=time.time(), error="")
+                    task.update(status="completed", size=size, size_estimated=False,
+                                downloaded=size, speed=0, completed_at=time.time(), error="")
                     self.store.event("Download complete", task["name"], "success")
                 self._mark(task_id)
         except Exception as exc:
@@ -486,7 +512,7 @@ class DownloadManager:
                 snapshot = dict(task)
                 settings = self.settings.model_dump()
 
-            def progress(downloaded, total, phase):
+            def progress(downloaded, total, phase, *, estimated=False):
                 with self.lock:
                     current = self.tasks.get(task_id)
                     if not current:
@@ -496,6 +522,7 @@ class DownloadManager:
                         current["downloaded"] = downloaded
                     if total is not None:
                         current["size"] = total
+                        current["size_estimated"] = bool(estimated)
                     current["phase"] = phase
                     self._mark(task_id)
 
@@ -509,7 +536,8 @@ class DownloadManager:
                     return
                 size = path.stat().st_size
                 task.update(path=str(path), name=path.name, status="completed", size=size,
-                            downloaded=size, speed=0, completed_at=time.time(), phase="complete", error="")
+                            size_estimated=False, downloaded=size, speed=0,
+                            completed_at=time.time(), phase="complete", error="")
                 self._mark(task_id)
                 self.store.event("Media download complete", task["name"], "success")
         except Exception as exc:
@@ -576,8 +604,8 @@ class DownloadManager:
                     task.update(name=name, path=str(path), part_path=str(path) + ".part",
                                 category=task["category"] if task.get("explicit_category") else category_for(name, mime))
                     part = Path(task["part_path"])
-            task.update(size=total, resumable=resumable, etag=etag, last_modified=modified,
-                        mime=mime, final_url=final_url)
+            task.update(size=total, size_estimated=False, resumable=resumable, etag=etag,
+                        last_modified=modified, mime=mime, final_url=final_url)
             if not task["segments"]:
                 count = min(connections, max(1, math.ceil(total / (1024 * 1024)))) if resumable and total else 1
                 step = math.ceil(total / count) if total else 0

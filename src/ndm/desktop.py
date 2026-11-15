@@ -38,6 +38,28 @@ def format_bytes(value: float) -> str:
     return "0 B"
 
 
+def format_size(size: float, *, estimated: bool = False) -> str:
+    if not size:
+        return "Unknown"
+    return ("~" if estimated else "") + format_bytes(size)
+
+
+def mp3_size_estimate(item: dict) -> int:
+    """192 kbps MP3 ≈ 24,000 bytes per second of audio."""
+    try:
+        duration = float(item.get("duration") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return int(duration * 24_000) if duration > 0 else 0
+
+
+def media_size_label(item: dict, *, convert_mp3: bool = False) -> str:
+    if convert_mp3:
+        estimate = mp3_size_estimate(item)
+        return "MP3 " + format_size(estimate, estimated=True) if estimate else "MP3 size unknown"
+    return format_size(item.get("size") or 0, estimated=bool(item.get("size_estimated")))
+
+
 def percent(task: dict) -> float:
     if task["status"] == "completed":
         return 100.0
@@ -114,6 +136,7 @@ class Desktop:
         self.add_category = 0
         self.media_url = ""
         self.media_result = None
+        self.media_convert_mp3 = False
         self.spotify_url = ""
         self.spotify_result = None
         self.spotify_selected: set[str] = set()
@@ -626,7 +649,7 @@ class Desktop:
                         table.cell()
                         ctx.icon(CATEGORY_ICONS.get(task["category"], ui.Icon.FILE), size=15, color=ui.Color.ACCENT)
                         ctx.text(task["name"], size=12, nowrap=True)
-                        table.cell_text(format_bytes(task["size"]) if task["size"] else "—")
+                        table.cell_text(format_size(task["size"], estimated=bool(task.get("size_estimated"))))
                         table.cell_text(status_text(task))
                         table.cell()
                         ctx.progress(percent(task) / 100, width=ui.FILL, height=12,
@@ -715,7 +738,7 @@ class Desktop:
         elif self.dialog == "spotify":
             self._spotify_dialog(ctx, state)
         elif self.dialog == "media":
-            self._media_dialog(ctx)
+            self._media_dialog(ctx, state)
         elif self.dialog == "options":
             self._options_dialog(ctx, state)
         elif self.dialog == "details":
@@ -821,7 +844,10 @@ class Desktop:
             if not dialog.open:
                 self.dialog = ""
 
-    def _media_dialog(self, ctx: ui.UI) -> None:
+    def _media_dialog(self, ctx: ui.UI, state: dict) -> None:
+        ffmpeg_ready = bool(state.get("daemon", {}).get("ffmpeg"))
+        if not ffmpeg_ready:
+            self.media_convert_mp3 = False
         with ctx.dialog("Media Grabber", True, width=740) as dialog:
             if dialog:
                 self.media_url = ctx.input("media_address", self.media_url, label="Page or media URL",
@@ -830,6 +856,14 @@ class Desktop:
                 if ctx.button("Inspecting…" if self.busy == "media" else "Find Media", icon=ui.Icon.SEARCH,
                               variant=ui.ButtonVariant.PRIMARY, disabled=bool(self.busy)):
                     self.inspect_media()
+                self.media_convert_mp3 = ctx.checkbox("Convert to MP3 (extract audio, 192 kbps)",
+                                                      self.media_convert_mp3, disabled=not ffmpeg_ready)
+                if not ffmpeg_ready:
+                    ctx.text("Install FFmpeg on PATH to enable MP3 conversion and video/audio merging.",
+                             width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                elif self.media_convert_mp3:
+                    ctx.text("Each Download button saves an MP3 audio file instead of the original video.",
+                             width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
                 self._error_in_dialog(ctx)
                 if self.media_result is None:
                     ctx.text("Direct media, HTML media elements, and sites supported by yt-dlp. Protected streams are not bypassed.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
@@ -838,18 +872,25 @@ class Desktop:
                     ctx.text(result.get("title", "Media"), size=13, font=ui.FontRole.MEDIUM)
                     if result.get("message"):
                         ctx.text(result["message"], width=ui.FILL, size=11)
+                    if result["items"]:
+                        ctx.text("Sizes: exact when reported by the source, ~ when estimated, Unknown when unavailable. Estimates are replaced by the real file size on completion.",
+                                 width=ui.FILL, size=10, color=ui.Color.TEXT_SECONDARY)
                     with ctx.scroll("media_results", height=260, width=ui.FILL, gap=5):
                         for item in result["items"]:
                             with ctx.id_scope(item["id"]), ctx.row(width=ui.FILL, gap=8, align=ui.Align.CENTER):
                                 with ctx.column(width=ui.GROW(1), gap=2):
-                                    ctx.text(item["name"] + "." + item["ext"], size=12, nowrap=True)
-                                    ctx.text(item["quality"] + " · " + item["note"], size=10, color=ui.Color.TEXT_SECONDARY)
-                                if ctx.button("Download", size=ui.ControlSize.SM):
+                                    ctx.text(item["name"] + (".mp3" if self.media_convert_mp3 else "." + item["ext"]), size=12, nowrap=True)
+                                    ctx.text(item["quality"] + " · " + media_size_label(item, convert_mp3=self.media_convert_mp3) + " · " + item["note"], size=10, color=ui.Color.TEXT_SECONDARY)
+                                if ctx.button("Download MP3" if self.media_convert_mp3 else "Download", size=ui.ControlSize.SM):
+                                    mp3_size = mp3_size_estimate(item)
                                     self.perform("media.download", {"url": item.get("page_url") or item["url"],
                                                  "format_id": item["id"], "name": item["name"], "category": item["category"],
-                                                 "ext": item["ext"]})
+                                                 "quality": "audio" if self.media_convert_mp3 else "best",
+                                                 "ext": "mp3" if self.media_convert_mp3 else item["ext"],
+                                                 "size": mp3_size if self.media_convert_mp3 else item.get("size") or 0,
+                                                 "size_estimated": True if self.media_convert_mp3 else bool(item.get("size_estimated"))})
                                     if not self.error:
-                                        self.notice = "Media added to the download list."
+                                        self.notice = "MP3 conversion queued." if self.media_convert_mp3 else "Media added to the download list."
                                         self.dialog = ""
                 with ctx.dialog_footer():
                     if ctx.button("Close"):
@@ -996,7 +1037,8 @@ class Desktop:
         with ctx.dialog("Download Properties", bool(task), width=650) as dialog:
             if dialog and task:
                 for label, value in [("File name", task["name"]), ("Address", task["url"]), ("Saved to", task["path"]),
-                                     ("Status", status_text(task)), ("Size", format_bytes(task["size"])),
+                                     ("Status", status_text(task)),
+                                     ("Size", format_size(task["size"], estimated=bool(task.get("size_estimated")))),
                                      ("Downloaded", format_bytes(task["downloaded"])), ("Source", task.get("provider") or task["host"]),
                                      ("Connections", str(len(task["segments"]) or task["connections"])),
                                      ("Range resume", "Supported" if task["resumable"] else "Not used for this transfer")]:

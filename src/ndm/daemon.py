@@ -55,8 +55,10 @@ class MediaDownload(BaseModel):
     format_id: str = Field(default="best", max_length=40)
     name: str = Field(default="media", max_length=180)
     category: str = "video"
-    quality: str = "best"
+    quality: str = Field(default="best", pattern="^(best|1080|720|audio)$")
     ext: str = Field(default="mp4", max_length=8)
+    size: int = Field(default=0, ge=0)
+    size_estimated: bool = False
 
 
 class TaskAction(BaseModel):

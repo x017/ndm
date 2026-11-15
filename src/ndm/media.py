@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -65,6 +66,42 @@ class LinkParser(HTMLParser):
             self.title += data
 
 
+def _size_fields(size: int | float | None, *, estimated: bool = False) -> dict:
+    try:
+        value = max(0, int(size or 0))
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    return {"size": value, "size_estimated": bool(value and estimated)}
+
+
+def _probe_size(client: httpx.Client, url: str) -> dict:
+    """Read a media length without downloading the body.
+
+    HEAD is tried first; a one-byte ranged GET covers servers that reject HEAD
+    or omit Content-Length. Accept-Encoding: identity keeps the reported length
+    equal to the stored file size rather than a compressed transfer size.
+    """
+    try:
+        response = client.head(url, headers={"Accept-Encoding": "identity"}, timeout=5)
+        if response.status_code < 400:
+            length = response.headers.get("content-length")
+            if length and length.isdigit() and int(length) > 0:
+                return _size_fields(int(length))
+    except (httpx.HTTPError, ValueError):
+        pass
+    try:
+        with client.stream("GET", url, headers={"Range": "bytes=0-0", "Accept-Encoding": "identity"}, timeout=5) as response:
+            total = re.search(r"bytes \d+-\d+/(\d+)", response.headers.get("content-range", ""))
+            if total:
+                return _size_fields(int(total.group(1)))
+            length = response.headers.get("content-length")
+            if response.status_code == 200 and length and length.isdigit():
+                return _size_fields(int(length))
+    except (httpx.HTTPError, ValueError):
+        pass
+    return _size_fields(0)
+
+
 def inspect_media(url: str, *, allow_private: bool = False, settings: dict | None = None) -> dict:
     settings = settings or {}
     resolve = not (settings.get("proxy_enabled") and settings.get("proxy_remote_dns", True))
@@ -102,10 +139,15 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
             if key in seen:
                 continue
             seen.add(key)
+            exact = fmt.get("filesize")
+            approx = fmt.get("filesize_approx")
+            if not exact and not approx and info.get("duration") and fmt.get("tbr"):
+                approx = float(info["duration"]) * float(fmt["tbr"]) * 125
             items.append({
                 "id": str(fid), "url": url, "page_url": url,
                 "name": safe_filename(info.get("title") or "Media"),
-                "ext": fmt.get("ext") or "mp4", "size": fmt.get("filesize") or fmt.get("filesize_approx") or 0,
+                "ext": fmt.get("ext") or "mp4", **_size_fields(exact or approx, estimated=not exact),
+                "duration": float(info.get("duration") or 0),
                 "quality": f"{height}p" if height else (f"{round(fmt.get('abr') or 0)} kbps" if has_audio else "Audio"),
                 "category": "video" if has_video else "audio",
                 "note": "Video + audio" if has_video and has_audio else ("Merges audio · FFmpeg required" if has_video else "Audio only"),
@@ -114,14 +156,22 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
         items.sort(key=lambda i: (i["category"] == "video", i["size"]), reverse=True)
         if not items:
             items = [{"id": "best", "url": url, "page_url": url, "name": safe_filename(info.get("title") or "Media"),
-                      "ext": info.get("ext") or "mp4", "size": info.get("filesize") or 0,
+                      "ext": info.get("ext") or "mp4",
+                      **_size_fields(info.get("filesize") or info.get("filesize_approx"),
+                                     estimated=not info.get("filesize")),
+                      "duration": float(info.get("duration") or 0),
                       "quality": "Best available", "category": "video", "note": "Automatic format", "needs_ffmpeg": False}]
-        return {"kind": "ytdlp", "title": info.get("title") or "Media", "items": items[:12], "message": ""}
+        return {"kind": "ytdlp", "title": info.get("title") or "Media", "items": items[:12],
+                "duration": float(info.get("duration") or 0), "message": ""}
     suffix = Path(urlsplit(url).path).suffix.lower()
     if suffix in MEDIA_EXTENSIONS:
+        with httpx.Client(follow_redirects=True, timeout=15, headers={"User-Agent": "NDM/0.1"},
+                          cookies=firefox_cookie_jar(settings), **httpx_options(settings),
+                          event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private, resolve=resolve)]}) as client:
+            size = _probe_size(client, url)
         return {"kind": "direct", "title": safe_filename(urlsplit(url).path).rsplit(".", 1)[0],
                 "items": [{"id": "original", "url": url, "name": urlsplit(url).path.rsplit("/", 1)[-1],
-                           "ext": suffix[1:], "size": 0, "quality": "Original", "category": category_for(url),
+                           "ext": suffix[1:], **size, "quality": "Original", "category": category_for(url),
                            "note": "Direct media link", "needs_ffmpeg": False}], "message": ""}
     parser = LinkParser()
     size = 0
@@ -135,7 +185,8 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
                 if mime.startswith(("audio/", "video/")):
                     return {"kind": "direct", "title": "Direct media", "items": [
                         {"id": "original", "url": str(response.url), "name": response.url.path.rsplit("/", 1)[-1] or "media",
-                         "ext": "mp4" if mime.startswith("video/") else "mp3", "size": int(response.headers.get("content-length", "0")),
+                         "ext": "mp4" if mime.startswith("video/") else "mp3",
+                         **_size_fields(response.headers.get("content-length")),
                          "quality": "Original", "category": category_for("", mime), "note": mime, "needs_ffmpeg": False}], "message": ""}
                 if "html" not in mime:
                     raise ValueError("No HTML page or playable media was found at this URL.")
@@ -162,10 +213,19 @@ def inspect_media(url: str, *, allow_private: bool = False, settings: dict | Non
         seen.add(absolute)
         name = title or Path(urlsplit(absolute).path).name
         items.append({"id": str(len(items)), "url": absolute, "name": name,
-                      "ext": Path(urlsplit(absolute).path).suffix[1:], "size": 0,
+                      "ext": Path(urlsplit(absolute).path).suffix[1:], **_size_fields(0),
                       "quality": "Original", "category": category_for(absolute),
                       "note": "Found on page", "needs_ffmpeg": False})
-    return {"kind": "html", "title": parser.title.strip() or "Page media", "items": items[:30],
+    items = items[:30]
+    if items:
+        with httpx.Client(follow_redirects=True, timeout=10, headers={"User-Agent": "NDM/0.1"},
+                          cookies=firefox_cookie_jar(settings), **httpx_options(settings),
+                          event_hooks={"request": [lambda request: validate_url(str(request.url), allow_private=allow_private, resolve=resolve)]}) as client:
+            with ThreadPoolExecutor(max_workers=min(6, len(items))) as pool:
+                sizes = list(pool.map(lambda item: _probe_size(client, item["url"]), items))
+        for item, size in zip(items, sizes, strict=True):
+            item.update(size)
+    return {"kind": "html", "title": parser.title.strip() or "Page media", "items": items,
             "message": "Only direct media elements are detected. Scripts and protected streams are not bypassed." if items else "No direct audio or video links were found. Try a direct file URL."}
 
 
@@ -188,8 +248,12 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
     def hook(data: dict) -> None:
         if stop.is_set():
             raise yt_dlp.utils.DownloadCancelled()
-        total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-        progress(int(data.get("downloaded_bytes") or 0), int(total), "downloading")
+        total = data.get("total_bytes")
+        estimated = False
+        if not total:
+            total = data.get("total_bytes_estimate") or 0
+            estimated = bool(total)
+        progress(int(data.get("downloaded_bytes") or 0), int(total), "downloading", estimated=estimated)
 
     def post_hook(data: dict) -> None:
         if stop.is_set():
@@ -209,10 +273,14 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
     }
     if rate_limit:
         options["ratelimit"] = rate_limit
-    if ffmpeg:
+    if task.get("media_quality") == "audio":
+        if not ffmpeg:
+            raise ValueError("MP3 conversion needs FFmpeg on PATH. Install FFmpeg, then retry.")
+        options["format"] = "bestaudio/best"
+        options["final_ext"] = "mp3"
+        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+    elif ffmpeg:
         options["merge_output_format"] = "mp4" if task["category"] == "video" else task.get("audio_ext", "m4a")
-        if task.get("media_quality") == "audio":
-            options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(task["url"], download=True)
         if stop.is_set():
@@ -221,7 +289,15 @@ def media_download(task: dict, stop, progress, rate_limit: int, connections: int
         for item in downloads:
             candidate = Path(item.get("filepath") or "")
             if candidate.is_file() and candidate.suffix != ".part":
+                if task.get("media_quality") == "audio":
+                    converted = candidate.with_suffix(".mp3")
+                    if converted.is_file():
+                        return converted
                 return candidate
+        if task.get("media_quality") == "audio":
+            converted = destination.with_suffix(".mp3")
+            if converted.is_file():
+                return converted
         candidates = [p for p in destination.parent.glob(destination.stem + ".*")
                       if p.is_file() and p.suffix not in {".part", ".ytdl", ".json"}]
         if not candidates:
