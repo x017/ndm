@@ -203,6 +203,26 @@ def exception_chain(exc: BaseException) -> list[BaseException]:
     return chain
 
 
+def detail_text(exc: BaseException) -> str:
+    """Full text of a failure, including causes hidden in custom attributes.
+
+    Some upstream libraries keep the real reason outside the exception chain:
+    spotapi's ``ParentException`` raises ``RequestError("Failed to complete
+    request.", error=<real cause>)`` with no ``__cause__``, so reading only
+    ``str(exc)`` loses the network error entirely.
+    """
+    parts: list[str] = []
+    for item in exception_chain(exc):
+        parts.append(f"{type(item).__name__}: {item}")
+        for attribute in ("error", "reason", "msg"):
+            value = getattr(item, attribute, None)
+            if isinstance(value, BaseException):
+                parts.append(f"{type(value).__name__}: {value}")
+            elif isinstance(value, str) and value and value not in parts:
+                parts.append(value)
+    return redact(" ".join(dict.fromkeys(parts)))
+
+
 def log_failure(logger: logging.Logger, stage: str, exc: BaseException, **fields) -> None:
     """Write the full, redacted failure chain plus the stage that produced it."""
     context = " ".join(f"{k}={redact(v)}" for k, v in fields.items() if v not in (None, ""))
@@ -210,6 +230,9 @@ def log_failure(logger: logging.Logger, stage: str, exc: BaseException, **fields
                  type(exc).__name__, redact(exc))
     for depth, item in enumerate(exception_chain(exc)):
         logger.error("  cause[%d] %s: %s", depth, type(item).__name__, redact(item))
+        hidden = getattr(item, "error", None)
+        if hidden not in (None, "") and str(hidden) != str(item):
+            logger.error("  cause[%d].error: %s", depth, redact(hidden))
     logger.debug("Traceback for %s:\n%s", stage,
                  redact("".join(traceback.format_exception(type(exc), exc, exc.__traceback__))))
     hint = diagnose(exc)
@@ -232,10 +255,24 @@ _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
      "intercepting the connection; try another network or fix the proxy settings."),
     (re.compile(r"(?i)certificate_verify_failed|sslcertificateverify|self.signed certificate|ssl: |ssLError"),
      "TLS certificate validation failed. Check system clock/CA certificates, or a TLS-intercepting proxy or antivirus."),
-    (re.compile(r"(?i)cannot connect to proxy|proxyerror|socks|proxy connection|unable to connect to proxy|407"),
+    # A SOCKS tunnel that opens but then stalls during the TLS handshake is a
+    # *working* proxy carrying a blocked/dead upstream, not bad proxy settings.
+    # Match it before the generic proxy rule: "SocksHTTPSConnectionPool" appears
+    # in every proxied requests error and would otherwise mask the real cause.
+    (re.compile(r"(?i)handshake operation timed out|handshake timed out"),
+     "The proxy connected, but the TLS handshake through it never completed. The proxy itself is "
+     "reachable; its upstream exit is blocked, overloaded, or dead. Switch to another proxy/server "
+     "or VPN exit, then retry."),
+    # Genuine proxy-layer failures only. Do not match the bare word "socks":
+    # it is part of the pool class name in every proxied requests/urllib3 error.
+    (re.compile(r"(?i)cannot connect to proxy|unable to connect to proxy|proxyconnectionerror"
+                r"|generalproxyerror|socks5?auth|socks[45]error|proxy authentication|407"
+                r"|tunnel connection failed|cannot connect to socks|invalid proxy|proxyerror"),
      "The proxy refused or failed the connection. Verify the proxy URL, port, and credentials in Options → Network."),
-    (re.compile(r"(?i)getaddrinfo|name or service not known|temporary failure in name resolution|nodename nor servname|dns"),
-     "DNS lookup failed. Check your connection/VPN; with a SOCKS proxy try enabling remote DNS."),
+    (re.compile(r"(?i)getaddrinfo|name or service not known|temporary failure in name resolution"
+                r"|nodename nor servname|failed to resolve|nameresolutionerror|\bdns\b"),
+     "DNS lookup failed. Check your connection/VPN. With a SOCKS proxy, enable remote DNS "
+     "(Options → Network) so the proxy resolves the hostname instead of this machine."),
     (re.compile(r"(?i)429|too many requests|rate.?limit"),
      "The source is rate-limiting you. Wait a few minutes, lower concurrency in Options, then retry."),
     # Specific causes must precede the generic "not found"/"unavailable" rule
@@ -259,9 +296,7 @@ _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 def diagnose(exc: BaseException | str) -> str:
     """Map a failure (including wrapped causes) to one actionable sentence."""
-    text = exc if isinstance(exc, str) else " ".join(
-        f"{type(item).__name__} {item}" for item in exception_chain(exc))
-    text = redact(text)
+    text = redact(exc if isinstance(exc, str) else detail_text(exc))
     for pattern, hint in _HINTS:
         if pattern.search(text):
             return hint
@@ -282,6 +317,11 @@ def failure_message(exc: BaseException, *, detail: str = "", prefix: str = "",
 
     hint = diagnose(detail or exc)
     raw = tidy(str(exc)) or type(exc).__name__
+    # A generic wrapper ("Failed to complete request.") hides the real cause in
+    # an attribute or a chained exception. Prefer that text for the visible row.
+    hidden = tidy(detail_text(exc))
+    if len(raw) < 60 and hidden and hidden != raw and len(hidden) > len(raw):
+        raw = hidden
     parts = [p for p in (prefix, hint) if p]
     head = " | ".join(parts)
     budget = max(80, limit - len(head) - 24)
@@ -331,13 +371,16 @@ def check_connectivity(settings: dict | None = None, *, timeout: float = 10.0) -
     """Probe the hosts the Spotify path actually needs, through the configured proxy."""
     import httpx
 
-    from .network import httpx_options
+    from .network import httpx_options, proxy_url
 
     register_secrets(settings)
     results = []
     options = httpx_options(settings or {})
+    # Name the proxy in the report so a failing tunnel is not mistaken for a
+    # direct-connection problem. Credentials stay redacted.
+    via = redact(proxy_url(settings or {}))
     for host in ("https://open.spotify.com/", "https://music.youtube.com/", "https://www.youtube.com/"):
-        row = {"url": host, "ok": False, "detail": ""}
+        row = {"url": host, "ok": False, "detail": "", "via": via or "direct"}
         try:
             with httpx.Client(timeout=timeout, follow_redirects=True, **options) as client:
                 response = client.get(host, headers={"User-Agent": "NDM/diagnostics"})

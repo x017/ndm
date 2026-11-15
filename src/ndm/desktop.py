@@ -429,7 +429,8 @@ class Desktop:
                              size=11, width=ui.FILL)
                 for row in self.diagnostics_check:
                     tone = ui.Tone.SUCCESS if row.get("ok") else ui.Tone.DANGER
-                    ctx.alert(f"{row.get('url')} — {row.get('detail')}"
+                    route = row.get("via") or "direct"
+                    ctx.alert(f"{row.get('url')} (via {route}) — {row.get('detail')}"
                               + (f" · {row['hint']}" if row.get("hint") else ""), tone=tone)
                 with ctx.row(gap=10):
                     if ctx.button("Refresh log", icon=ui.Icon.REFRESH_CW, disabled=bool(self.busy)):

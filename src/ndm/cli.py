@@ -174,11 +174,13 @@ def main(argv: list[str] | None = None) -> None:
             for key, value in environment(settings).items():
                 print(f"  {key}: {value}")
             print(f"\nLog file: {log_path(data_dir)}")
-            print("\nConnectivity (through your configured proxy):")
+            via = "your configured proxy" if settings.get("proxy_enabled") else "a direct connection"
+            print(f"\nConnectivity (through {via}):")
             failed = False
             for row in check_connectivity(settings):
                 mark = "OK  " if row["ok"] else "FAIL"
-                print(f"  {mark} {row['url']} — {row['detail']}")
+                route = f" [via {row['via']}]" if row.get("via") and row["via"] != "direct" else ""
+                print(f"  {mark} {row['url']}{route} — {row['detail']}")
                 if row.get("hint"):
                     print(f"       {row['hint']}")
                 failed = failed or not row["ok"]

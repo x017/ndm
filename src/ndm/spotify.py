@@ -376,7 +376,18 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
     # Fill them before matching/tagging, exactly as upstream's downloader did.
     if any(value is None for value in (song.genres, song.disc_count, song.tracks_count,
                                        song.track_number, song.album_id, song.album_artist)):
-        song = reinit_song(song)
+        # This refetches Spotify metadata over the network and can fail before
+        # matching starts. Log it like any other stage; spotapi hides the real
+        # cause in RequestError.error rather than __cause__.
+        try:
+            song = reinit_song(song)
+        except Exception as exc:
+            if stop is not None and stop.is_set():
+                raise SpotifyCancelled() from exc
+            log_failure(log, "Spotify metadata refresh", exc, track=song.display_name)
+            raise ValueError(failure_message(
+                exc, prefix=f"Could not refresh Spotify metadata for {song.display_name}",
+            )) from exc
         song.artists = list(song.artists or [song.artist])
         song.artist = song.artist or (song.artists[0] if song.artists else "")
         song.duration = int(song.duration or 0)
