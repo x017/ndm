@@ -1,6 +1,7 @@
 """Real native-widget smoke tests using Nexa's software renderer and input events."""
 from __future__ import annotations
 
+import copy
 import json
 
 import nexa as ui
@@ -569,3 +570,130 @@ def test_row_menu_stays_within_the_panel_height(tmp_path, monkeypatch):
     # ~43px per entry and ~31px per separator against a ~419px panel.
     assert len(labels) * 43 + len(separators) * 31 <= 419, (labels, len(separators))
     assert "Remove…" in labels and "Properties" in labels
+
+
+def _ctrl_k(ctx, desktop):
+    ctx.input_key(ui.Key.K, True, ui.Mod.PRIMARY)
+    frame(desktop, ctx)
+    ctx.input_key(ui.Key.K, False)
+    frame(desktop, ctx)
+    # Injected text events carry no modifier state, so the PRIMARY latch from
+    # Ctrl+K survives until a plain keystroke clears it. Real typing sends both.
+    ctx.input_key(ui.Key.S, True)
+    frame(desktop, ctx)
+    ctx.input_key(ui.Key.S, False)
+    frame(desktop, ctx)
+
+
+def _type(ctx, desktop, text):
+    for char in text:
+        ctx.input_text(char)
+        frame(desktop, ctx)
+
+
+def _enter(ctx, desktop):
+    ctx.input_key(ui.Key.ENTER, True)
+    frame(desktop, ctx)
+    ctx.input_key(ui.Key.ENTER, False)
+    for _ in range(5):
+        frame(desktop, ctx)
+
+
+def _two_files(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.request(None, "add", {"url": "https://example.org/fixture.zip"})
+    base = copy.deepcopy(client.state["downloads"][0])
+    client.state["downloads"] = []
+    for index, (name, status) in enumerate((("ubuntu.iso", "downloading"),
+                                            ("sade-flow.mp3", "completed"))):
+        task = copy.deepcopy(base)
+        task.update(id=f"id{index}", name=name, status=status, url="https://x/" + name)
+        client.state["downloads"].append(task)
+    desktop.refresh()
+    return client, desktop
+
+
+def test_ctrl_k_opens_the_command_palette(tmp_path, monkeypatch):
+    LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        assert not desktop.palette_open
+        _ctrl_k(ctx, desktop)
+        assert desktop.palette_open
+        assert desktop.palette_stage == "media"
+
+
+def test_palette_selects_media_then_shows_its_options(tmp_path, monkeypatch):
+    client, desktop = _two_files(tmp_path, monkeypatch)
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        desktop.open_palette()
+        for _ in range(3):
+            frame(desktop, ctx)
+        _type(ctx, desktop, "sade")
+        _enter(ctx, desktop)
+        assert desktop.selected == {"id1"}
+        assert desktop.palette_stage == "actions"
+        assert desktop.palette_target == "id1"
+        # Reopening must clear the query, or stage two shows "No results".
+        assert desktop.palette_open
+        commands, _ = desktop._palette_commands(desktop.state)
+        titles = [c.title for c in commands]
+        assert "Properties" in titles and "Remove…" in titles
+        assert "Back to all media" in titles
+        # A completed file cannot be stopped.
+        assert "Stop" not in titles
+        assert all(c.group in {"sade-flow.mp3", "Navigation"} for c in commands)
+
+
+def test_palette_action_reaches_the_daemon(tmp_path, monkeypatch):
+    client, desktop = _two_files(tmp_path, monkeypatch)
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        desktop.open_palette()
+        for _ in range(3):
+            frame(desktop, ctx)
+        _type(ctx, desktop, "sade")
+        _enter(ctx, desktop)
+        _type(ctx, desktop, "Retry")
+        _enter(ctx, desktop)
+        assert ("action", {"id": "id1", "action": "retry"}) in client.calls
+        assert not desktop.palette_open
+        assert desktop.palette_stage == "media"
+
+
+def test_palette_back_returns_to_media_and_escape_closes(tmp_path, monkeypatch):
+    _, desktop = _two_files(tmp_path, monkeypatch)
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        desktop.open_palette()
+        for _ in range(3):
+            frame(desktop, ctx)
+        _type(ctx, desktop, "sade")
+        _enter(ctx, desktop)
+        assert desktop.palette_stage == "actions"
+        _type(ctx, desktop, "Back")
+        _enter(ctx, desktop)
+        assert desktop.palette_stage == "media"
+        assert desktop.palette_open
+        ctx.input_key(ui.Key.ESCAPE, True)
+        frame(desktop, ctx)
+        ctx.input_key(ui.Key.ESCAPE, False)
+        for _ in range(2):
+            frame(desktop, ctx)
+        assert not desktop.palette_open
+
+
+def test_palette_lists_global_actions_when_no_media(tmp_path, monkeypatch):
+    LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    commands, handlers = desktop._palette_commands(desktop.state)
+    titles = [c.title for c in commands]
+    assert "Add URL…" in titles and "Options…" in titles
+    assert len(commands) == len(handlers)

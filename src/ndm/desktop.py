@@ -174,6 +174,10 @@ class Desktop:
         self.last_click = 0.0
         self.frame_no = 0
         self._select_frame = -1
+        self.palette_open = False
+        self.palette_stage = "media"
+        self.palette_target = ""
+        self.palette_reopen = 0
         self.sort = ui.TableSort(6, True)
         self.dialog = ""
         self.error = ""
@@ -697,6 +701,14 @@ class Desktop:
                 ctx.status_bar_text("Local daemon · no web server", icon=ui.Icon.SHIELD,
                                     tone=ui.Tone.SUCCESS if settings["engine_running"] else ui.Tone.WARNING)
         self._dialogs(ctx, state)
+        self._command_palette(ctx, state)
+        # Ctrl+K is checked before the keyboard-owner guard so it also closes the
+        # palette while its search field has focus.
+        if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.K):
+            if self.palette_open:
+                self.palette_open = False
+            else:
+                self.open_palette()
         # Handle global shortcuts only after every widget has run. Nexa clears
         # its keyboard-owner flag at begin_frame, so checking wants_keyboard
         # before the inputs are drawn is always false even when a field is
@@ -747,6 +759,8 @@ class Desktop:
                         self.open_dialog("details")
             with ctx.menu_bar_menu("View", mnemonic="V") as menu:
                 if menu:
+                    if ctx.menu_item("Command palette…", icon=ui.Icon.SEARCH, shortcut="Ctrl+K"):
+                        self.open_palette()
                     if ctx.menu_item("Refresh", icon=ui.Icon.REFRESH_CW, shortcut="F5"):
                         self.refresh()
                     if ctx.menu_item("Dark theme", checked=settings["theme"] == "dark"):
@@ -856,6 +870,105 @@ class Desktop:
                 and mouse.x >= rect.x and ctx.mouse_clicked(ui.MouseButton.RIGHT)):
             ctx.popover_open("row_menu")
         return ctx.popover("row_menu", placement=ui.Placement.BOTTOM_START, width=230)
+
+    def open_palette(self) -> None:
+        self.palette_stage = "media"
+        self.palette_target = ""
+        self.palette_reopen = 0
+        self.palette_open = True
+
+    def _palette_pick(self, task_id: str) -> None:
+        """Stage one chose a file: select it and show what can be done with it."""
+        self.selected = {task_id}
+        self.palette_target = task_id
+        self.palette_stage = "actions"
+        # The native palette keeps its query across an open/close, so stage two
+        # would be filtered by the filename just typed. Reopen after a short
+        # close to clear it, and ask for the frames rather than waiting for the
+        # user to move the mouse.
+        self.palette_reopen = 2
+
+    def _palette_commands(self, state: dict) -> tuple[list, list]:
+        """Build index-aligned (commands, handlers) for the current stage."""
+        commands: list = []
+        handlers: list = []
+
+        def add(title, icon, group, handler, shortcut=None):
+            commands.append(ui.Command(title, icon=icon, group=group, shortcut=shortcut))
+            handlers.append(handler)
+
+        def act(task_id, action):
+            return lambda ctx: self.perform("action", {"id": task_id, "action": action})
+
+        task = None
+        if self.palette_stage == "actions":
+            task = next((t for t in state["downloads"] if t["id"] == self.palette_target), None)
+            if task is None:
+                self.palette_stage = "media"
+        if task is not None:
+            group = task["name"]
+            status = task["status"]
+            if status in {"paused", "error", "queued"}:
+                add("Resume", ui.Icon.PLAY, group, act(task["id"], "resume"))
+            if status in {"downloading", "queued"}:
+                add("Stop", ui.Icon.PAUSE, group, act(task["id"], "pause"))
+            if status in {"error", "completed"}:
+                add("Retry", ui.Icon.DOWNLOAD, group, act(task["id"], "retry"))
+            if status == "completed" and Path(task["path"]).exists():
+                def open_file(ctx, path=task["path"]):
+                    try:
+                        os_open_path(path)
+                    except OSError as exc:
+                        self.error = safe_error(exc, self.state.get("settings", {}))
+                add("Open file", ui.Icon.PLAY, group, open_file)
+            add("Open containing folder", ui.Icon.FOLDER, group,
+                lambda ctx, path=task["path"]: self._open_containing_folder(path))
+            if task.get("url"):
+                add("Copy download link", ui.Icon.CLIPBOARD, group,
+                    lambda ctx, url=task["url"]: self._copy_to_clipboard(ctx, url, "Link"))
+            def properties(ctx, task_id=task["id"]):
+                self.details_id = task_id
+                self.open_dialog("details")
+            add("Properties", ui.Icon.INFO, group, properties)
+            add("Remove…", ui.Icon.TRASH, group,
+                lambda ctx, task_id=task["id"]: self.ask_delete([task_id]))
+            add("Back to all media", ui.Icon.ARROW_LEFT, "Navigation",
+                lambda ctx: self._palette_back())
+            return commands, handlers
+
+        for item in state["downloads"]:
+            add(item["name"], CATEGORY_ICONS.get(item["category"], ui.Icon.FILE), "Downloads",
+                lambda ctx, task_id=item["id"]: self._palette_pick(task_id),
+                shortcut=status_text(item))
+        add("Add URL…", ui.Icon.PLUS, "Actions", lambda ctx: self.open_dialog("add"), "Ctrl+N")
+        add("Download Spotify link…", ui.Icon.MUSIC, "Actions", lambda ctx: self.open_dialog("spotify"))
+        add("Media grabber…", ui.Icon.LINK, "Actions", lambda ctx: self.open_dialog("media"))
+        add("Offline audio files…", ui.Icon.MUSIC, "Actions", lambda ctx: self.load_library())
+        add("Options…", ui.Icon.SETTINGS, "Actions", lambda ctx: self.open_dialog("options"))
+        for key in ("all", "unfinished", "finished"):
+            add(CATEGORY_NAMES[key], CATEGORY_ICONS[key], "Show",
+                lambda ctx, category=key: setattr(self, "category", category))
+        return commands, handlers
+
+    def _palette_back(self) -> None:
+        self.palette_stage = "media"
+        self.palette_target = ""
+        self.palette_reopen = 2
+
+    def _command_palette(self, ctx: ui.UI, state: dict) -> None:
+        if self.palette_reopen:
+            self.palette_reopen -= 1
+            if self.palette_reopen == 0:
+                self.palette_open = True
+            ctx.request_redraw()
+        commands, handlers = self._palette_commands(state)
+        is_open, chosen = ctx.command_palette(self.palette_open, commands)
+        self.palette_open = is_open
+        if 0 <= chosen < len(handlers):
+            handlers[chosen](ctx)
+        if not self.palette_open and not self.palette_reopen:
+            self.palette_stage = "media"
+            self.palette_target = ""
 
     def _select_row(self, ctx: ui.UI, task: dict) -> None:
         """Shared selection + double-click handling for row and filename clicks."""
