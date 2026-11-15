@@ -271,6 +271,14 @@ ndm stop
 NDM_DEBUG=1 ndm daemon               # verbose; then retry the track
 ```
 
+`ndm doctor` probes each host on **both** HTTP stacks NDM uses, because they do
+not treat `socks5://` the same way: httpx always sends the hostname to the proxy,
+while requests (spotDL's YouTube Music client) resolves it locally first. With
+**remote DNS off**, a censored or poisoned local resolver can therefore break
+matching while the httpx probes still return HTTP 200. If matching times out
+through a SOCKS proxy, enable **Options → Network → remote DNS** so the proxy
+resolves hostnames (`socks5h://`).
+
 Proxy passwords, proxy usernames, `Cookie`/`Set-Cookie` values, and
 `Authorization` headers are redacted before anything is written or displayed,
 so the log is safe to share when reporting a problem.

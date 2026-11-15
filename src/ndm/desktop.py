@@ -425,12 +425,13 @@ class Desktop:
                     facts = self.diagnostics_env
                     ctx.text(f"ffmpeg: {facts.get('ffmpeg')} · ffprobe: {facts.get('ffprobe')} · deno: {facts.get('deno')}",
                              size=11, width=ui.FILL)
-                    ctx.text(f"yt-dlp {facts.get('yt_dlp')} · spotDL {facts.get('spotdl')} · proxy {facts.get('proxy_enabled')} · cookies {facts.get('firefox_cookies')}",
+                    ctx.text(f"yt-dlp {facts.get('yt_dlp')} · spotDL {facts.get('spotdl')} · proxy {facts.get('proxy_enabled')} · remote DNS {facts.get('proxy_remote_dns')} · cookies {facts.get('firefox_cookies')}",
                              size=11, width=ui.FILL)
                 for row in self.diagnostics_check:
                     tone = ui.Tone.SUCCESS if row.get("ok") else ui.Tone.DANGER
                     route = row.get("via") or "direct"
-                    ctx.alert(f"{row.get('url')} (via {route}) — {row.get('detail')}"
+                    stack = f" {row['stack']}" if row.get("stack") else ""
+                    ctx.alert(f"{row.get('url')} (via {route}{stack}) — {row.get('detail')}"
                               + (f" · {row['hint']}" if row.get("hint") else ""), tone=tone)
                 with ctx.row(gap=10):
                     if ctx.button("Refresh log", icon=ui.Icon.REFRESH_CW, disabled=bool(self.busy)):

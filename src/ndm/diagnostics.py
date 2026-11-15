@@ -348,6 +348,7 @@ def environment(settings: dict | None = None) -> dict:
         "ffprobe": shutil.which("ffprobe") or "MISSING",
         "deno": shutil.which("deno") or "not on PATH",
         "proxy_enabled": bool(data.get("proxy_enabled")),
+        "proxy_remote_dns": bool(data.get("proxy_remote_dns", True)),
         "firefox_cookies": bool(data.get("firefox_cookies")),
         "debug": debug_enabled(),
     }
@@ -368,29 +369,48 @@ def log_environment(logger: logging.Logger, settings: dict | None = None) -> Non
 
 
 def check_connectivity(settings: dict | None = None, *, timeout: float = 10.0) -> list[dict]:
-    """Probe the hosts the Spotify path actually needs, through the configured proxy."""
+    """Probe the hosts the Spotify path needs, on both HTTP stacks NDM uses.
+
+    httpx (metadata/doctor) and requests+PySocks (spotDL's YouTube Music client)
+    do not treat ``socks5://`` identically: httpx always sends the hostname to
+    the proxy, while requests resolves it locally first. With remote DNS off on
+    a censored network, httpx can succeed while matching times out, so probing
+    only httpx would report a false "OK".
+    """
     import httpx
 
-    from .network import httpx_options, proxy_url
+    from .network import httpx_options, proxy_url, requests_proxies
 
     register_secrets(settings)
     results = []
     options = httpx_options(settings or {})
+    proxies = requests_proxies(settings or {})
     # Name the proxy in the report so a failing tunnel is not mistaken for a
     # direct-connection problem. Credentials stay redacted.
     via = redact(proxy_url(settings or {}))
     for host in ("https://open.spotify.com/", "https://music.youtube.com/", "https://www.youtube.com/"):
-        row = {"url": host, "ok": False, "detail": "", "via": via or "direct"}
-        try:
-            with httpx.Client(timeout=timeout, follow_redirects=True, **options) as client:
-                response = client.get(host, headers={"User-Agent": "NDM/diagnostics"})
-            row["status"] = response.status_code
-            row["ok"] = response.status_code < 500
-            row["detail"] = f"HTTP {response.status_code}"
-        except Exception as exc:
-            row["detail"] = redact(f"{type(exc).__name__}: {exc}")[:200]
-            row["hint"] = diagnose(exc)
-        results.append(row)
+        for stack in ("httpx", "requests"):
+            row = {"url": host, "ok": False, "detail": "", "via": via or "direct", "stack": stack}
+            try:
+                if stack == "httpx":
+                    with httpx.Client(timeout=timeout, follow_redirects=True, **options) as client:
+                        response = client.get(host, headers={"User-Agent": "NDM/diagnostics"})
+                    status = response.status_code
+                else:
+                    import requests
+
+                    response = requests.get(host, proxies=proxies, timeout=timeout,
+                                            headers={"User-Agent": "NDM/diagnostics"},
+                                            allow_redirects=True)
+                    status = response.status_code
+                    response.close()
+                row["status"] = status
+                row["ok"] = status < 500
+                row["detail"] = f"HTTP {status}"
+            except Exception as exc:
+                row["detail"] = redact(f"{type(exc).__name__}: {exc}")[:200]
+                row["hint"] = diagnose(exc)
+            results.append(row)
     return results
 
 

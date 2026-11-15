@@ -180,12 +180,17 @@ def main(argv: list[str] | None = None) -> None:
             for row in check_connectivity(settings):
                 mark = "OK  " if row["ok"] else "FAIL"
                 route = f" [via {row['via']}]" if row.get("via") and row["via"] != "direct" else ""
-                print(f"  {mark} {row['url']}{route} — {row['detail']}")
+                stack = f" ({row['stack']})" if row.get("stack") else ""
+                print(f"  {mark} {row['url']}{route}{stack} — {row['detail']}")
                 if row.get("hint"):
                     print(f"       {row['hint']}")
                 failed = failed or not row["ok"]
             if failed:
                 print("\nAt least one host is unreachable. That is a network/proxy/DNS issue, not a tagging bug.")
+                if settings.get("proxy_enabled") and not settings.get("proxy_remote_dns", True):
+                    print("Remote DNS is OFF. With a SOCKS proxy, requests resolves hostnames on this")
+                    print("machine first, so a censored/poisoned local DNS breaks matching even when")
+                    print("the httpx probes pass. Enable remote DNS in Options → Network, then retry.")
         elif command in {"pause", "resume", "remove"}:
             print_result(request(data_dir, "action", {"id": args.id, "action": "delete" if command == "remove" else command}))
         else:
