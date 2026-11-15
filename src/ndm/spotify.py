@@ -395,6 +395,30 @@ def match_song(song_data: dict, data_dir: Path, *, settings: dict | None = None,
     return {"url": matched_url, "song": song.json, "provider": "YouTube Music via spotDL"}
 
 
+def _taggable(song_data: dict) -> dict:
+    """Fill fields spotDL writes unconditionally, because mutagen rejects None.
+
+    Spotify legitimately omits ISRC/label/release date on some tracks, and
+    streamed album/playlist rows omit even more. spotDL's embed_metadata assigns
+    them straight into ID3/Vorbis/MP4 tags, so a None turns a finished download
+    into "Invalid MultiSpec data: None" / "None needs to be str for key 'isrc'".
+    """
+    data = dict(song_data)
+    for key in ("isrc", "date", "publisher", "url", "album_name"):
+        if data.get(key) is None:
+            data[key] = ""
+    for key in ("disc_number", "disc_count", "track_number", "tracks_count"):
+        if data.get(key) is None:
+            data[key] = 0
+    if not data.get("artists"):
+        data["artists"] = [data.get("artist") or "Unknown artist"]
+    if not data.get("artist"):
+        data["artist"] = data["artists"][0]
+    if not data.get("name"):
+        data["name"] = "Unknown title"
+    return data
+
+
 def tag_file(path: Path, song_data: dict, *, stop=None) -> None:
     """Embed Spotify metadata/cover art after NDM has downloaded and converted audio."""
     if stop is not None and stop.is_set():
@@ -403,7 +427,7 @@ def tag_file(path: Path, song_data: dict, *, stop=None) -> None:
     from spotdl.utils.metadata import embed_metadata
 
     try:
-        embed_metadata(path, Song.from_missing_data(**song_data))
+        embed_metadata(path, Song.from_missing_data(**_taggable(song_data)))
     except Exception as exc:
         cause = exc.__cause__ or exc
         raise RuntimeError(
