@@ -151,6 +151,7 @@ def complete_settings(settings: dict | None) -> dict:
 OPTIONS_KEYS = [
     "download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
     "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
+    "browser_integration", "browser_ask",
     "firefox_cookies", "spotify_format", "spotify_bitrate", "spotify_tagger", "spotify_matcher", "proxy_enabled", "proxy_url", "proxy_username",
     "proxy_password", "proxy_remote_dns",
 ]
@@ -174,6 +175,9 @@ class Desktop:
         self.last_click = 0.0
         self.frame_no = 0
         self._select_frame = -1
+        self.seen_offers: set[str] = set()
+        self.offer_id = ""
+        self.offer_paused = False
         self.palette_open = False
         self.palette_stage = "media"
         self.palette_target = ""
@@ -700,6 +704,7 @@ class Desktop:
                 ctx.status_bar_text(f"Speed: {format_bytes(state['stats']['speed'])}/s", icon=ui.Icon.ACTIVITY)
                 ctx.status_bar_text("Local daemon · no web server", icon=ui.Icon.SHIELD,
                                     tone=ui.Tone.SUCCESS if settings["engine_running"] else ui.Tone.WARNING)
+        self._watch_offers(state)
         self._dialogs(ctx, state)
         self._command_palette(ctx, state)
         # Ctrl+K is checked before the keyboard-owner guard so it also closes the
@@ -751,6 +756,11 @@ class Desktop:
                         self.act_selected("pause")
                     if ctx.menu_item("Stop all", icon=ui.Icon.SQUARE):
                         self.stop_all()
+                    pending = len(self.state.get("offers") or [])
+                    if ctx.menu_item(f"Browser requests ({pending})", icon=ui.Icon.GLOBE,
+                                     disabled=not pending):
+                        self.offer_id = self.state["offers"][0]["id"]
+                        self.open_dialog("offer")
                     ctx.menu_separator()
                     if ctx.menu_item("Remove selected…", icon=ui.Icon.TRASH, disabled=not self.selected):
                         self.ask_delete(list(self.selected))
@@ -1182,6 +1192,77 @@ class Desktop:
             if ctx.button("Dismiss error", size=ui.ControlSize.SM):
                 self.error = ""
 
+    def _watch_offers(self, state: dict) -> None:
+        """Surface a browser handoff as a question, never a silent download."""
+        offers = state.get("offers") or []
+        live = {o["id"] for o in offers}
+        self.seen_offers &= live
+        new = [o for o in offers if o["id"] not in self.seen_offers]
+        if not new:
+            return
+        self.seen_offers.update(o["id"] for o in new)
+        if self.dialog in {"", "offer"}:
+            self.offer_id = new[0]["id"]
+            self.offer_paused = False
+            self.dialog = "offer"
+        else:
+            # Never yank away a dialog the user is typing into.
+            self.notice = f"Firefox sent {len(new)} download(s). Review them in Downloads → Browser requests."
+
+    def resolve_offer(self, accept: bool) -> None:
+        offer_id = self.offer_id
+        try:
+            self.call("browser.resolve", {"id": offer_id, "accept": accept,
+                                          "start_paused": self.offer_paused})
+            self.error = ""
+            self.refresh()
+        except (OSError, ValueError, RuntimeError, EOFError) as exc:
+            self.error = safe_error(exc, self.state.get("settings", {}))
+        self.offer_id = ""
+        remaining = [o for o in (self.state.get("offers") or []) if o["id"] != offer_id]
+        if remaining:
+            self.offer_id = remaining[0]["id"]
+            self.offer_paused = False
+        else:
+            self.dialog = ""
+
+    def _offer_dialog(self, ctx: ui.UI, state: dict) -> None:
+        offers = state.get("offers") or []
+        offer = next((o for o in offers if o["id"] == self.offer_id), None)
+        if offer is None:
+            # Resolved elsewhere, or it expired while the dialog was open.
+            self.dialog = ""
+            self.offer_id = ""
+            return
+        settings = state["settings"]
+        destination = Path(settings["music_dir"] if offer["category"] == "audio"
+                           else settings["download_dir"]) / offer["category"]
+        with ctx.dialog("Firefox wants to download a file", True, width=560) as dialog:
+            if dialog:
+                ctx.heading(offer["name"], level=3)
+                rows = [("From", offer["host"] or "unknown host"),
+                        ("Type", offer["category"]),
+                        ("Size", format_bytes(offer["size"]) if offer["size"] else "Unknown"),
+                        ("Save to", str(destination))]
+                for label, value in rows:
+                    with ctx.row(width=ui.FILL, gap=10):
+                        ctx.text(label, size=11, color=ui.Color.TEXT_SECONDARY, width=80)
+                        ctx.text(value, size=11, selectable=True, width=ui.GROW(1))
+                ctx.text(offer["url"], size=10, selectable=True, width=ui.FILL,
+                         color=ui.Color.TEXT_SECONDARY)
+                if len(offers) > 1:
+                    ctx.alert(f"{len(offers)} downloads are waiting. This is the oldest.",
+                              tone=ui.Tone.INFO)
+                self.offer_paused = ctx.checkbox("Add paused (start it later)", self.offer_paused)
+                self._error_in_dialog(ctx)
+                with ctx.dialog_footer():
+                    if ctx.button("Leave in Firefox"):
+                        self.resolve_offer(False)
+                    if ctx.button("Download", icon=ui.Icon.DOWNLOAD, variant=ui.ButtonVariant.PRIMARY):
+                        self.resolve_offer(True)
+            if not dialog.open:
+                self.resolve_offer(False)
+
     def _dialogs(self, ctx: ui.UI, state: dict) -> None:
         if self.dialog == "add":
             self._add_dialog(ctx)
@@ -1197,6 +1278,8 @@ class Desktop:
             self._diagnostics_dialog(ctx, state)
         elif self.dialog == "library":
             self._library_dialog(ctx)
+        elif self.dialog == "offer":
+            self._offer_dialog(ctx, state)
         elif self.dialog in {"delete", "shutdown", "about"}:
             title = {"delete": "Remove downloads", "shutdown": "Stop the background daemon?", "about": "About NDM"}[self.dialog]
             with ctx.dialog(title, True, width=480) as dialog:
@@ -1515,6 +1598,10 @@ class Desktop:
                         form["auto_capture"] = ctx.switch("Enable automatic media capture", form["auto_capture"])
                         form["clipboard_capture"] = ctx.checkbox("Capture copied direct media links while this window is open", form["clipboard_capture"])
                         form["watch_inbox"] = ctx.checkbox("Watch the link inbox in the background", form["watch_inbox"])
+                        form["browser_integration"] = ctx.switch("Hand Firefox downloads to NDM", form["browser_integration"])
+                        form["browser_ask"] = ctx.checkbox("Ask me in the app before each browser download", form["browser_ask"])
+                        ctx.text("Setup: uv run ndm extension install — then load extension/firefox/manifest.json via about:debugging.",
+                                 width=ui.FILL, size=11)
                         ctx.text("Inbox: " + state["daemon"]["inbox"], selectable=True, size=11, width=ui.FILL)
                         domains = ctx.input("capture_domains", ", ".join(form["allowed_domains"]), label="Allowed hostnames (comma-separated; empty = any)", width=ui.FILL)
                         form["allowed_domains"] = [v.strip() for v in domains.split(",") if v.strip()]

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root { color-scheme: light dark; }
+    body { width: 290px; margin: 0; padding: 14px; font: 13px/1.45 system-ui, sans-serif; }
+    h1 { font-size: 14px; margin: 0 0 10px; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 9px 0; }
+    .status { padding: 8px 10px; border-radius: 8px; background: rgba(125,125,125,.14); font-size: 12px; }
+    .ok { color: #1a7f4b; } .bad { color: #b3261e; }
+    label { flex: 1; }
+    input[type=number] { width: 74px; }
+    .types { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; margin: 6px 0 10px; }
+    .hint { font-size: 11px; opacity: .7; margin-top: 10px; }
+    code { font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>NDM Download Handoff</h1>
+  <div id="status" class="status">Checking NDM…</div>
+  <div class="row">
+    <input type="checkbox" id="enabled">
+    <label for="enabled">Hand downloads to NDM</label>
+  </div>
+  <div class="row">
+    <label for="minSize">Skip files smaller than</label>
+    <input type="number" id="minSize" min="0" step="50"> KB
+  </div>
+  <div class="types" id="types"></div>
+  <div class="hint">
+    NDM asks you in the app before each download. If NDM is closed, Firefox
+    keeps the download.<br><br>
+    Setup: <code>uv run ndm extension install</code>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

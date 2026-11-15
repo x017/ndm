@@ -65,6 +65,7 @@ class DownloadManager:
         self.dirty: set[str] = set()
         self.started = time.time()
         self.speed_history: deque[float] = deque([0.0] * 60, maxlen=60)
+        self.offers: dict[str, dict] = {}
         self.root = Path(self.settings.download_dir).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.store.directory / "inbox").mkdir(exist_ok=True)
@@ -299,6 +300,55 @@ class DownloadManager:
                         self.action(task_id, "resume")
             self.store.event("Preferences updated", "Your download engine is ready.")
         return candidate
+
+    OFFER_TTL = 300.0
+    OFFER_LIMIT = 50
+
+    def offer_download(self, *, url: str, filename: str | None = None, mime: str = "",
+                       size: int = 0, page_url: str = "") -> dict:
+        """Queue a browser download for the user to approve in the app.
+
+        Returns immediately so the extension can decide whether to cancel
+        Firefox's own transfer. With browser_ask off the download starts at once;
+        otherwise it waits in `offers` until the desktop resolves it.
+        """
+        if not self.settings.browser_integration:
+            raise RuntimeError("Browser integration is off. Enable it in Options → Capture.")
+        url = self.validate_target(url)
+        name = safe_filename(filename or Path(unquote(urlsplit(url).path)).name or "download")
+        kind = category_for(name, mime)
+        with self.lock:
+            now = time.time()
+            for offer_id, stale in list(self.offers.items()):
+                if now - stale["created_at"] > self.OFFER_TTL:
+                    del self.offers[offer_id]
+            for offer in self.offers.values():
+                if offer["url"] == url:
+                    return {"id": offer["id"], "status": "pending", "duplicate": True}
+            if not self.settings.browser_ask:
+                task = self.add(url=url, filename=name, category=kind, source="firefox")
+                return {"id": "", "status": "started", "task": task["id"]}
+            if len(self.offers) >= self.OFFER_LIMIT:
+                raise ValueError("Too many downloads are waiting for approval.")
+            offer_id = uuid.uuid4().hex[:12]
+            self.offers[offer_id] = {
+                "id": offer_id, "url": url, "name": name, "category": kind,
+                "mime": mime, "size": size, "page_url": page_url,
+                "host": (urlsplit(url).hostname or "").lower(), "created_at": now,
+            }
+        self.store.event("Download offered", f"{name} is waiting for approval.")
+        return {"id": offer_id, "status": "pending"}
+
+    def resolve_offer(self, offer_id: str, accept: bool, *, start_paused: bool = False) -> dict:
+        with self.lock:
+            offer = self.offers.pop(offer_id, None)
+        if offer is None:
+            raise KeyError("That download offer is no longer waiting.")
+        if not accept:
+            return {"status": "declined", "id": offer_id}
+        task = self.add(url=offer["url"], filename=offer["name"], category=offer["category"],
+                        start_paused=start_paused, source="firefox")
+        return {"status": "started", "id": offer_id, "task": task["id"]}
 
     def capture(self, *, url: str, filename: str | None, mime: str, source: str) -> dict:
         if not self.settings.auto_capture:
@@ -852,6 +902,7 @@ class DownloadManager:
                     "connections": sum(len(t["segments"]) for t in tasks if t["status"] == "downloading"),
                 },
                 "history": list(self.speed_history),
+                "offers": sorted(self.offers.values(), key=lambda o: o["created_at"]),
                 "daemon": {"uptime": time.time() - self.started, "pid": os.getpid(),
                            "version": "0.1.0", "data_dir": str(self.store.directory),
                            "ffmpeg": bool(shutil.which("ffmpeg")),

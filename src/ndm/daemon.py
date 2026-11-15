@@ -29,8 +29,10 @@ from .ipc import endpoint, listener, request
 from .media import inspect_media
 from .models import (
     SETTINGS_SCHEMA_VERSION,
+    BrowserOffer,
     CaptureRequest,
     NewDownload,
+    OfferDecision,
     SettingsPatch,
     default_data_dir,
 )
@@ -187,6 +189,12 @@ class NativeDaemon:
             return self.manager.add(**NewDownload.model_validate(payload).model_dump())
         if operation == "capture":
             return self.manager.capture(**CaptureRequest.model_validate(payload).model_dump())
+        if operation == "browser.offer":
+            return self.manager.offer_download(**BrowserOffer.model_validate(payload).model_dump())
+        if operation == "browser.resolve":
+            command = OfferDecision.model_validate(payload)
+            return self.manager.resolve_offer(command.id, command.accept,
+                                              start_paused=command.start_paused)
         if operation == "action":
             command = TaskAction.model_validate(payload)
             return self.manager.action(command.id, command.action)

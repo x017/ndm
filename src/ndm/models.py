@@ -31,7 +31,7 @@ PROXY_SCHEME_ALIASES = {"sockcs5": "socks5"}
 # Bump when the daemon's settings schema or local IPC payload contract changes
 # so the desktop can replace an out-of-date background daemon instead of sending
 # it fields it cannot accept.
-SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_SCHEMA_VERSION = 10
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".wav",
     ".flac", ".ogg", ".opus", ".aac", ".m3u8", ".mpd",
@@ -190,6 +190,8 @@ class Settings(BaseModel):
     proxy_remote_dns: bool = True
     auto_capture: bool = False
     clipboard_capture: bool = False
+    browser_integration: bool = False
+    browser_ask: bool = True
     watch_inbox: bool = False
     capture_types: list[str] = Field(default_factory=lambda: ["video", "audio"])
     allowed_domains: list[str] = Field(default_factory=list)
@@ -319,6 +321,8 @@ class SettingsPatch(BaseModel):
     auto_capture: bool | None = None
     clipboard_capture: bool | None = None
     watch_inbox: bool | None = None
+    browser_integration: bool | None = None
+    browser_ask: bool | None = None
     capture_types: list[str] | None = None
     allowed_domains: list[str] | None = None
     media_quality: str | None = None
@@ -358,3 +362,24 @@ class CaptureRequest(BaseModel):
     filename: str | None = Field(default=None, max_length=180)
     mime: str = Field(default="", max_length=200)
     source: str = Field(default="clipboard", pattern="^(clipboard|inbox)$")
+
+
+class BrowserOffer(BaseModel):
+    """A download the Firefox extension intercepted and handed to the app.
+
+    The extension only cancels Firefox's own transfer after the daemon accepts
+    the offer, so a refused or unreachable NDM leaves the browser download alone.
+    """
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=1, max_length=8192)
+    filename: str | None = Field(default=None, max_length=180)
+    mime: str = Field(default="", max_length=200)
+    size: int = Field(default=0, ge=0)
+    page_url: str = Field(default="", max_length=8192)
+
+
+class OfferDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=64)
+    accept: bool
+    start_paused: bool = False

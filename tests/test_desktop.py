@@ -697,3 +697,95 @@ def test_palette_lists_global_actions_when_no_media(tmp_path, monkeypatch):
     titles = [c.title for c in commands]
     assert "Add URL…" in titles and "Options…" in titles
     assert len(commands) == len(handlers)
+
+
+def _offer(offer_id="off1", name="clip.mp4"):
+    return {"id": offer_id, "url": "https://example.org/" + name, "name": name,
+            "category": "video", "mime": "video/mp4", "size": 40960,
+            "page_url": "https://example.org/", "host": "example.org", "created_at": 1.0}
+
+
+def test_browser_offer_opens_a_question_instead_of_downloading(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.state["offers"] = [_offer()]
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        frame(desktop, ctx)
+        assert desktop.dialog == "offer"
+        assert desktop.offer_id == "off1"
+        # Nothing was queued just because Firefox offered it.
+        assert not any(op == "add" for op, _ in client.calls)
+        assert not any(op == "browser.resolve" for op, _ in client.calls)
+        for _ in range(2):
+            frame(desktop, ctx)
+
+
+def test_browser_offer_download_button_accepts(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.state["offers"] = [_offer()]
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(3):
+            frame(desktop, ctx)
+        assert desktop.dialog == "offer"
+        # The primary button sits at the right of the footer.
+        ctx.input_mouse_move(842, 536)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, True)
+        frame(desktop, ctx)
+        ctx.input_mouse_button(ui.MouseButton.LEFT, False)
+        frame(desktop, ctx)
+        decisions = [p for op, p in client.calls if op == "browser.resolve"]
+        assert decisions and decisions[0]["id"] == "off1"
+        assert decisions[0]["accept"] is True
+
+
+def test_browser_offer_does_not_interrupt_an_open_dialog(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    desktop.open_dialog("add")
+    desktop.url = "https://example.org/typing"
+    client.state["offers"] = [_offer()]
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        for _ in range(2):
+            frame(desktop, ctx)
+        assert desktop.dialog == "add"
+        assert desktop.url == "https://example.org/typing"
+        assert "Firefox sent" in desktop.notice
+
+
+def test_browser_offer_queue_advances_to_the_next(tmp_path, monkeypatch):
+    client = LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    client.state["offers"] = [_offer("a", "first.mp4"), _offer("b", "second.mp4")]
+    desktop.refresh()
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        frame(desktop, ctx)
+        assert desktop.offer_id == "a"
+        client.state["offers"] = [_offer("b", "second.mp4")]
+        desktop.resolve_offer(False)
+        assert desktop.offer_id == "b"
+        assert desktop.dialog == "offer"
+        client.state["offers"] = []
+        desktop.resolve_offer(True)
+        assert desktop.dialog == ""
+
+
+def test_capture_options_expose_browser_integration(tmp_path, monkeypatch):
+    LocalClient(tmp_path, monkeypatch)
+    desktop = Desktop(data_dir=tmp_path)
+    desktop.open_dialog("options")
+    assert "browser_integration" in desktop.settings_form
+    assert "browser_ask" in desktop.settings_form
+    desktop.settings_form["browser_integration"] = True
+    desktop.settings_form["browser_ask"] = True
+    desktop.save_options()
+    assert desktop.state["settings"]["browser_integration"] is True
+    with ui.SoftwareRenderer() as renderer, ui.UI(width=1280, height=780, renderer=renderer) as ctx:
+        desktop.open_dialog("options")
+        desktop.options_tab = 3
+        for _ in range(2):
+            frame(desktop, ctx)
+        assert desktop.dialog == "options"

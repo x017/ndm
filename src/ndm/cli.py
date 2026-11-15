@@ -132,6 +132,9 @@ def main(argv: list[str] | None = None) -> None:
         p = sub.add_parser(name, help=f"{name.title()} a queued download")
         common(p)
         p.add_argument("id")
+    extension = sub.add_parser("extension", help="Register the Firefox download-handoff extension host")
+    common(extension)
+    extension.add_argument("action", choices=["install", "uninstall", "status"])
     service = sub.add_parser("service", help="Install/remove a Linux or macOS sign-in service")
     common(service)
     service.add_argument("action", choices=["install", "uninstall"])
@@ -146,6 +149,34 @@ def main(argv: list[str] | None = None) -> None:
         elif command == "desktop":
             from .desktop import Desktop
             Desktop(data_dir=data_dir).run()
+        elif command == "extension":
+            from . import extension as ext
+            if args.action == "install":
+                info = ext.install(data_dir)
+                print("Firefox native host registered.")
+                print(f"  Manifest:  {info['manifest']}")
+                print(f"  Launcher:  {info['launcher']}")
+                print("\nLoad the extension in Firefox:")
+                print("  1. Open about:debugging#/runtime/this-firefox")
+                print("  2. Click 'Load Temporary Add-on…'")
+                print(f"  3. Pick {info['extension']}/manifest.json")
+                print("\nThen enable Options → Capture → 'Hand Firefox downloads to NDM'.")
+                print("Temporary add-ons are removed when Firefox closes; reload it next session.")
+            elif args.action == "uninstall":
+                info = ext.uninstall(data_dir)
+                print("Removed the native host." if info["removed"] else "No native host was registered.")
+            else:
+                info = ext.status(data_dir)
+                print(f"Registered:        {'yes' if info['installed'] else 'no'}")
+                print(f"Manifest:          {info['manifest']}")
+                print(f"Launcher present:  {'yes' if info['launcher_exists'] else 'no'}")
+                if info.get("registered_path"):
+                    print(f"Host path:         {info['registered_path']}")
+                    if not info.get("path_matches"):
+                        print("  Warning: the registered path differs from this data dir. Re-run install.")
+                print(f"Extension folder:  {info['extension']}")
+                if not info["extension_present"]:
+                    print("  Warning: extension files not found next to the package.")
         elif command == "service":
             install_service(data_dir, args.start, args.action == "uninstall")
         elif command == "add":
