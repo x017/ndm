@@ -75,6 +75,58 @@ ndm desktop
 > Use the branch containing the features you need. If your checkout predates the
 > web frontend, update that branch before running `ndm web`.
 
+## System-wide installation (Linux)
+
+Install the current checkout for all users in an isolated `/opt/ndm` Python
+environment, with an `ndm` command in `/usr/local/bin` and an application-menu
+entry that starts the tray and desktop:
+
+```bash
+# Debian/Ubuntu prerequisites (use equivalent packages on other distributions):
+sudo apt install python3-venv ffmpeg libayatana-appindicator3-1 gir1.2-ayatanaappindicator3-0.1
+sudo bash scripts/install-system.sh
+
+# Run as your normal user, NOT with sudo:
+ndm tray
+```
+
+The installer needs network access and Python 3.11–3.15. It refuses to overwrite
+an existing installation. To update, uninstall and reinstall from the new checkout:
+
+```bash
+sudo bash scripts/install-system.sh --uninstall
+sudo bash scripts/install-system.sh
+```
+
+Uninstalling preserves each user's settings and downloads. No root-owned daemon
+is installed: normal launches use the current user's home directory and account.
+Disable any user service/autostart entry before uninstalling the application.
+The installer does not install a system boot service or start the web server.
+
+### System tray
+
+From a source checkout:
+
+```bash
+uv sync --extra tray
+uv run ndm tray                  # Tray plus desktop window
+uv run ndm tray --no-window      # Tray only; open the desktop from its menu
+```
+
+Closing a desktop launched by the tray leaves the tray and download daemon running.
+Use **Open NDM** to reopen it. If that window is already open, use your operating
+system's task switcher; the tray does not create another copy of its own child.
+**Quit tray** removes only the icon; downloads and an open window continue.
+Use `ndm stop` to stop the daemon. **Open Web UI** opens the default local web
+address; run `ndm web` separately first.
+
+Tray support uses optional `pystray` and Pillow dependencies. Linux needs a tray
+host/AppIndicator implementation; GNOME may require the AppIndicator shell
+extension, and minimal Wayland sessions may have no tray host. X11 fallback
+support depends on the desktop. If no tray is available, use `ndm desktop`.
+macOS and Windows tray backends are provided by pystray but have not been verified
+here. The system-wide installer above is Linux-only.
+
 ## Web UI
 
 ### Login and network access
@@ -382,7 +434,7 @@ Report bugs and propose changes through the repository's
 
 ## Limitations
 
-NDM does not currently provide torrents, scheduled downloads, a system tray, an
+NDM does not currently provide torrents, scheduled downloads, an
 audio streaming service, or complete desktop/web feature parity. Media extraction
 and Spotify matching rely on third-party services and may break as those services
 change. Browser extensions loaded in development mode may require reloading after

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NDM
+Comment=Download manager with a persistent queue and system tray
+Exec=/usr/local/bin/ndm tray
+TryExec=/usr/local/bin/ndm
+Icon=ndm
+Terminal=false
+Categories=Network;FileTransfer;
+StartupNotify=false
