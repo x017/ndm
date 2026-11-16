@@ -1,184 +1,237 @@
-# NDM — native download manager
+# NDM
 
-NDM is a **desktop application**, built in Python with the native
-[nexa-ui](https://pypi.org/project/nexa-ui/) widget toolkit. Its interface follows
-Internet Download Manager's working layout: menus, an icon toolbar, a category
-tree, a detailed download table, and a status bar.
+**A persistent download manager with a native desktop app and a lightweight web interface.**
 
-**There is no React app, web interface, webview, or HTTP API.** The background
-daemon communicates over an authenticated Unix domain socket (Windows: named
-pipe). Optional Firefox and Chrome/Chromium extensions use native messaging
-(stdin/stdout), not a web server. Closing the window leaves downloads running.
+NDM combines resumable HTTP downloads, yt-dlp media extraction, and spotDL music
+matching in a shared background engine. Use the Nexa UI desktop app locally or
+manage the same queue from the HTMX and Alpine.js web frontend. Downloads continue
+when you close either interface.
+
+[Quick start](#quick-start) · [Web UI](#web-ui) · [Browser integration](#browser-integration) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
 ## Features
 
-- **IDM-style native desktop:** File / Downloads / View / Tools / Help menus;
-  Add URL, Spotify, Grabber, Resume, Stop, Stop All, Delete, Properties, Options;
-  All Downloads / Unfinished / Finished / Compressed / Documents / Music / Video
-  / Images / Other categories; sortable columns and a resizable divider.
-- **Download engine:** up to eight HTTP range connections per file, three
-  simultaneous files by default, persistent resume with ETag/Last-Modified
-  validation, safe filenames, per-category folders, and an optional shared speed
-  limit. Single-connection fallback when ranges are unavailable.
-- **spotDL integration:** public Spotify track, album, and playlist links are
-  expanded with the upstream spotDL Python API, previewed in a native track
-  table, then queued individually. spotDL selects the YouTube Music match;
-  NDM's own yt-dlp pipeline downloads and converts it, then spotDL metadata is
-  embedded. Formats: MP3, M4A, FLAC, Opus, Ogg.
-- **yt-dlp media grabber:** media-page and direct-media inspection,
-  format selection, background extraction, and one-click **MP3 conversion**
-  (192 kbps audio extraction via FFmpeg). Every inspected item shows its file
-  size — exact when the source reports it, `~` when estimated, and the real
-  byte count replaces the estimate once the download finishes.
-- **Browser handoff and page grabs:** optional Firefox and Chrome/Chromium
-  extensions intercept downloads with an in-app approval step and send the
-  current YouTube video or Spotify track/album/playlist to the existing
-  yt-dlp / spotDL pipelines. Brave and Edge can load the Chromium extension.
-- **Optional browser cookies:** select Firefox, Chrome, Chromium, Brave, Edge,
-  Vivaldi, Opera, or Safari in Capture options for authenticated downloads,
-  media inspection, and spotDL audio matching. Off by default; no cookie export
-  file is needed.
-- **Background capture:** opt-in link-inbox watching while the window is closed;
-  opt-in clipboard capture while the desktop window is open. Optional host
-  allowlist applies to both. Linux systemd and macOS LaunchAgent installers.
-- **Fully custom colors:** light/dark/system base plus 34 independent semantic
-  color overrides (surfaces, text, borders, accents, status colors, controls,
-  hover/active states, focus ring, scrim, and chart series). Pick visually or enter
-  `#RRGGBB` / `#RRGGBBAA`; reset one token or the whole palette.
-- **HTTP and SOCKS5 proxy:** one daemon-wide proxy for segmented downloads,
-  media inspection/extraction, spotDL metadata/matching, and NDM's matched-audio
-  transfers. HTTP, HTTPS, SOCKS5, and SOCKS5H URLs; optional username/password;
-  remote DNS by default.
-- **Ctrl+V URL paste:** copy a link anywhere, press Ctrl+V in NDM, and the Add
-  Download dialog opens prefilled. Spotify links open the spotDL dialog instead.
-  Focused text fields retain normal clipboard paste behavior.
-- **Desktop preferences:** connection and concurrency limits, destination folders,
-  capture options, and audio settings.
-- **Files stay local:** completed files open in your desktop applications.
-  The offline-audio dialog lists your music/download folders and exports M3U
-  playlists. It does not run an audio streaming server.
+- **Resumable downloads.** Persistent queue, up to eight HTTP range connections
+  per file, configurable concurrency, shared speed limits, and single-connection
+  fallback when a server does not support ranges.
+- **Native desktop.** An IDM-style layout with menus, a toolbar, category tree,
+  sortable download table, progress details, and light/dark themes with semantic
+  color customization.
+- **Web frontend.** Live queue updates, search and category filters, download
+  controls, dialogs, settings, browser handoff approvals, and password login.
+  HTMX and Alpine.js are bundled locally; no CDN or JavaScript build step is needed.
+- **Media downloads.** yt-dlp integration, desktop media inspection and format
+  selection, and FFmpeg-based conversion and merging.
+- **Spotify links.** Expand public tracks, albums, and playlists with spotDL;
+  match an available audio source, download it through NDM, and write metadata.
+- **Browser integration.** Firefox and Chromium-family extensions for file
+  handoff and YouTube/Spotify page grabs through native messaging.
+- **Optional browser cookies and proxies.** Select a local browser cookie store
+  and configure HTTP, HTTPS, SOCKS5, or SOCKS5H proxy transport.
+- **Background operation.** Authenticated local daemon IPC, SQLite persistence,
+  opt-in link-inbox capture, and sign-in service installation on Linux and macOS.
 
-### Spotify boundary
+## Requirements
 
-NDM integrates [spotDL](https://github.com/spotdl/spotify-downloader), **not a
-Spotify protected-stream ripper**. Spotify supplies track metadata; spotDL finds
-a corresponding public audio source, normally YouTube Music. The matched
-recording may differ, may be unavailable, or may fail. This is not Spotify
-Premium offline caching and does not defeat DRM. Use it only for content you own
-or have permission to save, subject to the source's terms.
+| Component | Requirement |
+| --- | --- |
+| Python | 3.11–3.15 |
+| Package manager | [uv](https://docs.astral.sh/uv/) recommended; pip is also supported |
+| Desktop | A graphical session supported by Nexa UI; Linux requires working display/OpenGL libraries |
+| Media processing | FFmpeg on `PATH` for conversion and merging |
+| Some YouTube sources | A supported JavaScript runtime, such as Deno |
 
-No spotDL web UI is launched. NDM imports spotDL's metadata/matching API to
-select the source, then downloads that source through NDM's own yt-dlp pipeline.
-spotDL's own web dependencies remain installed as part of the upstream package,
-but NDM never starts them.
+The web frontend does not need a desktop window. Native platform integrations
+and browser-cookie access depend on the operating system and local environment.
+Windows and macOS integrations should be verified on the target platform.
 
-## Install and run
-
-Python **3.11–3.15** and a normal desktop session are required. Nexa is a native
-UI library, so its window cannot be hosted as a browser preview.
+## Quick start
 
 ```bash
+git clone https://github.com/x017/ndm.git
+cd ndm
 uv sync
-uv run ndm                 # opens the desktop and starts its daemon if needed
 
-# Or, without uv:
+# Open the native desktop; start the daemon if needed.
+uv run ndm
+```
+
+To use the web interface instead:
+
+```bash
+uv run ndm web
+```
+
+Open **http://127.0.0.1:8765**. The default username is `admin`; if no password
+is configured, NDM generates one and prints it in the terminal.
+
+Alternatively, install into a Python environment with pip:
+
+```bash
 python -m pip install -e .
-ndm
-```
-
-Install **FFmpeg** on your PATH for converting spotDL matches, yt-dlp merging,
-and Media Grabber MP3 conversion. Without FFmpeg the MP3 checkbox is disabled
-and the daemon rejects audio-extraction requests with an actionable error.
-Nexa bundles its native UI runtime in the `nexa-ui` package. Linux desktops also
-need working OpenGL/display libraries.
-
-### Commands
-
-```bash
 ndm desktop
-ndm daemon                           # local IPC only; no TCP port
-ndm add https://example.org/file.zip --filename file.zip
-ndm status                           # JSON queue snapshot
-ndm pause <task-id>
-ndm resume <task-id>
-ndm remove <task-id>                 # keeps completed files
-ndm spotify https://open.spotify.com/playlist/...
-ndm logs                             # read the failure log after an error
-ndm logs --path                      # print only the log file location
-ndm doctor                           # test Spotify/YouTube reachability + tools
-ndm match-check <spotify-url>        # compare NDM vs spotDL matching (no download)
-ndm extension install --browser chrome   # register Firefox/Chrome/Chromium/Brave/Edge host
-ndm extension doctor --browser chrome    # test the actual native-host launch
-ndm config cookie_browser chrome         # select local browser cookies (or none)
-ndm stop                             # stop the background daemon
 ```
 
-All commands accept `--data-dir PATH`. `NDM_HOME` sets the default state folder.
-Multiple independent data directories can run separate daemons.
+> Use the branch containing the features you need. If your checkout predates the
+> web frontend, update that branch before running `ndm web`.
 
-For public-only operation, `ndm daemon --block-private` rejects local/private
-network targets. Local destinations are allowed by default for a desktop tool;
-only add URLs you trust. Credentials embedded in URLs are rejected.
+## Web UI
 
-### Start at sign-in
+### Login and network access
+
+Set credentials before starting the web server. For example, in a POSIX shell:
 
 ```bash
-ndm service install --start          # Linux systemd user service / macOS LaunchAgent
-ndm service uninstall
+export NDM_WEB_USERNAME=admin
+read -rs -p "NDM web password: " NDM_WEB_PASSWORD; echo
+export NDM_WEB_PASSWORD
+uv run ndm web
 ```
 
-Linux unattended operation without a logged-in session may additionally require
-`loginctl enable-linger "$USER"`. On Windows, create a per-user Task Scheduler
-task running `ndm.exe daemon --data-dir "C:\your\state\folder"`.
+On PowerShell:
 
-Closing the desktop window is not the same as `ndm stop`: the daemon continues.
-Use **File → Stop daemon and exit** when you want both to stop.
-
-## Proxy and appearance
-
-Open **Options → Proxy**, enable the proxy, enter a URL such as
-`http://proxy.local:8080` or `socks5://127.0.0.1:1080`, optionally add credentials,
-and click **OK**. SOCKS5 remote DNS (`socks5h`) is the default; disable it only when
-the proxy cannot resolve hostnames. An enabled NDM proxy overrides ambient proxy
-environment variables. Proxy passwords are stored in the local NDM state directory
-and masked in the UI/CLI status output; protect that directory like other secrets.
-The status bar shows the active proxy without credentials.
-
-Open **Options → Appearance** for the full palette. Valid color edits apply
-immediately; incomplete hex text stays editable without being saved. Picker edits
-preserve an existing alpha value. **Reset** beside a row restores that token and
-**Reset palette** restores the base theme. The base accent presets remain
-available for a quick starting point.
-
-## Using automatic media capture
-
-Open **Options → Capture**. Capture is off by default.
-
-1. Enable automatic capture.
-2. Optionally set an allowed-host list.
-3. Enable the inbox watcher for background operation.
-4. Put a `.txt` file containing an HTTP(S) media URL, or an Internet Shortcut
-   `.url` file, into the inbox directory shown in Options.
-
-Example `.url` file:
-
-```ini
-[InternetShortcut]
-URL=https://example.org/media/video.mp4
+```powershell
+$env:NDM_WEB_USERNAME = "admin"
+# Omit NDM_WEB_PASSWORD to generate a random password at startup.
+uv run ndm web
 ```
 
-The daemon marks processed files `.processed`. Spotify inbox links are rejected;
-use the Spotify dialog or CLI so the spotDL metadata/matching path is explicit.
-Clipboard monitoring requires the open desktop window and only captures direct
-media extensions. Browser interception is a separate opt-in integration; see
-[extension/README.md](extension/README.md) for Firefox and Chrome setup.
+| Variable / option | Default | Purpose |
+| --- | --- | --- |
+| `NDM_WEB_USERNAME` | `admin` | Login username |
+| `NDM_WEB_PASSWORD` | Generated at startup | Login password |
+| `--host` | `127.0.0.1` | Listening address |
+| `--port` | `8765` | HTTP port |
+| `--data-dir` | `NDM_HOME` or the default state directory | Queue and daemon to manage |
+
+For access from another device:
+
+```bash
+uv run ndm web --host 0.0.0.0 --port 8765
+```
+
+**Network access is opt-in.** Use a trusted network, restrict access with a
+firewall, and place remote deployments behind an HTTPS reverse proxy. The web
+server does not provide TLS itself. Treat access to it as access to a download
+manager running under your operating-system account.
+
+Login uses an HttpOnly, SameSite session cookie. Login forms and application
+writes require CSRF tokens; these checks support reverse proxies that rewrite
+the backend host header. Restarting the web server invalidates existing sessions.
+When no password is configured, it also generates a new password.
+
+### Desktop and web capabilities
+
+Both interfaces control the same queue when using the same data directory.
+
+| Capability | Desktop | Web |
+| --- | --- | --- |
+| Queue, progress, search, and categories | Yes | Yes |
+| Add URL, resume, pause, and remove | Yes | Yes |
+| Media downloads | Inspection and format selection | URL and quality selection |
+| Spotify links | Preview and select tracks | Queue all returned tracks |
+| Browser handoff approvals | Yes | Yes |
+| Connection, proxy, folder, cookie, and Spotify settings | Yes | Yes |
+| Appearance | Full semantic palette | Browser-local dark mode |
+| Clipboard capture, OS file dialogs, and open-file actions | Native integrations | Not ported |
+
+The web queue refreshes every two seconds. Download paths and cookie stores
+belong to the **machine running NDM**, not the device viewing the web page.
+
+## Command-line usage
+
+All examples use `uv run`; after a pip installation, use `ndm` directly.
+
+```bash
+uv run ndm desktop
+uv run ndm web
+uv run ndm daemon                  # Headless engine; authenticated local IPC only
+uv run ndm add https://example.org/file.zip --filename file.zip
+uv run ndm add https://example.org/file.zip --paused
+uv run ndm status                  # Queue snapshot as JSON
+uv run ndm pause <task-id>
+uv run ndm resume <task-id>
+uv run ndm remove <task-id>         # Keeps completed files
+uv run ndm spotify <spotify-url>
+uv run ndm config --list
+uv run ndm logs --lines 80
+uv run ndm doctor
+uv run ndm stop                    # Stops the daemon
+```
+
+Run `uv run ndm --help` or `uv run ndm <command> --help` for available options.
+All commands accept `--data-dir PATH`; `NDM_HOME` sets the default state directory.
+Separate data directories allow independent queues and daemons.
+
+Closing the desktop, closing a browser tab, or stopping the web frontend does
+not stop the daemon. Use `uv run ndm stop` to stop the background engine.
+
+### Start the daemon at sign-in
+
+```bash
+uv run ndm service install --start   # Linux systemd user service / macOS LaunchAgent
+uv run ndm service uninstall
+```
+
+Linux unattended operation may also require `loginctl enable-linger "$USER"`.
+On Windows, use a per-user Task Scheduler task to run `ndm daemon` with the
+appropriate data directory. These services start the daemon, not the web server.
+
+## Browser integration
+
+The repository includes a Firefox extension and a Chromium Manifest V3 extension
+for Chrome, Chromium, Brave, and Edge.
+
+```bash
+uv run ndm extension install --browser chrome
+uv run ndm config browser_integration true
+uv run ndm extension doctor --browser chrome
+```
+
+Replace `chrome` with `firefox`, `chromium`, `brave`, or `edge`; use `all` to
+register all supported native hosts.
+
+Load `extension/chrome/` as an unpacked extension in your Chromium browser, or
+load `extension/firefox/manifest.json` through Firefox's temporary add-on loader.
+Registration alone does not load the extension. See the
+[browser extension guide](extension/README.md) for platform-specific instructions.
+
+- **File handoff:** asks for approval by default. The extension cancels the
+  browser download only after NDM accepts it; unsupported `blob:` and `data:`
+  downloads remain in the browser.
+- **Page grabs:** send supported YouTube video or Spotify track, album, and
+  playlist pages into NDM's existing media pipelines. Page grabs always ask.
+- **Transport:** extensions use native messaging, not the web frontend. The
+  optional web server is not required for browser integration.
+
+## Configuration
+
+### Folders and download behavior
+
+Use **Options** in the desktop or web interface to configure destination folders,
+concurrency, connections per file, and speed limits. Direct downloads default to
+`~/Downloads/NDM`, organized by category. Music has a separate configurable folder.
+
+Segmented downloads and persistent resume depend on server support. NDM validates
+ETag/Last-Modified information and restarts changed remote files rather than
+combining incompatible bytes. Downloads use partial files before completion.
+
+### Proxies
+
+Configure **Options → Proxy**, or set the URL before enabling the proxy:
+
+```bash
+uv run ndm config proxy_url socks5://127.0.0.1:1080
+uv run ndm config proxy_enabled true
+```
+
+HTTP, HTTPS, SOCKS5, and SOCKS5H are supported, with optional credentials. Remote
+DNS is enabled by default. An enabled NDM proxy overrides ambient proxy settings.
+Proxy credentials are stored in local settings; protect the state directory.
 
 ### Browser cookies
 
-Open **Options → Capture → Use cookies from**, select the browser where you are
-signed in, and click **OK**. Choices are Off, Firefox, Chrome, Chromium, Brave,
-Edge, Vivaldi, Opera, and Safari. The setting is `cookie_browser` (default
-`none`):
+Select **Options → Capture → Use cookies from**, or use the CLI:
 
 ```bash
 uv run ndm config cookie_browser chrome
@@ -186,281 +239,158 @@ uv run ndm config cookie_browser firefox
 uv run ndm config cookie_browser none
 ```
 
-This works independently of automatic capture and browser handoff: manual
-downloads, Media Grabber inspection, and Spotify matching can use an existing
-browser login even when inbox/clipboard capture is off. The older
-`firefox_cookies=true` setting is still accepted and maps to
-`cookie_browser=firefox`; an explicit browser selection takes precedence.
+Supported choices are `none`, `firefox`, `chrome`, `chromium`, `brave`, `edge`,
+`vivaldi`, `opera`, and `safari`. Availability depends on the platform, browser
+profile, and keyring access. Chromium-family browsers may need to be closed
+before their cookie store can be read.
 
-NDM reads a fresh cookie snapshot locally for each new HTTP download, HTML
-inspection, yt-dlp operation, spotDL YouTube Music match, or transfer of a
-matched audio source. Only cookies matching the destination's domain, path, and
-security rules are sent. Cookie values are not saved in NDM settings, queue
-entries, or an export file. Select **Off** to stop reading cookies for new
-operations.
+Cookies are opt-in and independent of automatic capture. They can be used for
+downloads, media inspection, and YouTube Music matching. Cookie values are not
+persisted in NDM settings or exported to a cookie file; destination matching
+controls which cookies are sent. The legacy `firefox_cookies` setting remains
+supported, but an explicit `cookie_browser` selection takes precedence.
 
-Chromium-family cookie stores may require a keyring unlock and, on some systems,
-the browser to be fully closed. If no readable profile is available, NDM shows
-an actionable error without exposing profile paths or cookie values. Cookies do
-not bypass DRM or authorize an account. Spotify metadata still uses spotDL's
-normal anonymous/official API credentials; browser cookies apply to YouTube
-Music matching and the matched-audio transfer, not Spotify protected audio.
+Cookies do not bypass DRM, and Spotify browser cookies are not used to extract
+Spotify's protected audio.
 
-### Browser extensions and page grabs
+### Automatic capture
 
-The checkout ships `extension/firefox/` and `extension/chrome/`. They can hand
-ordinary downloads to NDM and grab the current YouTube/Spotify page. File
-handoff asks in the app by default and cancels the browser copy only after NDM
-accepts; a closed/refusing NDM leaves the browser download intact. Page grabs
-always ask and reuse the existing media pipelines.
+Desktop **Options → Capture** provides opt-in clipboard capture while the window
+is open and link-inbox watching in the background. An optional host allowlist
+restricts capture. The inbox accepts text files containing HTTP(S) media URLs
+and Internet Shortcut files:
 
-```bash
-uv run ndm extension install --browser firefox   # or chrome/chromium/brave/edge/all
-uv run ndm config browser_integration true
-uv run ndm extension doctor --browser firefox
+```ini
+[InternetShortcut]
+URL=https://example.org/media/video.mp4
 ```
 
-Load the matching extension folder as described in
-[extension/README.md](extension/README.md). The extensions use native messaging;
-NDM still opens no HTTP listener.
+Processed inbox files receive a `.processed` suffix. Use the Spotify dialog or
+CLI for Spotify links rather than the inbox.
 
-## Using the Media Grabber
+## Media and Spotify
 
-1. Click **Grabber** on the toolbar (or paste a media URL with Ctrl+V and open
-   the grabber).
-2. Enter a page URL, a direct media link, or a yt-dlp-supported site URL and
-   click **Find Media**.
-3. Each result row shows the format quality, file size, and a note. Sizes are
-   exact when the source reports a byte count, prefixed with `~` when estimated
-   (extractor approximation, duration × bitrate, or a 192 kbps MP3 projection),
-   and shown as **Unknown** when the server provides no length. HEAD and
-   one-byte ranged GET probes fill in sizes for direct and page-scanned links
-   without downloading the body.
-4. Optionally check **Convert to MP3** to extract audio at 192 kbps instead of
-   saving the original video. This requires FFmpeg on PATH; the checkbox is
-   disabled and the daemon refuses the request when FFmpeg is missing. MP3 and
-   video downloads of the same URL are queued as separate tasks.
-5. Click **Download** (or **Download MP3**) to queue the item. The background
-   daemon handles extraction/conversion; the Size column and Properties dialog
-   show the estimate until the real file size is known at completion.
+In the desktop **Grabber**, inspect a supported page or direct-media URL, review
+available formats, and queue a download. FFmpeg is required for audio conversion
+and merging; the desktop also offers MP3 extraction at 192 kbps. File sizes may
+be estimates until the transfer completes.
 
-Protected streams and DRM are never bypassed. Spotify links are redirected to
-the spotDL dialog instead. The browser extensions' page-grab button sends
-YouTube/Spotify links into this same approval/queue flow.
+The desktop **Spotify** dialog previews tracks and supports queueing a selection.
+The web Spotify form queues all returned tracks. Public metadata access and
+audio-source availability depend on region and upstream services.
 
-## Using spotDL
+**NDM does not download Spotify's protected streams or bypass DRM.** Spotify
+provides metadata; spotDL matches a corresponding public source, usually YouTube
+Music. The recording may differ from the original or be unavailable. This is
+not Spotify Premium offline caching, and output conversion cannot improve the
+source's audio quality. Save only content you own or have permission to download,
+subject to applicable law and service terms.
 
-1. Click **Spotify** on the toolbar.
-2. Paste a public `open.spotify.com` track, album, or playlist URL (Ctrl+V also
-   opens this dialog automatically when the clipboard contains a Spotify link).
-3. Click **Find Tracks**. Titles, artists, albums, and durations appear in the
-   table as each Spotify page is read, so you can review or queue tracks while
-   the rest of a long playlist is still loading. The heading shows the live
-   count and the playlist/album title when available. Previews are capped at
-   500 tracks, with a warning when the list is longer.
-4. Select rows and click **Queue Selected**.
-
-The daemon processes tracks using its normal concurrency limit. spotDL selects
-the YouTube Music match, then NDM's yt-dlp pipeline performs the transfer and
-FFmpeg conversion. Rows show matching, byte-level download progress, transfer
-speed/ETA while transferring, converting, and tagging. The Size column starts
-with a `~` estimate from track duration and the selected lossy bitrate. FLAC,
-`auto`, and `disable` have no final-size estimate, so active rows show
-`Estimating` or a `~` source-transfer length instead of `Unknown`; the real
-saved-file size replaces it at completion. Properties also shows the matched
-source URL and transfer size. Stop is cooperative: matching or a
-conversion may finish before the track pauses. A paused/failed spotDL task
-starts the operation again; yt-dlp resume applies to the matched source, not to
-Spotify.
-
-NDM can also do the YouTube Music matching itself (`Options → Source matcher`).
-It calls `ytmusicapi` directly and scores candidates on normalized title,
-artists, duration, album, and verified status, penalizing versions you did not
-ask for (live, cover, sped up, karaoke). An ISRC hit short-circuits the search.
-Every candidate and its score is written to the diagnostics log.
-
-**spotDL remains the default matcher** because its scoring has more real-world
-tuning. Compare them on your own music before switching:
+spotDL is the default source matcher. An experimental NDM matcher can be compared
+without downloading audio:
 
 ```bash
-ndm match-check https://open.spotify.com/playlist/... --limit 10
+uv run ndm match-check <spotify-url> --limit 10
 ```
 
-That prints both choices per track and counts agreements/differences without
-downloading anything. Open the differing links, listen, then switch to
-`NDM (experimental)` in Options if you prefer its picks.
+If a source requires JavaScript execution, install Deno on `PATH` or use
+`spotdl --download-deno`. NDM reuses that local runtime. NDM does not launch
+spotDL's web interface or request a Spotify account password. Upstream Spotify
+API credentials, when needed, can be supplied through `SPOTIPY_CLIENT_ID` and
+`SPOTIPY_CLIENT_SECRET`.
 
-NDM writes the tags itself (`Options → Tag writer → NDM`). Only fields that
-actually have a value are written, so a track with no ISRC, label, or release
-date tags cleanly instead of failing after the audio was saved. Cover art is
-fetched through your proxy, and a cover that cannot be downloaded is logged and
-skipped rather than failing the track. Choose `spotDL (legacy)` to use upstream's
-embedder instead. NDM uses standard Vorbis `publisher`/`website` comments (spotDL
-used `encodedby`/`woas`) and the `com.apple.iTunes` M4A atoms that other tag
-editors read.
+## Security and local data
 
-Output defaults to MP3 at 192 kbps. `auto`/`disable` leave the bitrate to
-yt-dlp/FFmpeg defaults; a higher output bitrate does not improve source quality.
-Public metadata access and YouTube Music availability depend on region and
-upstream services. Some YouTube sources also need a JavaScript runtime: install
-Deno system-wide, or run `spotdl --download-deno` once; NDM reuses that local
-Deno for both matching and the matched-source transfer. NDM does not request
-Spotify account passwords or launch an OAuth web server. Advanced users can set
-`SPOTIPY_CLIENT_ID` and `SPOTIPY_CLIENT_SECRET` for their own official Spotify API
-application before launching NDM; default spotDL metadata access needs no login.
+- State defaults to `~/.local/share/ndm`; override it with `NDM_HOME` or `--data-dir`.
+- The daemon uses authenticated Unix domain sockets or Windows named pipes. Only
+  the explicit `web` command opens an HTTP listener.
+- Private/local download targets are allowed by default. To reject them, start
+  the daemon with `uv run ndm daemon --block-private` before connecting a frontend.
+- URLs with embedded credentials are rejected. Add only URLs you trust.
+- Protect the state directory, IPC key, web credentials, proxy credentials, and
+  downloaded files. Redaction in diagnostic output is not a substitute for
+  operating-system access controls.
+- Downloaded content is not guaranteed safe. NDM is not a malware scanner.
 
-### When a download fails
+## Troubleshooting
 
-Failures are recorded in a rotating log at `NDM_HOME/logs/ndm.log` (default
-`~/.local/share/ndm/logs/ndm.log`, 2 MB × 3 backups). Three ways to read it:
+| Problem | Recommended action |
+| --- | --- |
+| `invalid choice: 'web'` | Update the branch containing the web frontend, then run `uv sync`. |
+| Login fails | Check the current startup password or configured environment variables. Refresh the login page after restarting the server. |
+| Stale login form or CSRF error | Reload the page to obtain the current server token. Update older versions that reject proxy origins. |
+| Conversion or merging fails | Install FFmpeg and verify it is on the daemon's `PATH`. |
+| YouTube sign-in or bot check | Select the local browser where you are signed in; inspect the diagnostic log. Cookies are not a guaranteed workaround. |
+| Cookie store cannot be read | Check profile/keyring access and try closing the browser. |
+| Extension cannot reach NDM | Run `uv run ndm extension doctor --browser <browser>` and check that the extension is loaded. |
+| Download or Spotify matching fails | Run `uv run ndm logs` and `uv run ndm doctor`; check proxy, DNS, runtime availability, and upstream restrictions. |
+| Settings differ between interfaces | Ensure both use the same `NDM_HOME` or `--data-dir`. |
 
-- **Tools → Diagnostics…** in the desktop, or **Diagnostics** in a failed row's
-  Properties. It shows the log tail, resolved `ffmpeg`/`ffprobe`/`deno` paths,
-  library versions, and a **Test connection** button that probes
-  `open.spotify.com`, `music.youtube.com`, and `www.youtube.com` through your
-  configured proxy.
-- `ndm logs` (works even when the daemon is stopped) and `ndm doctor`.
-- Open the log file directly.
-
-The queue row itself leads with an actionable cause — DNS, proxy, TLS
-interception, rate limiting, a YouTube sign-in/bot check, a missing JavaScript
-runtime, or missing FFmpeg — followed by the upstream message. Full upstream
-detail (yt-dlp warnings, the exception chain, and a traceback) goes to the log,
-tagged with the task id so a single track can be traced.
-
-Set `NDM_DEBUG=1` for verbose yt-dlp/spotDL output, including each retried
-request:
+Useful diagnostics:
 
 ```bash
-ndm stop
-NDM_DEBUG=1 ndm daemon               # verbose; then retry the track
+uv run ndm logs --path
+uv run ndm logs --lines 100
+uv run ndm logs --match --lines 40
+uv run ndm doctor
 ```
 
-`ndm doctor` probes each host on **both** HTTP stacks NDM uses, because they do
-not treat `socks5://` the same way: httpx always sends the hostname to the proxy,
-while requests (spotDL's YouTube Music client) resolves it locally first. With
-**remote DNS off**, a censored or poisoned local resolver can therefore break
-matching while the httpx probes still return HTTP 200. If matching times out
-through a SOCKS proxy, enable **Options → Network → remote DNS** so the proxy
-resolves hostnames (`socks5h://`).
+Logs are stored at `<data-dir>/logs/ndm.log`. Desktop users can also open
+**Tools → Diagnostics**. Before sharing logs or filing an issue, review them for
+personal URLs, file paths, and other sensitive information.
 
-Proxy passwords, proxy usernames, `Cookie`/`Set-Cookie` values, and
-`Authorization` headers are redacted before anything is written or displayed,
-so the log is safe to share when reporting a problem.
-
-## Data and security
-
-- Queue/settings/events: SQLite under `NDM_HOME` (default `~/.local/share/ndm`).
-- Diagnostics: `NDM_HOME/logs/ndm.log`, rotating, with credentials and cookie
-  values redacted before writing.
-- Downloads: `~/Downloads/NDM`, split by category, configurable in Options.
-- A store lock prevents two daemons from owning the same state directory.
-- IPC uses a 32-byte private challenge key in `ipc.key`; the POSIX socket is
-  owner-only. Windows uses a per-state-directory named pipe. There is no CORS,
-  browser token, public bind address, or listening web port.
-- HTTP redirects are revalidated. Direct downloads write `.part` files before
-  atomically renaming the completed result.
-- Browser cookies are opt-in per selected browser, read locally, kept in memory,
-  and matched to the request destination, including spotDL's YouTube Music
-  clients. NDM does not persist cookie values or transmit them to an NDM server.
-  Upstream temporary database copies are removed after reading.
-- spotDL's upstream metadata cache is stored by spotDL in its usual per-user
-  config directory. Matched audio transfers use NDM's destination folder and
-  yt-dlp partial files, not spotDL's downloader temp directory.
-
-## Development and verification
+## Development
 
 ```bash
-uv sync
-uv run pytest
-uv run ruff check .
+uv sync --extra dev
+uv run pytest tests/test_web.py
+uv run pytest tests
+uv run ruff check src tests
+node --test tests/extension_runtime.test.cjs
 uv lock --check
 uv build --wheel
 ```
 
-The test suite uses local HTTP **test fixtures only**; the application itself has
-no HTTP server. Native IPC, real-file integrity, pause/resume across daemon
-restart, validator invalidation, capture opt-in, settings validation, media
-extraction, spotDL adapter/queue controls, proxy transport wiring, full-palette
-rendering, and global Ctrl+V routing are covered. Tests do not contact
-Spotify or download copyrighted audio.
-
-Run `ndm` or `ndm desktop` in a desktop session on your own machine. The desktop
-command opens the native window directly; it has no screenshot/headless mode.
-
-### Layout
+Node.js is needed for the extension runtime tests, not for running NDM or its
+web frontend. Some media tests depend on external tools or upstream behavior;
+report environment details alongside failures. A passing local suite does not
+guarantee availability of third-party providers.
 
 ```text
 src/ndm/
-  desktop.py      native Nexa menus, toolbar, tree, tables, dialogs
-  daemon.py       headless queue owner and validated local commands
-  ipc.py          Unix socket / Windows pipe transport
-  engine.py       segmented HTTP, queue, resume, capture, media workers
-  spotify.py      spotDL metadata/matching adapter; NDM owns the transfer
-  media.py        direct media/HTML inspection and yt-dlp
-  models.py       validated settings, colors, proxy URLs, and URL rules
-  network.py      shared proxy configuration and opt-in browser cookies
-  browser_host.py native-messaging stdio helper (no HTTP listener)
-  extension.py    per-browser host registration and doctor
-  store.py        SQLite persistence and exclusive state ownership
-  cli.py          native desktop, daemon, queue and service commands
+├── cli.py              Command-line entry points
+├── desktop.py          Native Nexa UI frontend
+├── web/                HTMX/Alpine frontend and authenticated HTTP adapter
+├── daemon.py           Shared background service and command validation
+├── ipc.py              Authenticated local transport
+├── engine.py           Queue, segmented transfers, resume, and workers
+├── media.py            Media inspection and yt-dlp integration
+├── spotify.py          spotDL metadata and source matching
+├── network.py          Proxy and browser-cookie configuration
+├── models.py           Validated settings and request models
+├── store.py            SQLite persistence
+├── browser_host.py     Native-messaging host
+└── extension.py        Per-browser host registration and diagnostics
+extension/              Firefox and Chromium extensions
+tests/                  Python and JavaScript tests
 ```
 
-## Current limits
+When contributing, keep desktop and web operations on the shared daemon, validate
+new request payloads, add regression tests, and document platform limitations.
+Report bugs and propose changes through the repository's
+[issues](https://github.com/x017/ndm/issues) and pull requests.
 
-- Native Windows/macOS/Linux sessions are the target. Linux rendering has been
-  exercised here through Nexa's headless software renderer; Windows named pipes
-  and macOS services are implemented but require testing on those systems.
-- No scheduler, torrent protocol, system tray, or browser interception.
-- A server must support byte ranges for segmented resume. Changed remote files
-  are restarted rather than mixing incompatible bytes.
-- spotDL is a metadata-to-source matcher, not guaranteed lossless or exact-track
-  reproduction. Provider failures are shown in the row's Properties dialog.
-- No Spotify DRM circumvention, protected-stream extraction, or Premium offline
-  export is provided.
+## Limitations
 
-## License
+NDM does not currently provide torrents, scheduled downloads, a system tray, an
+audio streaming service, or complete desktop/web feature parity. Media extraction
+and Spotify matching rely on third-party services and may break as those services
+change. Browser extensions loaded in development mode may require reloading after
+browser restarts or updates.
 
-MIT for NDM. Nexa, spotDL, yt-dlp, and their dependencies retain their own
-licenses. The upstream spotDL project is MIT-licensed.
+## Licensing
 
-## Web UI (HTMX + Alpine.js)
-
-The optional web frontend mirrors the Nexa desktop layout: download sidebar,
-searchable live table, progress bars, selection, resume/stop/delete toolbar,
-Add URL, Spotify, Media Grabber, browser handoff approvals, and tabbed options.
-It is a separate frontend to the **same native daemon**, not a second engine.
-The desktop and web UI can be used together with the same `--data-dir`.
-
-```bash
-uv run ndm web                     # http://127.0.0.1:8765
-uv run ndm web --port 9000
-# Deliberately expose to a trusted network / HTTPS reverse proxy:
-uv run ndm web --host 0.0.0.0 --port 8765
-```
-
-Open the normal web URL and sign in with a username and password. Configure them
-with `NDM_WEB_USERNAME` (default `admin`) and `NDM_WEB_PASSWORD` environment
-variables before starting the server. If no password is configured, NDM generates
-a random password and prints it in the terminal. Restarting invalidates sessions.
-Network deployments should use HTTPS and firewall access appropriately.
-The daemon itself still uses authenticated local IPC and does not listen on TCP.
-Write requests also require a session-specific CSRF header. Login forms carry a
-hidden CSRF token. These checks support reverse proxies that rewrite Host without
-trusting arbitrary forwarded headers.
-
-HTMX 2.0.4 and Alpine.js 3.14.9 are bundled locally: no CDN, JavaScript build step,
-or additional Python dependencies. The semantic Nexa surfaces, buttons, inputs,
-selects, tabs, dialogs, badges, progress bars, and table selection are implemented
-in HTML/CSS rather than trying to run the native renderer in the browser. Use the
-moon button for browser-local dark mode. The queue refreshes every two seconds.
-
-Files and cookies belong to the **machine running NDM**, not the visiting browser.
-Spotify currently queues all tracks from the supplied public link; the desktop's
-track picker and media format inspector are not yet ported. Native clipboard
-watching, OS file dialogs/open-file actions, and desktop notifications remain
-native-only. The web settings expose connection, proxy, folders, browser capture,
-cookies, and Spotify settings; they do not change browser-extension registration.
-
-Frontend source: `src/ndm/web/`. Adapter and security tests:
-`python -m pytest tests/test_web.py`.
+NDM is described as MIT-licensed in the project's existing documentation; this
+checkout does not yet include a standalone `LICENSE` file. Third-party components,
+including Nexa UI, yt-dlp, spotDL, HTMX, and Alpine.js, retain their respective
+licenses. Bundled web-library license notices are in `src/ndm/web/static/`.
