@@ -92,6 +92,10 @@ def main(argv: list[str] | None = None) -> None:
 
     desktop = sub.add_parser("desktop", help="Open the native desktop; start the local daemon if needed")
     common(desktop)
+    web = sub.add_parser("web", help="Open the HTMX/Alpine browser frontend to the local daemon")
+    common(web)
+    web.add_argument("--host", default="127.0.0.1", help="Bind address; use 0.0.0.0 for network access")
+    web.add_argument("--port", type=int, default=8765)
     daemon = sub.add_parser("daemon", help="Run the background engine with local IPC; no web server")
     common(daemon)
     daemon.add_argument("--block-private", action="store_true", help="Reject private/local-network download targets")
@@ -149,6 +153,9 @@ def main(argv: list[str] | None = None) -> None:
         if command == "daemon":
             from .daemon import run_daemon
             run_daemon(data_dir=data_dir, allow_private=not args.block_private)
+        elif command == "web":
+            from .web import run
+            run(data_dir, host=args.host, port=args.port)
         elif command == "desktop":
             from .desktop import Desktop
             Desktop(data_dir=data_dir).run()

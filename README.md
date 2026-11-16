@@ -423,3 +423,42 @@ src/ndm/
 
 MIT for NDM. Nexa, spotDL, yt-dlp, and their dependencies retain their own
 licenses. The upstream spotDL project is MIT-licensed.
+
+## Web UI (HTMX + Alpine.js)
+
+The optional web frontend mirrors the Nexa desktop layout: download sidebar,
+searchable live table, progress bars, selection, resume/stop/delete toolbar,
+Add URL, Spotify, Media Grabber, browser handoff approvals, and tabbed options.
+It is a separate frontend to the **same native daemon**, not a second engine.
+The desktop and web UI can be used together with the same `--data-dir`.
+
+```bash
+uv run ndm web                     # http://127.0.0.1:8765
+uv run ndm web --port 9000
+# Deliberately expose to a trusted network / HTTPS reverse proxy:
+uv run ndm web --host 0.0.0.0 --port 8765
+```
+
+Open the normal web URL and sign in with a username and password. Configure them
+with `NDM_WEB_USERNAME` (default `admin`) and `NDM_WEB_PASSWORD` environment
+variables before starting the server. If no password is configured, NDM generates
+a random password and prints it in the terminal. Restarting invalidates sessions.
+Network deployments should use HTTPS and firewall access appropriately.
+The daemon itself still uses authenticated local IPC and does not listen on TCP.
+Write requests also require a session-specific CSRF header and same-origin checks.
+
+HTMX 2.0.4 and Alpine.js 3.14.9 are bundled locally: no CDN, JavaScript build step,
+or additional Python dependencies. The semantic Nexa surfaces, buttons, inputs,
+selects, tabs, dialogs, badges, progress bars, and table selection are implemented
+in HTML/CSS rather than trying to run the native renderer in the browser. Use the
+moon button for browser-local dark mode. The queue refreshes every two seconds.
+
+Files and cookies belong to the **machine running NDM**, not the visiting browser.
+Spotify currently queues all tracks from the supplied public link; the desktop's
+track picker and media format inspector are not yet ported. Native clipboard
+watching, OS file dialogs/open-file actions, and desktop notifications remain
+native-only. The web settings expose connection, proxy, folders, browser capture,
+cookies, and Spotify settings; they do not change browser-extension registration.
+
+Frontend source: `src/ndm/web/`. Adapter and security tests:
+`python -m pytest tests/test_web.py`.
