@@ -445,7 +445,9 @@ variables before starting the server. If no password is configured, NDM generate
 a random password and prints it in the terminal. Restarting invalidates sessions.
 Network deployments should use HTTPS and firewall access appropriately.
 The daemon itself still uses authenticated local IPC and does not listen on TCP.
-Write requests also require a session-specific CSRF header and same-origin checks.
+Write requests also require a session-specific CSRF header. Login forms carry a
+hidden CSRF token. These checks support reverse proxies that rewrite Host without
+trusting arbitrary forwarded headers.
 
 HTMX 2.0.4 and Alpine.js 3.14.9 are bundled locally: no CDN, JavaScript build step,
 or additional Python dependencies. The semantic Nexa surfaces, buttons, inputs,

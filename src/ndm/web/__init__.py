@@ -61,7 +61,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def login_page(self, error=""):
         from html import escape
-        return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · NDM</title><link rel="stylesheet" href="/static/app.css"></head><body><main style="min-height:100dvh;align-items:center;justify-content:center"><section class="dialog" style="width:400px"><h2>↧ NDM</h2><p class="muted">Sign in to your download manager.</p><form method="post" action="/login"><label>Username<input name="username" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><p class="error" role="alert">' + escape(error) + '</p><button class="primary" style="width:100%">Sign in</button></form></section></main></body></html>'
+        return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · NDM</title><link rel="stylesheet" href="/static/app.css"></head><body><main style="min-height:100dvh;align-items:center;justify-content:center"><section class="dialog" style="width:400px"><h2>↧ NDM</h2><p class="muted">Sign in to your download manager.</p><form method="post" action="/login"><input type="hidden" name="csrf" value="' + self.server.csrf + '"><label>Username<input name="username" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><p class="error" role="alert">' + escape(error) + '</p><button class="primary" style="width:100%">Sign in</button></form></section></main></body></html>'
 
     def do_GET(self):
         route = urlsplit(self.path)
@@ -87,9 +87,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if urlsplit(self.path).path == "/login":
-            origin = self.headers.get("Origin")
-            if origin and urlsplit(origin).netloc != self.headers.get("Host"):
-                return self.send("Forbidden origin", 403)
             now = time.monotonic()
             attempts = [t for t in self.server.login_attempts.get(self.client_address[0], []) if now - t < 60]
             self.server.login_attempts[self.client_address[0]] = attempts
@@ -100,6 +97,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not 0 < length <= 4096:
                     return self.send("Invalid request", 400)
                 values = parse_qs(self.rfile.read(length).decode())
+                if not secrets.compare_digest(values.get("csrf", [""])[0], self.server.csrf):
+                    return self.send(self.login_page("Session expired. Please try again."), 403)
                 valid = secrets.compare_digest(values.get("username", [""])[0].encode(), self.server.username.encode())
                 valid &= secrets.compare_digest(values.get("password", [""])[0].encode(), self.server.password.encode())
             except (ValueError, UnicodeError):
@@ -111,9 +110,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send("", 303, headers={"Location": "/", "Set-Cookie": f"ndm_session={self.server.token}; HttpOnly; SameSite=Strict; Path=/{secure}"})
         if not self.authorized() or not secrets.compare_digest(self.headers.get("X-NDM-CSRF", ""), self.server.csrf):
             return self.send("Forbidden", 403)
-        origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).netloc != self.headers.get("Host"):
-            return self.send("Forbidden origin", 403)
+        # The unguessable CSRF header protects writes even behind a proxy that
+        # rewrites Host. Do not trust forwarded headers or compare backend Host
+        # with the browser's public Origin.
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > 65536:

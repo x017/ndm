@@ -48,9 +48,9 @@ def test_private_login(web):
     server, _ = web
     assert 'name="password"' in fetch(server, auth=False)[2]
     assert fetch(server, '/?token=test-secret', auth=False)[0] == 200
-    assert fetch(server, '/login', 'POST', 'username=admin&password=wrong', auth=False)[0] == 401
+    assert fetch(server, '/login', 'POST', 'username=admin&password=wrong&csrf=' + server.csrf, auth=False)[0] == 401
     from urllib.parse import urlencode
-    status, headers, _ = fetch(server, '/login', 'POST', urlencode({'username': server.username, 'password': server.password}), auth=False)
+    status, headers, _ = fetch(server, '/login', 'POST', urlencode({'username': server.username, 'password': server.password, 'csrf': server.csrf}), auth=False)
     assert status == 303
     assert headers['Location'] == '/'
     assert 'HttpOnly' in headers['Set-Cookie']
@@ -74,7 +74,7 @@ def test_writes_require_session_csrf_and_same_origin(web):
     server, calls = web
     assert fetch(server, '/add', 'POST', 'url=https://example.com', auth=False)[0] == 403
     assert fetch(server, '/add', 'POST', 'url=https://example.com', csrf=False)[0] == 403
-    assert fetch(server, '/add', 'POST', 'url=https://example.com', Origin='https://evil.example')[0] == 403
+    assert fetch(server, '/add', 'POST', 'url=https://example.com', csrf=False, Origin='https://evil.example')[0] == 403
     assert not calls
 
 
@@ -114,3 +114,13 @@ def test_settings_and_dialog_components():
         assert label in html
     assert 'hx-post="/add"' in dialog('add', state)
     assert 'hx-post="/grab"' in dialog('grab', state)
+
+
+def test_proxy_login_requires_csrf_not_backend_host(web):
+    from urllib.parse import urlencode
+    server, _ = web
+    body = urlencode({'username': server.username, 'password': server.password})
+    assert fetch(server, '/login', 'POST', body, auth=False)[0] == 403
+    body += '&csrf=' + server.csrf
+    assert fetch(server, '/login', 'POST', body, auth=False, Origin='https://public.example')[0] == 303
+    assert fetch(server, '/add', 'POST', 'url=https://example.com', Origin='https://public.example')[0] == 200
