@@ -1,2 +1,5 @@
-def main() -> None:
-    print("Hello from ndm!")
+"""NDM — your downloads, in flow."""
+from .cli import main
+
+__version__ = "0.1.0"
+__all__ = ["main", "__version__"]

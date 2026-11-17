@@ -1,19 +1,38 @@
 [project]
 name = "ndm"
 version = "0.1.0"
-description = "Nex Download Manager"
+description = "Native IDM-style download manager built with Nexa UI"
 readme = "README.md"
-authors = [
-    { name = "Parsa", email = "parsam280xyz@gmail.com" }
-]
-requires-python = ">=3.12"
+authors = [{ name = "Parsa", email = "parsam280xyz@gmail.com" }]
+requires-python = ">=3.11,<3.16"
 dependencies = [
-    "nexa-ui",
+    "nexa-ui>=1.4.0,<2",
+    "httpx[socks]>=0.28,<1",
+    "PySocks>=1.7.1,<2",
+    "pydantic>=2.9.2,<3",
+    "yt-dlp>=2026.10.26,<2027",
+    "spotdl>=4.6.0,<5",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.9"]
+tray = ["pystray>=0.19.5,<1", "Pillow>=10,<13"]
 
 [project.scripts]
 ndm = "ndm:main"
 
 [build-system]
-requires = ["uv_build>=0.12.10,<0.13.0"]
+requires = ["uv_build>=0.12.10,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

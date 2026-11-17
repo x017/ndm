@@ -1,0 +1,1813 @@
+"""Native IDM-style desktop application. Real Nexa widgets; no webview or web server."""
+from __future__ import annotations
+
+import os
+import re
+import threading
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import nexa as ui
+
+from .daemon import is_running, start_detached
+from .diagnostics import code_fingerprint, get_logger, log_failure, redact
+from .ipc import request
+from .ipc import stream as ipc_stream
+from .models import (
+    ACCENTS,
+    COOKIE_BROWSERS,
+    CUSTOM_COLOR_KEYS,
+    MEDIA_EXTENSIONS,
+    SETTINGS_SCHEMA_VERSION,
+    Settings,
+    normalize_color,
+)
+from .network import proxy_label, safe_error
+
+log = get_logger("ndm.desktop")
+
+CATEGORY_NAMES = {"all": "All Downloads", "unfinished": "Unfinished", "finished": "Finished",
+                  "archive": "Compressed", "document": "Documents", "audio": "Music",
+                  "video": "Video", "image": "Images", "other": "Other"}
+CATEGORY_ICONS = {"all": ui.Icon.DOWNLOAD, "unfinished": ui.Icon.CLOCK, "finished": ui.Icon.CIRCLE_CHECK,
+                  "archive": ui.Icon.ARCHIVE, "document": ui.Icon.FILE_TEXT, "audio": ui.Icon.MUSIC,
+                  "video": ui.Icon.VIDEO, "image": ui.Icon.IMAGE, "other": ui.Icon.FILE}
+
+
+def format_bytes(value: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < 1024 or unit == "TB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return "0 B"
+
+
+def format_size(size: float, *, estimated: bool = False) -> str:
+    if not size:
+        return "Unknown"
+    return ("~" if estimated else "") + format_bytes(size)
+
+
+def hex_color(color: ui.Color, *, keep_alpha: bool = True) -> str:
+    value = f"#{color.r:02x}{color.g:02x}{color.b:02x}"
+    if keep_alpha and color.a != 255:
+        value += f"{color.a:02x}"
+    return value
+
+
+def mp3_size_estimate(item: dict) -> int:
+    """192 kbps MP3 ≈ 24,000 bytes per second of audio."""
+    try:
+        duration = float(item.get("duration") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return int(duration * 24_000) if duration > 0 else 0
+
+
+def media_size_label(item: dict, *, convert_mp3: bool = False) -> str:
+    if convert_mp3:
+        estimate = mp3_size_estimate(item)
+        return "MP3 " + format_size(estimate, estimated=True) if estimate else "MP3 size unknown"
+    return format_size(item.get("size") or 0, estimated=bool(item.get("size_estimated")))
+
+
+def percent(task: dict) -> float:
+    if task["status"] == "completed":
+        return 100.0
+    if task["source"] == "spotdl":
+        return float(task.get("percent", 0))
+    return min(100.0, task["downloaded"] / task["size"] * 100) if task["size"] else 0.0
+
+
+def size_label(task: dict) -> str:
+    """Prefer the final-file estimate; never leave an active Spotify row as Unknown."""
+    if task["size"]:
+        return format_size(task["size"], estimated=bool(task.get("size_estimated")))
+    if task["source"] == "spotdl":
+        transfer = task.get("transfer_size") or 0
+        if transfer:
+            return format_size(transfer, estimated=True)
+        if task["status"] in {"queued", "downloading"}:
+            return "Estimating"
+        return "—"
+    return format_size(0)
+
+
+def time_left(task: dict) -> str:
+    if task["status"] == "completed":
+        return ""
+    if task["status"] != "downloading":
+        return "—"
+    if task["source"] == "spotdl":
+        if task.get("phase") != "downloading":
+            return "—"
+        total = task.get("transfer_size") or 0
+        remaining = total - task["downloaded"]
+    elif task["source"] == "ytdlp":
+        return "—"
+    else:
+        total = task["size"]
+        remaining = total - task["downloaded"]
+    if not total or not task["speed"]:
+        return "Estimating"
+    seconds = max(0, int(remaining / task["speed"]))
+    return f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
+
+
+def status_text(task: dict) -> str:
+    if task["status"] == "downloading":
+        return {"matching": "Matching", "processing": "Converting", "tagging": "Tagging",
+                "paused": "Stopping"}.get(task.get("phase"), "Downloading")
+    return {"queued": "Queued", "paused": "Stopped", "completed": "Complete", "error": "Error"}.get(task["status"], task["status"])
+
+
+def clip_error(text: str, limit: int) -> str:
+    """Shorten an error for a banner without dropping the trailing log pointer.
+
+    Failure messages end with "full log: ndm logs"; a plain slice would cut off
+    the one part that tells the user where the full explanation lives.
+    """
+    if len(text) <= limit:
+        return text
+    tail = " | full log: ndm logs"
+    if text.endswith(tail) and limit > len(tail) + 20:
+        return text[:limit - len(tail) - 1].rstrip() + "…" + tail
+    return text[:limit].rstrip() + "…"
+
+
+def complete_settings(settings: dict | None) -> dict:
+    """Fill settings added since a daemon/state file was created.
+
+    The daemon validates persisted settings, but an older still-running daemon
+    can return a partial dictionary over IPC. Normalize at the UI boundary so
+    opening Options never depends on the daemon having been restarted first.
+    """
+    defaults = Settings().model_dump()
+    if settings:
+        defaults.update({key: value for key, value in settings.items() if key in Settings.model_fields})
+    return Settings.model_validate(defaults).model_dump()
+
+
+OPTIONS_KEYS = [
+    "download_dir", "music_dir", "max_concurrent", "connections", "speed_limit", "resume_on_start",
+    "notifications", "auto_capture", "clipboard_capture", "watch_inbox", "allowed_domains",
+    "browser_integration", "browser_ask",
+    "firefox_cookies", "cookie_browser", "spotify_format", "spotify_bitrate", "spotify_tagger", "spotify_matcher", "proxy_enabled", "proxy_url", "proxy_username",
+    "proxy_password", "proxy_remote_dns",
+]
+
+
+class Desktop:
+    def __init__(self, *, data_dir: Path):
+        self.data_dir = data_dir.expanduser().resolve()
+        self._ensure_daemon()
+        self.state = self._normalized_state(self.call("state"))
+        self.cache_lock = threading.RLock()
+        self.stop = threading.Event()
+        self.app = None
+        self.runner = None
+        self.category = "all"
+        self.tree_open = True
+        self.categories_open = True
+        self.search = ""
+        self.selected: set[str] = set()
+        self.last_row = None
+        self.last_click = 0.0
+        self.frame_no = 0
+        self._select_frame = -1
+        self.seen_offers: set[str] = set()
+        self.offer_id = ""
+        self.offer_paused = False
+        self.offer_resolving = ""
+        self.palette_open = False
+        self.palette_stage = "media"
+        self.palette_target = ""
+        self.palette_reopen = 0
+        self.sort = ui.TableSort(6, True)
+        self.dialog = ""
+        self.error = ""
+        self.notice = ""
+        self.delete_ids: list[str] = []
+        self.details_id = None
+        self.diagnostics_text = ""
+        self.diagnostics_path = ""
+        self.diagnostics_env: dict = {}
+        self.diagnostics_check: list[dict] = []
+        self.exit_after_stop = False
+        self.url = ""
+        self.filename = ""
+        self.start_paused = False
+        self.add_connections = self.state["settings"]["connections"]
+        self.add_category = 0
+        self.media_url = ""
+        self.media_result = None
+        self.media_convert_mp3 = False
+        self.spotify_url = ""
+        self.spotify_result = None
+        self.spotify_selected: set[str] = set()
+        self.spotify_search_id = 0
+        self.spotify_handle = None
+        self.busy = ""
+        self.library = []
+        self.library_selection = -1
+        self.options_tab = 0
+        self.settings_form = complete_settings(self.state["settings"])
+        self.custom_color = ui.Color.hex(self.state["settings"]["accent"])
+        self.color_hex: dict[str, str] = {}
+        self.last_clipboard = ""
+        self.last_clipboard_check = 0.0
+        self.completed_ids = {t["id"] for t in self.state["downloads"] if t["status"] == "completed"}
+        self._following_system = False
+        self._theme_mode: int | None = None
+        self._theme_pending = False
+        self._base_palettes: dict[int, dict] = {}
+
+    def call(self, operation: str, payload: dict | None = None, *, timeout: float = 30.0):
+        return request(self.data_dir, operation, payload, timeout=timeout)
+
+    def _ensure_daemon(self) -> None:
+        if not is_running(self.data_dir):
+            start_detached(self.data_dir)
+            if not self._wait_for_daemon():
+                raise RuntimeError(f"The native daemon did not start. See {self.data_dir / 'daemon.log'}.")
+            return
+        try:
+            health = self.call("health", timeout=3)
+        except (OSError, ValueError, RuntimeError, EOFError):
+            return
+        if health.get("name") != "ndm":
+            return
+        state = self.call("state", timeout=3)
+        if not self._daemon_is_compatible(state):
+            self._replace_daemon()
+
+    @staticmethod
+    def _daemon_is_compatible(state: dict) -> bool:
+        info = state.get("daemon", {})
+        schema = info.get("settings_schema")
+        if schema is not None and schema != SETTINGS_SCHEMA_VERSION:
+            return False
+        # A pull that changes behaviour without changing the settings shape must
+        # still replace the daemon, or the desktop keeps talking to old code.
+        running = info.get("code_fingerprint")
+        if running is not None and running != code_fingerprint():
+            return False
+        settings = state.get("settings") or {}
+        required = set(OPTIONS_KEYS) | {"colors", "theme", "accent", "engine_running"}
+        return required.issubset(settings)
+
+    def _wait_for_daemon(self, *, compatible: bool = False, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if is_running(self.data_dir):
+                if not compatible:
+                    return True
+                try:
+                    state = self.call("state", timeout=2)
+                except (OSError, ValueError, RuntimeError, EOFError):
+                    state = None
+                if state is not None and self._daemon_is_compatible(state):
+                    return True
+            time.sleep(0.1)
+        return False
+
+    def _daemon_lock_free(self) -> bool:
+        path = self.data_dir / "daemon.lock"
+        if not path.exists():
+            return True
+        try:
+            with path.open("a+") as handle:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return True
+        except OSError:
+            return False
+
+    def _replace_daemon(self) -> None:
+        try:
+            self.call("shutdown", timeout=5)
+        except (OSError, ValueError, RuntimeError, EOFError):
+            pass
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if not is_running(self.data_dir) and self._daemon_lock_free():
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("The old background daemon did not stop. Run 'ndm stop', then start NDM again.")
+        start_detached(self.data_dir)
+        if not self._wait_for_daemon(compatible=True):
+            raise RuntimeError(f"The updated background daemon did not start. See {self.data_dir / 'daemon.log'}.")
+
+    @staticmethod
+    def _normalized_state(state: dict) -> dict:
+        return {**state, "settings": complete_settings(state.get("settings"))}
+
+    def refresh(self) -> None:
+        try:
+            state = self._normalized_state(self.call("state", timeout=3))
+            with self.cache_lock:
+                self.state = state
+        except (OSError, ValueError, RuntimeError, EOFError) as exc:
+            with self.cache_lock:
+                self.error = f"Local daemon connection: {exc}"
+
+    def _background(self) -> None:
+        while not self.stop.wait(0.5):
+            self.refresh()
+            if self.app:
+                self.app.wake()
+
+    def open_dialog(self, name: str) -> None:
+        self.dialog = name
+        self.error = ""
+        self.notice = ""
+        if name == "options":
+            self.settings_form = complete_settings(self.state["settings"])
+            self.custom_color = ui.Color.hex(self.state["settings"]["accent"])
+            self.color_hex = {}
+        if name == "add":
+            self.add_connections = self.state["settings"]["connections"]
+
+    def perform(self, operation: str, payload: dict | None = None) -> None:
+        try:
+            self.call(operation, payload)
+            self.error = ""
+            self.refresh()
+        except (OSError, ValueError, RuntimeError, EOFError) as exc:
+            settings = self.state.get("settings", {})
+            log_failure(log, f"UI action {operation}", exc, settings=settings)
+            self.error = safe_error(exc, settings)
+
+    def targets(self) -> list[dict]:
+        return [t for t in self.state["downloads"] if t["id"] in self.selected]
+
+    def act_selected(self, action: str) -> None:
+        for task in self.targets():
+            self.perform("action", {"id": task["id"], "action": action})
+        if action == "delete":
+            self.selected.clear()
+
+    def stop_all(self) -> None:
+        for task in self.state["downloads"]:
+            if task["status"] in {"downloading", "queued"}:
+                self.perform("action", {"id": task["id"], "action": "pause"})
+
+    def add(self) -> None:
+        categories = [None, "video", "audio", "archive", "image", "document", "other"]
+        try:
+            self.call("add", {"url": self.url.strip(), "filename": self.filename.strip() or None,
+                              "category": categories[self.add_category], "connections": self.add_connections,
+                              "start_paused": self.start_paused})
+            self.url = self.filename = ""
+            self.start_paused = False
+            self.dialog = ""
+            self.category = "all"
+            self.refresh()
+        except (OSError, ValueError, RuntimeError, EOFError) as exc:
+            self.error = safe_error(exc, self.state.get("settings", {}))
+
+    def inspect_media(self) -> None:
+        if self.busy:
+            return
+        url = self.media_url.strip()
+        if not url:
+            self.error = "Paste a page or media URL first."
+            return
+        self.media_url = url
+        self.busy = "media"
+        self.media_result = None
+        self.error = ""
+
+        def work():
+            return self.call("media.inspect", {"url": url}, timeout=120)
+
+        self.runner.submit(work, on_done=self._media_loaded, on_error=self._operation_error)
+
+    def _media_loaded(self, result: dict) -> None:
+        self.busy = ""
+        self.media_result = result
+
+    def _operation_error(self, exc: BaseException) -> None:
+        self.busy = ""
+        self.error = safe_error(exc, self.state.get("settings", {}))
+
+    def load_diagnostics(self) -> None:
+        """Read the daemon's log off the UI thread."""
+        if self.busy:
+            return
+        self.busy = "diagnostics"
+        self.error = ""
+
+        def work():
+            return self.call("diagnostics", {"lines": 200}, timeout=20)
+
+        def done(result: dict) -> None:
+            self.busy = ""
+            self.diagnostics_path = result.get("path", "")
+            self.diagnostics_text = result.get("log", "")
+            self.diagnostics_env = result.get("environment", {})
+
+        self.runner.submit(work, on_done=done, on_error=self._operation_error)
+
+    def check_diagnostics(self) -> None:
+        if self.busy:
+            return
+        self.busy = "diagnostics"
+        self.error = ""
+
+        def work():
+            return self.call("diagnostics.check", {}, timeout=90)
+
+        def done(result: dict) -> None:
+            self.busy = ""
+            self.diagnostics_check = result.get("results", [])
+
+        self.runner.submit(work, on_done=done, on_error=self._operation_error)
+
+    def _diagnostics_dialog(self, ctx: ui.UI, state: dict) -> None:
+        with ctx.dialog("Diagnostics", True, width=760) as dialog:
+            if dialog:
+                path = self.diagnostics_path or state.get("daemon", {}).get("log_path", "")
+                ctx.text("Failure detail is written here. Proxy passwords and cookie values are redacted.",
+                         size=11, color=ui.Color.TEXT_SECONDARY, width=ui.FILL)
+                if path:
+                    ctx.text(path, size=11, selectable=True, width=ui.FILL)
+                ctx.text("For verbose upstream output, stop the daemon and run: NDM_DEBUG=1 ndm daemon",
+                         size=11, color=ui.Color.TEXT_SECONDARY, width=ui.FILL)
+                self._error_in_dialog(ctx)
+                if self.diagnostics_env:
+                    facts = self.diagnostics_env
+                    ctx.text(f"ffmpeg: {facts.get('ffmpeg')} · ffprobe: {facts.get('ffprobe')} · deno: {facts.get('deno')}",
+                             size=11, width=ui.FILL)
+                    ctx.text(f"yt-dlp {facts.get('yt_dlp')} · spotDL {facts.get('spotdl')} · proxy {facts.get('proxy_enabled')} · remote DNS {facts.get('proxy_remote_dns')} · cookies {facts.get('cookie_browser')}",
+                             size=11, width=ui.FILL)
+                for row in self.diagnostics_check:
+                    tone = ui.Tone.SUCCESS if row.get("ok") else ui.Tone.DANGER
+                    route = row.get("via") or "direct"
+                    stack = f" {row['stack']}" if row.get("stack") else ""
+                    ctx.alert(f"{row.get('url')} (via {route}{stack}) — {row.get('detail')}"
+                              + (f" · {row['hint']}" if row.get("hint") else ""), tone=tone)
+                with ctx.row(gap=10):
+                    if ctx.button("Refresh log", icon=ui.Icon.REFRESH_CW, disabled=bool(self.busy)):
+                        self.load_diagnostics()
+                    if ctx.button("Test connection", icon=ui.Icon.LINK, disabled=bool(self.busy)):
+                        self.check_diagnostics()
+                    if self.busy == "diagnostics":
+                        ctx.text("Working…", size=11, color=ui.Color.TEXT_SECONDARY)
+                body = self.diagnostics_text or "No log entries yet. Queue a track, let it fail, then press Refresh log."
+                with ctx.scroll("diagnostics_log", height=320, width=ui.FILL, gap=4):
+                    ctx.text(body, size=11, font=ui.FontRole.MONO, selectable=True, width=ui.FILL)
+                with ctx.dialog_footer():
+                    if ctx.button("Close"):
+                        self.dialog = ""
+            if not dialog.open:
+                self.dialog = ""
+
+    def _cancel_spotify_stream(self) -> None:
+        self.spotify_search_id += 1
+        handle = self.spotify_handle
+        self.spotify_handle = None
+        if handle is not None:
+            handle.cancel()
+        if self.busy == "spotify":
+            self.busy = ""
+
+    def search_spotify(self) -> None:
+        if self.busy:
+            return
+        url = self.spotify_url.strip()
+        if not url:
+            self.error = "Paste a public Spotify track, album, or playlist link first."
+            return
+        self.spotify_url = url
+        self.busy = "spotify"
+        self.error = ""
+        self.spotify_result = {"items": [], "truncated": False, "total": 0, "kind": "", "title": ""}
+        self.spotify_selected.clear()
+        self.spotify_search_id += 1
+        search_id = self.spotify_search_id
+        log.info("UI Spotify search #%s url=%s", search_id, redact(url))
+        self.spotify_handle = self.runner.stream(
+            lambda: ipc_stream(self.data_dir, "spotify.search.stream", {"url": url}, timeout=300),
+            on_item=lambda event, sid=search_id: self._spotify_event(sid, event),
+            on_done=lambda sid=search_id: self._spotify_done(sid),
+            on_error=lambda exc, sid=search_id: self._spotify_error(sid, exc))
+
+    def _spotify_event(self, search_id: int, event: dict) -> None:
+        if search_id != self.spotify_search_id:
+            return
+        result = self.spotify_result
+        if result is None:
+            result = {"items": [], "truncated": False, "total": 0, "kind": "", "title": ""}
+            self.spotify_result = result
+        if event.get("type") == "meta":
+            result["kind"] = event.get("kind", "")
+            result["title"] = event.get("title") or ""
+            result["total"] = int(event.get("total") or 0)
+        elif event.get("type") == "items":
+            new_items = event.get("items") or []
+            result["items"].extend(new_items)
+            self.spotify_selected.update(item["id"] for item in new_items)
+        elif event.get("type") == "done":
+            result["total"] = int(event.get("total") or len(result["items"]))
+            result["truncated"] = bool(event.get("truncated"))
+
+    def _spotify_done(self, search_id: int) -> None:
+        if search_id != self.spotify_search_id:
+            return
+        self.spotify_handle = None
+        self.busy = ""
+        result = self.spotify_result or {}
+        log.info("UI Spotify search #%s done: %s track(s) truncated=%s", search_id,
+                 len(result.get("items") or []), bool(result.get("truncated")))
+
+    def _spotify_error(self, search_id: int, exc: BaseException) -> None:
+        if search_id != self.spotify_search_id:
+            return
+        self.spotify_handle = None
+        self.busy = ""
+        settings = self.state.get("settings", {})
+        log_failure(log, f"Spotify search #{search_id}", exc, settings=settings)
+        self.error = safe_error(exc, settings)
+
+    def queue_spotify(self, all_tracks: bool = False) -> None:
+        if not self.spotify_result:
+            return
+        songs = [item["song"] for item in self.spotify_result["items"]
+                 if all_tracks or item["id"] in self.spotify_selected]
+        if not songs:
+            self.error = "Select at least one track."
+            return
+        log.info("UI queueing %s Spotify track(s) start_paused=%s", len(songs), self.start_paused)
+        try:
+            result = self.call("spotify.queue", {"songs": songs, "start_paused": self.start_paused})
+            log.info("UI queued %s Spotify track(s): %s", len(result["tasks"]),
+                     ", ".join(str(t.get("id", "?")) for t in result["tasks"][:12]))
+            self.notice = f"Queued {len(result['tasks'])} tracks through spotDL."
+            self._cancel_spotify_stream()
+            self.dialog = ""
+            self.category = "audio"
+            self.refresh()
+        except (OSError, ValueError, RuntimeError, EOFError) as exc:
+            settings = self.state.get("settings", {})
+            log_failure(log, f"queue {len(songs)} Spotify track(s)", exc, settings=settings)
+            self.error = safe_error(exc, settings)
+
+    def save_options(self) -> None:
+        payload = {key: self.settings_form[key] for key in OPTIONS_KEYS}
+        try:
+            try:
+                self.call("settings", payload)
+            except ValueError as exc:
+                text = str(exc)
+                if "Extra inputs are not permitted" not in text and "extra_forbidden" not in text:
+                    raise
+                # An out-of-date daemon can survive an app update. Replace it and
+                # retry once instead of asking the user to restart daemons by hand.
+                self._replace_daemon()
+                self.call("settings", payload)
+            self.notice = "Options saved."
+            self.dialog = ""
+            self.refresh()
+        except (OSError, ValueError, RuntimeError, EOFError) as exc:
+            self.error = safe_error(exc, self.settings_form)
+
+    def load_library(self) -> None:
+        self.open_dialog("library")
+        self.runner.submit(lambda: self.call("library")["tracks"],
+                           on_done=lambda tracks: setattr(self, "library", tracks), on_error=self._operation_error)
+
+    def apply_theme(self, ctx: ui.UI, settings: dict) -> None:
+        # Nexa animates set_theme/follow_system_theme retargets and only applies
+        # them at the next begin_frame. Keep theme motion at zero so the target
+        # palette snaps in, and never capture a base palette mid-transition.
+        ctx.theme.motion = 0
+        mode = settings["theme"]
+        if mode == "system":
+            if not self._following_system and self.app is not None:
+                previous = ctx.theme_mode
+                try:
+                    self.app.follow_system_theme(True)
+                    self._following_system = True
+                except RuntimeError:
+                    ctx.theme_mode = ui.ThemeMode.LIGHT
+                if ctx.theme_mode != previous:
+                    self._theme_pending = True
+        elif self._following_system:
+            if self.app is not None:
+                self.app.follow_system_theme(False)
+            self._following_system = False
+        if mode != "system":
+            target = ui.ThemeMode.DARK if mode == "dark" else ui.ThemeMode.LIGHT
+            if ctx.theme_mode != target:
+                ctx.theme_mode = target
+                self._theme_pending = True
+        resolved = int(ctx.theme_mode)
+        if self._theme_pending:
+            # The retarget was requested during the previous frame (or just
+            # now). This frame's colors are still the old palette; wait one
+            # frame for Nexa to snap to the pristine target before capturing.
+            self._theme_pending = False
+            self._theme_mode = None
+        else:
+            if resolved != self._theme_mode or resolved not in self._base_palettes:
+                # First frame, an OS theme switch, or the frame after a requested
+                # mode change: ctx.theme is the untouched Nexa base palette.
+                self._base_palettes[resolved] = {
+                    token: ctx.theme[token] for token in ui.Token
+                    if token not in {ui.Token.NONE, ui.Token.COUNT}
+                }
+                self._theme_mode = resolved
+            # Restore the pristine base every frame so resetting one token, or
+            # changing the accent, cannot leave stale custom values behind.
+            for token, color in self._base_palettes[resolved].items():
+                ctx.theme[token] = color
+            accent = ui.Color.hex(settings["accent"])
+            for token in (ui.Token.ACCENT, ui.Token.ACCENT_STRONG, ui.Token.CONTROL_ON, ui.Token.SERIES_1):
+                ctx.theme[token] = accent
+            ctx.theme[ui.Token.ACCENT_SUBTLE] = ui.with_alpha(accent, 0.15)
+            ctx.theme[ui.Token.FOCUS_RING] = ui.with_alpha(accent, 0.5)
+            luminance = accent.r * .299 + accent.g * .587 + accent.b * .114
+            contrast = ui.Color.hex("#172033" if luminance > 165 else "#ffffff")
+            ctx.theme[ui.Token.ACCENT_FOREGROUND] = contrast
+            ctx.theme[ui.Token.CONTROL_GLYPH] = contrast
+            ctx.theme[ui.Token.CONTROL_THUMB_ON] = contrast
+            for key, value in settings.get("colors", {}).items():
+                if key in CUSTOM_COLOR_KEYS:
+                    ctx.theme[ui.Token[key.upper()]] = ui.Color.hex(value)
+        # Dense, restrained desktop chrome rather than a dashboard theme.
+        ctx.theme.radius_control = 3
+        ctx.theme.radius_surface = 3
+        ctx.theme.radius_panel = 4
+        ctx.theme.text_body = 12
+
+    def draw(self, ctx: ui.UI) -> None:
+        self.frame_no += 1
+        with self.cache_lock:
+            state = self.state
+        settings = state["settings"]
+        self.apply_theme(ctx, settings)
+        if settings["notifications"]:
+            for task in state["downloads"]:
+                if task["status"] == "completed" and task["id"] not in self.completed_ids:
+                    ctx.toast("Download complete", description=task["name"], tone=ui.Tone.SUCCESS)
+                    self.completed_ids.add(task["id"])
+        self._capture_clipboard(ctx, settings)
+        with ctx.column(width=ui.FILL, height=ui.FILL, bg=ui.Color.BACKGROUND):
+            self._menus(ctx, settings)
+            self._toolbar(ctx)
+            if self.error and not self.dialog:
+                if ctx.alert(clip_error(self.error, 350), tone=ui.Tone.WARNING, dismissible=True):
+                    self.error = ""
+            if self.notice and not self.dialog:
+                if ctx.alert(self.notice, tone=ui.Tone.SUCCESS, dismissible=True):
+                    self.notice = ""
+            with ctx.row(width=ui.FILL, height=46, pad_x=12, gap=10, align=ui.Align.CENTER,
+                         bg=ui.Color.SURFACE_MUTED):
+                ctx.icon(CATEGORY_ICONS[self.category], size=16, color=ui.Color.ACCENT)
+                ctx.text(CATEGORY_NAMES[self.category], size=12, font=ui.FontRole.MEDIUM)
+                ctx.spacer()
+                if self.search:
+                    shown = len(self.visible_tasks(state))
+                    total = len(state["downloads"])
+                    ctx.text(f"{shown} of {total}", size=11, color=ui.Color.TEXT_SECONDARY)
+                # A rounded pill reads as a search box; the input itself is
+                # transparent so the container owns the border and shape.
+                with ctx.row(width=300, height=32, pad_x=10, gap=6, align=ui.Align.CENTER,
+                             bg=ui.Color.SURFACE, border=1, border_color=ui.Color.BORDER,
+                             radius=16):
+                    ctx.icon(ui.Icon.SEARCH, size=14, color=ui.Color.TEXT_SECONDARY)
+                    # Match the border to the fill so the field blends into the
+                    # pill instead of drawing a second, square-cornered box.
+                    self.search = ctx.input(
+                        "find_downloads", self.search, placeholder="Search downloads…",
+                        clearable=True, width=ui.FILL, bg=ui.Color.SURFACE,
+                        border_color=ui.Color.SURFACE, focus_color=ui.Color.ACCENT,
+                        placeholder_color=ui.Color.TEXT_MUTED)
+            with ctx.split("workspace", 0.18, min_first=175, min_second=620, width=ui.FILL, height=ui.FILL) as split:
+                self._categories(ctx, state)
+                split.next()
+                self._download_table(ctx, state)
+            with ctx.status_bar():
+                ctx.status_bar_text(f"{len(self.state['downloads'])} files", icon=ui.Icon.FILE)
+                ctx.status_bar_text(f"{state['stats']['active']} downloading", icon=ui.Icon.DOWNLOAD)
+                ctx.status_bar_text(f"{state['stats']['queued']} queued", icon=ui.Icon.CLOCK)
+                ctx.status_bar_spacer()
+                ctx.status_bar_text("Proxy: " + proxy_label(settings), icon=ui.Icon.GLOBE)
+                ctx.status_bar_text(f"Speed: {format_bytes(state['stats']['speed'])}/s", icon=ui.Icon.ACTIVITY)
+                ctx.status_bar_text("Local daemon · no web server", icon=ui.Icon.SHIELD,
+                                    tone=ui.Tone.SUCCESS if settings["engine_running"] else ui.Tone.WARNING)
+        self._watch_offers(state)
+        self._dialogs(ctx, state)
+        self._command_palette(ctx, state)
+        # Ctrl+K is checked before the keyboard-owner guard so it also closes the
+        # palette while its search field has focus.
+        if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.K):
+            if self.palette_open:
+                self.palette_open = False
+            else:
+                self.open_palette()
+        # Handle global shortcuts only after every widget has run. Nexa clears
+        # its keyboard-owner flag at begin_frame, so checking wants_keyboard
+        # before the inputs are drawn is always false even when a field is
+        # focused; that let the global Ctrl+V replace the model value and the
+        # native field paste the same clipboard again (the doubled link).
+        if not ctx.wants_keyboard:
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.V) and self.dialog in {"", "add", "spotify", "media"}:
+                self.paste_url(ctx)
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.N):
+                self.open_dialog("add")
+            if ctx.shortcut(ui.Mod.PRIMARY, ui.Key.A):
+                self.selected = {t["id"] for t in self.visible_tasks(state)}
+            if ctx.key_pressed(ui.Key.DELETE) and self.selected:
+                self.ask_delete(list(self.selected))
+            if ctx.key_pressed(ui.Key.ENTER) and len(self.selected) == 1:
+                self.details_id = next(iter(self.selected))
+                self.open_dialog("details")
+
+    def _menus(self, ctx: ui.UI, settings: dict) -> None:
+        with ctx.menu_bar():
+            with ctx.menu_bar_menu("File", mnemonic="F") as menu:
+                if menu:
+                    if ctx.menu_item("Add URL…", icon=ui.Icon.PLUS, shortcut="Ctrl+N"):
+                        self.open_dialog("add")
+                    if ctx.menu_item("Paste URL from clipboard", icon=ui.Icon.CLIPBOARD, shortcut="Ctrl+V"):
+                        self.paste_url(ctx)
+                    if ctx.menu_item("Download Spotify link…", icon=ui.Icon.MUSIC):
+                        self.open_dialog("spotify")
+                    ctx.menu_separator()
+                    if ctx.menu_item("Close window (downloads continue)", icon=ui.Icon.LOG_OUT):
+                        self.app.quit()
+                    if ctx.menu_item("Stop daemon and exit", danger=True):
+                        self.exit_after_stop = True
+                        self.open_dialog("shutdown")
+            with ctx.menu_bar_menu("Downloads", mnemonic="D") as menu:
+                if menu:
+                    if ctx.menu_item("Resume selected", icon=ui.Icon.PLAY, disabled=not self.selected):
+                        self.act_selected("resume")
+                    if ctx.menu_item("Stop selected", icon=ui.Icon.PAUSE, disabled=not self.selected):
+                        self.act_selected("pause")
+                    if ctx.menu_item("Stop all", icon=ui.Icon.SQUARE):
+                        self.stop_all()
+                    pending = len(self.state.get("offers") or [])
+                    if ctx.menu_item(f"Browser requests ({pending})", icon=ui.Icon.GLOBE,
+                                     disabled=not pending):
+                        self.offer_id = self.state["offers"][0]["id"]
+                        self.open_dialog("offer")
+                    ctx.menu_separator()
+                    if ctx.menu_item("Remove selected…", icon=ui.Icon.TRASH, disabled=not self.selected):
+                        self.ask_delete(list(self.selected))
+                    if ctx.menu_item("Properties", icon=ui.Icon.INFO, disabled=len(self.selected) != 1):
+                        self.details_id = next(iter(self.selected))
+                        self.open_dialog("details")
+            with ctx.menu_bar_menu("View", mnemonic="V") as menu:
+                if menu:
+                    if ctx.menu_item("Command palette…", icon=ui.Icon.SEARCH, shortcut="Ctrl+K"):
+                        self.open_palette()
+                    if ctx.menu_item("Refresh", icon=ui.Icon.REFRESH_CW, shortcut="F5"):
+                        self.refresh()
+                    if ctx.menu_item("Dark theme", checked=settings["theme"] == "dark"):
+                        self.perform("settings", {"theme": "light" if settings["theme"] == "dark" else "dark"})
+                    if ctx.menu_item("Select all", disabled=not state_has_tasks(self.state)):
+                        self.selected = {t["id"] for t in self.visible_tasks(self.state)}
+            with ctx.menu_bar_menu("Tools", mnemonic="T") as menu:
+                if menu:
+                    if ctx.menu_item("Media grabber…", icon=ui.Icon.LINK):
+                        self.open_dialog("media")
+                    if ctx.menu_item("Offline audio files…", icon=ui.Icon.MUSIC):
+                        self.load_library()
+                    if ctx.menu_item("Diagnostics…", icon=ui.Icon.FILE_TEXT):
+                        self.open_dialog("diagnostics")
+                        self.load_diagnostics()
+                    if ctx.menu_item("Options…", icon=ui.Icon.SETTINGS):
+                        self.open_dialog("options")
+            with ctx.menu_bar_menu("Help", mnemonic="H") as menu:
+                if menu:
+                    if ctx.menu_item("About NDM", icon=ui.Icon.INFO):
+                        self.open_dialog("about")
+        if ctx.key_pressed(ui.Key.F5):
+            self.refresh()
+
+    def _toolbar(self, ctx: ui.UI) -> None:
+        with ctx.toolbar():
+            if ctx.toolbar_button(ui.Icon.PLUS, label="Add URL", tooltip="Add a direct download", shortcut="Ctrl+N"):
+                self.open_dialog("add")
+            if ctx.toolbar_button(ui.Icon.MUSIC, label="Spotify", tooltip="Find and queue a Spotify link with spotDL"):
+                self.open_dialog("spotify")
+            if ctx.toolbar_button(ui.Icon.LINK, label="Grabber", tooltip="Inspect a media page"):
+                self.open_dialog("media")
+            ctx.toolbar_separator()
+            if ctx.toolbar_button(ui.Icon.PLAY, label="Resume", disabled=not self.selected, tone=ui.Tone.SUCCESS):
+                self.act_selected("resume")
+            if ctx.toolbar_button(ui.Icon.PAUSE, label="Stop", disabled=not self.selected):
+                self.act_selected("pause")
+            if ctx.toolbar_button(ui.Icon.SQUARE, label="Stop All"):
+                self.stop_all()
+            if ctx.toolbar_button(ui.Icon.TRASH, label="Delete", disabled=not self.selected, tone=ui.Tone.DANGER):
+                self.ask_delete(list(self.selected))
+            ctx.toolbar_separator()
+            if ctx.toolbar_button(ui.Icon.INFO, label="Properties", disabled=len(self.selected) != 1):
+                self.details_id = next(iter(self.selected))
+                self.open_dialog("details")
+            ctx.toolbar_spacer()
+            if ctx.toolbar_button(ui.Icon.SETTINGS, label="Options"):
+                self.open_dialog("options")
+
+    def _categories(self, ctx: ui.UI, state: dict) -> None:
+        tasks = state["downloads"]
+        with ctx.column(width=ui.FILL, height=ui.FILL, bg=ui.Color.SURFACE_MUTED, pad=8, gap=2):
+            with ctx.tree("Downloads", self.tree_open, icon=ui.Icon.FOLDER) as root:
+                self.tree_open = root.open
+                if root:
+                    for key in ("all", "unfinished", "finished"):
+                        count = len(tasks) if key == "all" else sum(
+                            t["status"] == "completed" if key == "finished" else t["status"] != "completed" for t in tasks)
+                        with ctx.tree(f"{CATEGORY_NAMES[key]} ({count})", leaf=True, icon=CATEGORY_ICONS[key],
+                                      selected=self.category == key) as leaf:
+                            if leaf.clicked:
+                                self.category = key
+                    with ctx.tree("Categories", self.categories_open, icon=ui.Icon.FOLDER) as group:
+                        self.categories_open = group.open
+                        if group:
+                            for key in ("archive", "document", "audio", "video", "image", "other"):
+                                count = sum(t["category"] == key for t in tasks)
+                                with ctx.tree(f"{CATEGORY_NAMES[key]} ({count})", leaf=True, icon=CATEGORY_ICONS[key],
+                                              selected=self.category == key) as leaf:
+                                    if leaf.clicked:
+                                        self.category = key
+
+    def visible_tasks(self, state: dict) -> list[dict]:
+        tasks = []
+        for task in state["downloads"]:
+            if self.category == "unfinished" and task["status"] == "completed":
+                continue
+            if self.category == "finished" and task["status"] != "completed":
+                continue
+            if self.category not in {"all", "unfinished", "finished"} and task["category"] != self.category:
+                continue
+            if self.search and self.search.lower() not in (task["name"] + " " + task["url"]).lower():
+                continue
+            tasks.append(task)
+        keys = {0: lambda t: t["name"].lower(), 1: lambda t: t["size"], 2: lambda t: status_text(t),
+                3: lambda t: percent(t), 4: lambda t: time_left(t), 5: lambda t: t["speed"],
+                6: lambda t: t.get("completed_at") or t["created_at"], 7: lambda t: t["host"]}
+        tasks.sort(key=keys.get(self.sort.column, keys[6]), reverse=self.sort.descending)
+        return tasks
+
+    def _row_popover(self, ctx: ui.UI, anchor_label: str, *, band_top: float | None = None,
+                     enabled: bool = True):
+        """Right-click menu for the whole row, not just the filename cell.
+
+        ctx.context_menu anchors to the last interactive item, so it only ever
+        covered the filename. A table row exposes no rect of its own, but the
+        filename button spans the row's full height, so its band identifies the
+        row. A right-click anywhere in that band opens a popover anchored to the
+        button. band_top is the previous row's bottom, which claims the padding
+        between rows without letting two rows match the same click.
+        """
+        rect = ctx.get_rect(ctx.make_id(anchor_label))
+        self._row_band_bottom = rect.y + rect.h
+        mouse = ctx.mouse_pos
+        top = rect.y if band_top is None else min(band_top, rect.y)
+        if (enabled and rect.h > 0 and top <= mouse.y <= rect.y + rect.h
+                and mouse.x >= rect.x and ctx.mouse_clicked(ui.MouseButton.RIGHT)):
+            ctx.popover_open("row_menu")
+        return ctx.popover("row_menu", placement=ui.Placement.BOTTOM_START, width=230)
+
+    def open_palette(self) -> None:
+        self.palette_stage = "media"
+        self.palette_target = ""
+        self.palette_reopen = 0
+        self.palette_open = True
+
+    def _palette_pick(self, task_id: str) -> None:
+        """Stage one chose a file: select it and show what can be done with it."""
+        self.selected = {task_id}
+        self.palette_target = task_id
+        self.palette_stage = "actions"
+        # The native palette keeps its query across an open/close, so stage two
+        # would be filtered by the filename just typed. Reopen after a short
+        # close to clear it, and ask for the frames rather than waiting for the
+        # user to move the mouse.
+        self.palette_reopen = 2
+
+    def _palette_commands(self, state: dict) -> tuple[list, list]:
+        """Build index-aligned (commands, handlers) for the current stage."""
+        commands: list = []
+        handlers: list = []
+
+        def add(title, icon, group, handler, shortcut=None):
+            commands.append(ui.Command(title, icon=icon, group=group, shortcut=shortcut))
+            handlers.append(handler)
+
+        def act(task_id, action):
+            return lambda ctx: self.perform("action", {"id": task_id, "action": action})
+
+        task = None
+        if self.palette_stage == "actions":
+            task = next((t for t in state["downloads"] if t["id"] == self.palette_target), None)
+            if task is None:
+                self.palette_stage = "media"
+        if task is not None:
+            group = task["name"]
+            status = task["status"]
+            if status in {"paused", "error", "queued"}:
+                add("Resume", ui.Icon.PLAY, group, act(task["id"], "resume"))
+            if status in {"downloading", "queued"}:
+                add("Stop", ui.Icon.PAUSE, group, act(task["id"], "pause"))
+            if status in {"error", "completed"}:
+                add("Retry", ui.Icon.DOWNLOAD, group, act(task["id"], "retry"))
+            if status == "completed" and Path(task["path"]).exists():
+                def open_file(ctx, path=task["path"]):
+                    try:
+                        os_open_path(path)
+                    except OSError as exc:
+                        self.error = safe_error(exc, self.state.get("settings", {}))
+                add("Open file", ui.Icon.PLAY, group, open_file)
+            add("Open containing folder", ui.Icon.FOLDER, group,
+                lambda ctx, path=task["path"]: self._open_containing_folder(path))
+            if task.get("url"):
+                add("Copy download link", ui.Icon.CLIPBOARD, group,
+                    lambda ctx, url=task["url"]: self._copy_to_clipboard(ctx, url, "Link"))
+            def properties(ctx, task_id=task["id"]):
+                self.details_id = task_id
+                self.open_dialog("details")
+            add("Properties", ui.Icon.INFO, group, properties)
+            add("Remove…", ui.Icon.TRASH, group,
+                lambda ctx, task_id=task["id"]: self.ask_delete([task_id]))
+            add("Back to all media", ui.Icon.ARROW_LEFT, "Navigation",
+                lambda ctx: self._palette_back())
+            return commands, handlers
+
+        for item in state["downloads"]:
+            add(item["name"], CATEGORY_ICONS.get(item["category"], ui.Icon.FILE), "Downloads",
+                lambda ctx, task_id=item["id"]: self._palette_pick(task_id),
+                shortcut=status_text(item))
+        add("Add URL…", ui.Icon.PLUS, "Actions", lambda ctx: self.open_dialog("add"), "Ctrl+N")
+        add("Download Spotify link…", ui.Icon.MUSIC, "Actions", lambda ctx: self.open_dialog("spotify"))
+        add("Media grabber…", ui.Icon.LINK, "Actions", lambda ctx: self.open_dialog("media"))
+        add("Offline audio files…", ui.Icon.MUSIC, "Actions", lambda ctx: self.load_library())
+        add("Options…", ui.Icon.SETTINGS, "Actions", lambda ctx: self.open_dialog("options"))
+        for key in ("all", "unfinished", "finished"):
+            add(CATEGORY_NAMES[key], CATEGORY_ICONS[key], "Show",
+                lambda ctx, category=key: setattr(self, "category", category))
+        return commands, handlers
+
+    def _palette_back(self) -> None:
+        self.palette_stage = "media"
+        self.palette_target = ""
+        self.palette_reopen = 2
+
+    def _command_palette(self, ctx: ui.UI, state: dict) -> None:
+        if self.palette_reopen:
+            self.palette_reopen -= 1
+            if self.palette_reopen == 0:
+                self.palette_open = True
+            ctx.request_redraw()
+        commands, handlers = self._palette_commands(state)
+        is_open, chosen = ctx.command_palette(self.palette_open, commands)
+        self.palette_open = is_open
+        if 0 <= chosen < len(handlers):
+            handlers[chosen](ctx)
+        if not self.palette_open and not self.palette_reopen:
+            self.palette_stage = "media"
+            self.palette_target = ""
+
+    def _select_row(self, ctx: ui.UI, task: dict) -> None:
+        """Shared selection + double-click handling for row and filename clicks."""
+        if self._select_frame == self.frame_no and self.last_row == task["id"]:
+            return
+        self._select_frame = self.frame_no
+        if ui.Mod.PRIMARY in ctx.modifiers:
+            self.selected.symmetric_difference_update({task["id"]})
+        else:
+            self.selected = {task["id"]}
+        now = time.monotonic()
+        if self.last_row == task["id"] and now - self.last_click < 0.4:
+            if task["status"] == "completed":
+                self.perform("open", {"id": task["id"]})
+            else:
+                self.details_id = task["id"]
+                self.open_dialog("details")
+        self.last_row, self.last_click = task["id"], now
+
+    def _select_for_menu(self, task_id: str) -> None:
+        """Right-click keeps a multi-selection, but focuses an unselected row.
+
+        The menu body runs every frame while open, so this must be idempotent:
+        assigning unconditionally used to collapse a multi-row selection down to
+        the clicked row and make "Remove" act on one file instead of all of them.
+        """
+        if task_id not in self.selected:
+            self.selected = {task_id}
+
+    def _copy_to_clipboard(self, ctx: ui.UI, text: str, label: str) -> None:
+        if not text:
+            return
+        ctx.set_clipboard(text)
+        self.notice = f"{label} copied to clipboard."
+
+    def _open_containing_folder(self, path: str) -> None:
+        """Reveal a download in the platform file manager, not the file itself."""
+        import subprocess
+        import sys
+        target = Path(path)
+        folder = target if target.is_dir() else target.parent
+        try:
+            if sys.platform == "win32":
+                if target.is_file():
+                    subprocess.Popen(["explorer", f"/select,{target}"])
+                else:
+                    os.startfile(str(folder))  # noqa: S606
+            elif sys.platform == "darwin":
+                # -R reveals the file in Finder; a directory just opens.
+                args = ["open", "-R", str(target)] if target.is_file() else ["open", str(folder)]
+                subprocess.Popen(args)
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except OSError as exc:
+            self.error = safe_error(exc, self.state.get("settings", {}))
+
+    def _row_context_menu(self, ctx: ui.UI, task: dict) -> None:
+        """Right-click actions for one row, applied to the whole selection."""
+        self._select_for_menu(task["id"])
+        chosen = self.targets() or [task]
+        many = len(chosen) > 1
+        suffix = f" ({len(chosen)})" if many else ""
+        statuses = {t["status"] for t in chosen}
+        can_resume = bool(statuses & {"paused", "error", "queued"})
+        can_stop = bool(statuses & {"downloading", "queued"})
+        completed = [t for t in chosen if t["status"] == "completed"]
+
+        if ctx.menu_item(f"Resume{suffix}", icon=ui.Icon.PLAY, disabled=not can_resume):
+            for item in chosen:
+                self.perform("action", {"id": item["id"], "action": "resume"})
+        if ctx.menu_item(f"Stop{suffix}", icon=ui.Icon.PAUSE, disabled=not can_stop):
+            for item in chosen:
+                self.perform("action", {"id": item["id"], "action": "pause"})
+        if ctx.menu_item(f"Retry{suffix}", icon=ui.Icon.DOWNLOAD,
+                         disabled=not bool(statuses & {"error", "completed"})):
+            for item in chosen:
+                self.perform("action", {"id": item["id"], "action": "retry"})
+        ctx.menu_separator()
+        if ctx.menu_item("Open file", icon=ui.Icon.PLAY,
+                         disabled=many or not completed or not Path(task["path"]).exists()):
+            try:
+                os_open_path(task["path"])
+            except OSError as exc:
+                self.error = safe_error(exc, self.state.get("settings", {}))
+        if ctx.menu_item("Open containing folder", icon=ui.Icon.FOLDER, disabled=many):
+            self._open_containing_folder(task["path"])
+        ctx.menu_separator()
+        if ctx.menu_item("Copy download link", icon=ui.Icon.CLIPBOARD, disabled=many or not task.get("url")):
+            self._copy_to_clipboard(ctx, task.get("url", ""), "Link")
+        if ctx.menu_item("Properties", icon=ui.Icon.INFO, disabled=many):
+            self.details_id = task["id"]
+            self.open_dialog("details")
+        if ctx.menu_item(f"Remove…{suffix}", icon=ui.Icon.TRASH, danger=True):
+            self.ask_delete([t["id"] for t in chosen])
+
+    def _download_table(self, ctx: ui.UI, state: dict) -> None:
+        tasks = self.visible_tasks(state)
+        columns = [ui.TableColumn("File Name", width=ui.GROW(1), sortable=True),
+                   ui.TableColumn("Size", width=85, align=ui.TextAlign.RIGHT, sortable=True),
+                   ui.TableColumn("Status", width=100, sortable=True),
+                   ui.TableColumn("Progress", width=115, sortable=True),
+                   ui.TableColumn("Time Left", width=85, sortable=True),
+                   ui.TableColumn("Transfer Rate", width=105, align=ui.TextAlign.RIGHT, sortable=True),
+                   ui.TableColumn("Last Try Date", width=135, sortable=True),
+                   ui.TableColumn("Description", width=ui.GROW(1), sortable=True)]
+        with ctx.table("downloads", columns, sort=self.sort, height=ui.FILL, compact=True,
+                       striped=True, selectable=True) as table:
+            if table:
+                band_top = None
+                for task in tasks:
+                    with ctx.id_scope(task["id"]):
+                        clicked = table.row(task["id"] in self.selected)
+                        table.cell()
+                        # A table row is not an interactive item, so a context
+                        # menu anchored to it never opens. The filename is a
+                        # ghost button instead: it looks like the old label but
+                        # gives the menu a real widget to anchor to.
+                        name_clicked = ctx.button(
+                            task["name"], variant=ui.ButtonVariant.GHOST, size=ui.ControlSize.SM,
+                            icon=CATEGORY_ICONS.get(task["category"], ui.Icon.FILE),
+                            full_width=True)
+                        if clicked or name_clicked:
+                            self._select_row(ctx, task)
+                        with self._row_popover(ctx, task["name"], band_top=band_top,
+                                               enabled=not self.dialog) as menu:
+                            if menu:
+                                self._row_context_menu(ctx, task)
+                        band_top = self._row_band_bottom
+                        table.cell_text(size_label(task))
+                        table.cell_text(status_text(task))
+                        table.cell()
+                        ctx.progress(percent(task) / 100, width=ui.FILL, height=12,
+                                     tone=ui.Tone.SUCCESS if task["status"] == "completed" else ui.Tone.ACCENT,
+                                     indeterminate=task["status"] == "downloading" and not percent(task))
+                        table.cell_text(time_left(task))
+                        table.cell_text(f"{format_bytes(task['speed'])}/s" if task["speed"] else "—")
+                        stamp = task.get("completed_at") or task["created_at"]
+                        table.cell_text(time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp)))
+                        table.cell_text(("Local sample · " if task["source"] == "demo" else "") +
+                                        (task.get("provider") or task["host"]))
+            self.sort = table.sort or self.sort
+        if not tasks:
+            # The header remains visible; no promotional empty-state cards.
+            ctx.text("No downloads in this view. Use Add URL or Spotify on the toolbar.", size=12,
+                     color=ui.Color.TEXT_SECONDARY)
+        self.selected.intersection_update({t["id"] for t in state["downloads"]})
+
+    def ask_delete(self, ids: list[str]) -> None:
+        self.delete_ids = ids
+        self.open_dialog("delete")
+
+    def paste_url(self, ctx: ui.UI) -> None:
+        """Ctrl+V fills the active dialog, or opens the right one when none is open."""
+        text = ctx.get_clipboard().strip()
+        match = re.fullmatch(r"https?://\S+", text, re.IGNORECASE)
+        if not match:
+            message = "Copy a single HTTP or HTTPS link, then press Ctrl+V."
+            if self.dialog:
+                self.error = message
+            else:
+                self.notice = message
+            return
+        if self.dialog == "media":
+            self.media_url = text
+            self.media_result = None
+            self.error = ""
+            return
+        if self.dialog == "spotify":
+            self._cancel_spotify_stream()
+            self.spotify_url = text
+            self.spotify_result = None
+            self.spotify_selected.clear()
+            self.error = ""
+            return
+        if self.dialog == "add":
+            self.url = text
+            self.error = ""
+            return
+        from .spotify import supported_url
+        if supported_url(text) or urlsplit(text).hostname == "spotify.link":
+            self._cancel_spotify_stream()
+            self.open_dialog("spotify")
+            self.spotify_url = text
+            self.spotify_result = None
+            self.spotify_selected.clear()
+        else:
+            self.open_dialog("add")
+            self.url = text
+        self.notice = "Clipboard link pasted. Review the destination, then start the download."
+
+    def _capture_clipboard(self, ctx: ui.UI, settings: dict) -> None:
+        if not (settings["auto_capture"] and settings["clipboard_capture"]):
+            return
+        if time.monotonic() - self.last_clipboard_check < 2:
+            return
+        self.last_clipboard_check = time.monotonic()
+        text = ctx.get_clipboard().strip()
+        if text != self.last_clipboard:
+            self.last_clipboard = text
+            if text.startswith(("http://", "https://")) and "\n" not in text and Path(urlsplit(text).path).suffix.lower() in MEDIA_EXTENSIONS:
+                try:
+                    self.call("capture", {"url": text, "source": "clipboard"})
+                except (OSError, ValueError, RuntimeError, EOFError):
+                    pass
+
+    def _error_in_dialog(self, ctx: ui.UI) -> None:
+        if self.error:
+            # Keep dialog errors visible until explicitly dismissed; an auto-
+            # dismissible alert can disappear in the same click that caused it.
+            ctx.alert(clip_error(self.error, 450), tone=ui.Tone.DANGER)
+            if ctx.button("Dismiss error", size=ui.ControlSize.SM):
+                self.error = ""
+
+    def _watch_offers(self, state: dict) -> None:
+        """Surface a browser handoff as a question, never a silent download."""
+        offers = state.get("offers") or []
+        live = {o["id"] for o in offers}
+        self.seen_offers &= live
+        new = [o for o in offers if o["id"] not in self.seen_offers]
+        if not new:
+            return
+        self.seen_offers.update(o["id"] for o in new)
+        if self.dialog in {"", "offer"} and not self.offer_resolving:
+            self.offer_id = new[0]["id"]
+            self.offer_paused = False
+            self.dialog = "offer"
+        else:
+            # Never yank away a dialog the user is typing into.
+            self.notice = f"The browser sent {len(new)} request(s). Review them in Downloads → Browser requests."
+
+    def resolve_offer(self, accept: bool) -> None:
+        offer_id = self.offer_id
+        if not offer_id or self.offer_resolving:
+            return
+        payload = {"id": offer_id, "accept": accept, "start_paused": self.offer_paused}
+        offer = next((o for o in (self.state.get("offers") or []) if o["id"] == offer_id), {})
+        # Expanding a playlist or inspecting YouTube can take much longer than
+        # a file handoff. Never do that network work on the rendering thread.
+        if accept and offer.get("kind") in {"youtube", "spotify"} and self.runner is not None:
+            self.offer_resolving = offer_id
+            self.error = ""
+            self.runner.submit(
+                lambda: self.call("browser.resolve", payload, timeout=300),
+                on_done=lambda result: self._offer_resolved(offer_id, result),
+                on_error=lambda exc: self._offer_resolution_failed(offer_id, exc))
+            return
+        try:
+            self.call("browser.resolve", payload)
+            self.error = ""
+            self.refresh()
+        except (OSError, ValueError, RuntimeError, EOFError) as exc:
+            self.error = safe_error(exc, self.state.get("settings", {}))
+        self._advance_offer(offer_id)
+
+    def _advance_offer(self, offer_id: str) -> None:
+        self.offer_id = ""
+        remaining = [o for o in (self.state.get("offers") or []) if o["id"] != offer_id]
+        if remaining:
+            self.offer_id = remaining[0]["id"]
+            self.offer_paused = False
+        else:
+            self.dialog = ""
+
+    def _offer_resolved(self, offer_id: str, result: dict) -> None:
+        self.offer_resolving = ""
+        self.error = ""
+        self.refresh()
+        self._advance_offer(offer_id)
+        count = len(result.get("tasks") or [])
+        self.notice = f"Queued {count} download(s) from the browser." if count else "Browser request accepted."
+
+    def _offer_resolution_failed(self, offer_id: str, exc: BaseException) -> None:
+        self.offer_resolving = ""
+        self.error = safe_error(exc, self.state.get("settings", {}))
+        self.refresh()
+        # The daemon restores a failed offer. Keep it visible for a retry.
+        if any(o["id"] == offer_id for o in (self.state.get("offers") or [])):
+            self.offer_id = offer_id
+            self.dialog = "offer"
+
+    def _offer_dialog(self, ctx: ui.UI, state: dict) -> None:
+        offers = state.get("offers") or []
+        offer = next((o for o in offers if o["id"] == self.offer_id), None)
+        if offer is None:
+            if self.offer_resolving:
+                return
+            # Resolved elsewhere, or it expired while the dialog was open.
+            self.dialog = ""
+            self.offer_id = ""
+            return
+        settings = state["settings"]
+        destination = Path(settings["music_dir"] if offer["category"] == "audio"
+                           else settings["download_dir"]) / offer["category"]
+        kind = offer.get("kind", "file")
+        titles = {"file": "The browser wants to download a file",
+                  "youtube": "Grab this YouTube video?",
+                  "spotify": "Grab this Spotify link?"}
+        with ctx.dialog(titles.get(kind, titles["file"]), True, width=560) as dialog:
+            if dialog:
+                ctx.heading(offer["name"], level=3)
+                rows = [("From", offer["host"] or "unknown host"),
+                        ("Type", kind if kind != "file" else offer["category"]),
+                        ("Size", format_bytes(offer["size"]) if offer["size"] else "Unknown"),
+                        ("Save to", str(destination))]
+                for label, value in rows:
+                    with ctx.row(width=ui.FILL, gap=10):
+                        ctx.text(label, size=11, color=ui.Color.TEXT_SECONDARY, width=80)
+                        ctx.text(value, size=11, selectable=True, width=ui.GROW(1))
+                ctx.text(offer["url"], size=10, selectable=True, width=ui.FILL,
+                         color=ui.Color.TEXT_SECONDARY)
+                if kind != "file":
+                    ctx.text("NDM will inspect this page only after you approve it. "
+                             + ("Spotify albums/playlists may queue multiple tracks." if kind == "spotify"
+                                else "The video uses your Media Grabber settings."),
+                             size=11, width=ui.FILL, color=ui.Color.TEXT_SECONDARY)
+                if len(offers) > 1:
+                    ctx.alert(f"{len(offers)} requests are waiting. This is the oldest.",
+                              tone=ui.Tone.INFO)
+                resolving = bool(self.offer_resolving)
+                self.offer_paused = ctx.checkbox("Add paused (start it later)", self.offer_paused)
+                self._error_in_dialog(ctx)
+                if resolving:
+                    ctx.text("Preparing downloads…", size=11, color=ui.Color.TEXT_SECONDARY)
+                with ctx.dialog_footer():
+                    if ctx.button("Leave in browser" if kind == "file" else "Cancel", disabled=resolving):
+                        self.resolve_offer(False)
+                    label = "Grab" if kind != "file" else "Download"
+                    if ctx.button("Working…" if resolving else label, icon=ui.Icon.DOWNLOAD,
+                                  variant=ui.ButtonVariant.PRIMARY, disabled=resolving):
+                        self.resolve_offer(True)
+            if not dialog.open and not self.offer_resolving:
+                self.resolve_offer(False)
+
+    def _dialogs(self, ctx: ui.UI, state: dict) -> None:
+        if self.dialog == "add":
+            self._add_dialog(ctx)
+        elif self.dialog == "spotify":
+            self._spotify_dialog(ctx, state)
+        elif self.dialog == "media":
+            self._media_dialog(ctx, state)
+        elif self.dialog == "options":
+            self._options_dialog(ctx, state)
+        elif self.dialog == "details":
+            self._details_dialog(ctx, state)
+        elif self.dialog == "diagnostics":
+            self._diagnostics_dialog(ctx, state)
+        elif self.dialog == "library":
+            self._library_dialog(ctx)
+        elif self.dialog == "offer":
+            self._offer_dialog(ctx, state)
+        elif self.dialog in {"delete", "shutdown", "about"}:
+            title = {"delete": "Remove downloads", "shutdown": "Stop the background daemon?", "about": "About NDM"}[self.dialog]
+            with ctx.dialog(title, True, width=480) as dialog:
+                if dialog:
+                    if self.dialog == "delete":
+                        ctx.text(f"Remove {len(self.delete_ids)} queue entries? Unfinished files are deleted. Completed files stay on disk.", width=ui.FILL)
+                        with ctx.dialog_footer():
+                            if ctx.button("Cancel"):
+                                self.dialog = ""
+                            if ctx.button("Remove", variant=ui.ButtonVariant.DANGER):
+                                for task_id in self.delete_ids:
+                                    self.perform("action", {"id": task_id, "action": "delete"})
+                                self.selected.difference_update(self.delete_ids)
+                                self.dialog = ""
+                    elif self.dialog == "shutdown":
+                        ctx.text("Active transfers will stop and save their resumable state. Automatic capture will also stop.", width=ui.FILL)
+                        with ctx.dialog_footer():
+                            if ctx.button("Cancel"):
+                                self.dialog = ""
+                            if ctx.button("Stop daemon and exit", variant=ui.ButtonVariant.DANGER):
+                                try:
+                                    self.call("shutdown")
+                                    self.app.quit()
+                                except (OSError, ValueError, RuntimeError, EOFError) as exc:
+                                    self.error = safe_error(exc, self.state.get("settings", {}))
+                    else:
+                        ctx.heading("NDM 0.1.0", level=3)
+                        ctx.text("Native Python download manager · Nexa UI", width=ui.FILL)
+                        ctx.text("Segmented HTTP downloads, yt-dlp media extraction, and spotDL matching. No web interface or listening web server.", width=ui.FILL)
+                        ctx.text("spotDL uses Spotify metadata and matching public audio sources; it does not extract Spotify's protected streams.", width=ui.FILL, color=ui.Color.TEXT_SECONDARY)
+                        with ctx.dialog_footer():
+                            if ctx.button("Close"):
+                                self.dialog = ""
+                if not dialog.open:
+                    self.dialog = ""
+
+    def _add_dialog(self, ctx: ui.UI) -> None:
+        with ctx.dialog("Add New Download", True, width=590) as dialog:
+            if dialog:
+                self.url = ctx.input("address", self.url, label="Address (URL)", width=ui.FILL, max_bytes=8192, autofocus=True)
+                self.filename = ctx.input("save_as", self.filename, label="Save as (optional)", width=ui.FILL)
+                self.add_category = ctx.select("category", ["Detect automatically", "Video", "Music", "Compressed", "Images", "Documents", "Other"], self.add_category, label="Category", width=ui.FILL)
+                self.add_connections = int(ctx.number("connections", self.add_connections, 1, 8, label="Connections for this file", width=ui.FILL))
+                self.start_paused = ctx.checkbox("Add to queue without starting", self.start_paused)
+                ctx.text("For Spotify links, use the Spotify toolbar button instead.", size=11, color=ui.Color.TEXT_SECONDARY)
+                self._error_in_dialog(ctx)
+                with ctx.dialog_footer():
+                    if ctx.button("Cancel"):
+                        self.dialog = ""
+                    if ctx.button("Start Download", icon=ui.Icon.DOWNLOAD, variant=ui.ButtonVariant.PRIMARY):
+                        self.add()
+            if not dialog.open:
+                self.dialog = ""
+
+    def _spotify_row_menu(self, ctx: ui.UI, item: dict, items: list[dict]) -> None:
+        """Right-click a Spotify result to queue it or copy its link."""
+        if item["id"] not in self.spotify_selected:
+            self.spotify_selected = {item["id"]}
+        count = len(self.spotify_selected)
+        if ctx.menu_item(f"Queue selected ({count})", icon=ui.Icon.DOWNLOAD):
+            self.queue_spotify()
+        if ctx.menu_item("Queue only this track", icon=ui.Icon.MUSIC):
+            self.spotify_selected = {item["id"]}
+            self.queue_spotify()
+        ctx.menu_separator()
+        if ctx.menu_item("Copy Spotify link", icon=ui.Icon.CLIPBOARD, disabled=not item.get("url")):
+            self._copy_to_clipboard(ctx, item.get("url", ""), "Spotify link")
+        if ctx.menu_item("Copy title and artist", icon=ui.Icon.COPY):
+            self._copy_to_clipboard(ctx, f"{item.get('artist', '')} - {item.get('name', '')}".strip(" -"),
+                                    "Track")
+        ctx.menu_separator()
+        if ctx.menu_item("Select all", icon=ui.Icon.CHECK):
+            self.spotify_selected = {i["id"] for i in items}
+        if ctx.menu_item("Clear selection", icon=ui.Icon.X, disabled=not self.spotify_selected):
+            self.spotify_selected.clear()
+
+    def _spotify_dialog(self, ctx: ui.UI, state: dict) -> None:
+        info = state["daemon"]["spotify"]
+        with ctx.dialog("Download Spotify Link — spotDL", True, width=820) as dialog:
+            if dialog:
+                ctx.text("Paste a public Spotify track, album, or playlist link. NDM previews the metadata before queuing individual tracks.", width=ui.FILL, size=12)
+                self.spotify_url = ctx.input("spotify_address", self.spotify_url, label="Spotify link", placeholder="https://open.spotify.com/track/", width=ui.FILL, max_bytes=2048, autofocus=True)
+                self.start_paused = ctx.checkbox("Add tracks without starting", self.start_paused)
+                with ctx.row(gap=10, align=ui.Align.CENTER):
+                    if ctx.button("Find Tracks", icon=ui.Icon.SEARCH,
+                                  variant=ui.ButtonVariant.PRIMARY, disabled=bool(self.busy)):
+                        self.search_spotify()
+                    ctx.text(f"Output: {state['settings']['spotify_format'].upper()} · {state['settings']['spotify_bitrate']} · FFmpeg {'ready' if info['ffmpeg'] else 'required'}", size=11)
+                ctx.text("Audio source: YouTube Music via spotDL. Matches may differ from the original recording; this is not Spotify protected audio.", size=11, color=ui.Color.TEXT_SECONDARY, width=ui.FILL)
+                if not info["installed"]:
+                    ctx.alert("spotDL is missing. Run uv sync or pip install -e . to reinstall NDM's dependencies.", tone=ui.Tone.WARNING)
+                self._error_in_dialog(ctx)
+                if self.spotify_result is not None:
+                    items = self.spotify_result["items"]
+                    total = self.spotify_result.get("total", len(items))
+                    title = self.spotify_result.get("title") or ""
+                    heading = f"{len(items)} track" + ("" if len(items) == 1 else "s")
+                    if total > len(items):
+                        heading += f" of {total}"
+                    if title:
+                        heading += f" — {title}"
+                    ctx.text(heading, size=13, font=ui.FontRole.MEDIUM, width=ui.FILL)
+                    if self.spotify_result["truncated"]:
+                        detail = f"Showing the first {len(items)} of {total} tracks." if total > len(items) else f"Showing the first {len(items)} tracks."
+                        ctx.alert(detail + " Queue these, then import the remaining playlist separately.", tone=ui.Tone.WARNING)
+                    columns = [ui.TableColumn("Title", width=ui.GROW(1)), ui.TableColumn("Artist", width=180),
+                               ui.TableColumn("Album", width=180), ui.TableColumn("Duration", width=75)]
+                    with ctx.table("spotify_tracks", columns, height=245, compact=True, striped=True, selectable=True) as table:
+                        if table:
+                            spotify_band = None
+                            for item in items:
+                                with ctx.id_scope(item["id"]):
+                                    row_clicked = table.row(item["id"] in self.spotify_selected)
+                                    table.cell()
+                                    title_clicked = ctx.button(
+                                        item["name"], variant=ui.ButtonVariant.GHOST,
+                                        size=ui.ControlSize.SM, full_width=True)
+                                    if row_clicked or title_clicked:
+                                        self.spotify_selected.symmetric_difference_update({item["id"]})
+                                    with self._row_popover(ctx, item["name"], band_top=spotify_band) as menu:
+                                        if menu:
+                                            self._spotify_row_menu(ctx, item, items)
+                                    spotify_band = self._row_band_bottom
+                                    table.cell_text(item["artist"])
+                                    table.cell_text(item["album"])
+                                    duration = item["duration"]
+                                    table.cell_text(f"{duration // 60}:{duration % 60:02}")
+                    ctx.text(f"{len(self.spotify_selected)} of {len(items)} tracks selected", size=11)
+                with ctx.dialog_footer():
+                    if ctx.button("Close"):
+                        self._cancel_spotify_stream()
+                        self.dialog = ""
+                    if self.spotify_result and self.spotify_result["items"]:
+                        if ctx.button("Select All"):
+                            self.spotify_selected = {i["id"] for i in self.spotify_result["items"]}
+                        if ctx.button("Queue Selected", icon=ui.Icon.DOWNLOAD, variant=ui.ButtonVariant.PRIMARY):
+                            self.queue_spotify()
+            if not dialog.open:
+                self._cancel_spotify_stream()
+                self.dialog = ""
+
+    def _media_dialog(self, ctx: ui.UI, state: dict) -> None:
+        ffmpeg_ready = bool(state.get("daemon", {}).get("ffmpeg"))
+        if not ffmpeg_ready:
+            self.media_convert_mp3 = False
+        with ctx.dialog("Media Grabber", True, width=740) as dialog:
+            if dialog:
+                self.media_url = ctx.input("media_address", self.media_url, label="Page or media URL",
+                                           placeholder="https://example.com/video or direct media link",
+                                           width=ui.FILL, max_bytes=8192, autofocus=True)
+                if ctx.button("Inspecting…" if self.busy == "media" else "Find Media", icon=ui.Icon.SEARCH,
+                              variant=ui.ButtonVariant.PRIMARY, disabled=bool(self.busy)):
+                    self.inspect_media()
+                self.media_convert_mp3 = ctx.checkbox("Convert to MP3 (extract audio, 192 kbps)",
+                                                      self.media_convert_mp3, disabled=not ffmpeg_ready)
+                if not ffmpeg_ready:
+                    ctx.text("Install FFmpeg on PATH to enable MP3 conversion and video/audio merging.",
+                             width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                elif self.media_convert_mp3:
+                    ctx.text("Each Download button saves an MP3 audio file instead of the original video.",
+                             width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                self._error_in_dialog(ctx)
+                if self.media_result is None:
+                    ctx.text("Direct media, HTML media elements, and sites supported by yt-dlp. Protected streams are not bypassed.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                if self.media_result:
+                    result = self.media_result
+                    ctx.text(result.get("title", "Media"), size=13, font=ui.FontRole.MEDIUM)
+                    if result.get("message"):
+                        ctx.text(result["message"], width=ui.FILL, size=11)
+                    if result["items"]:
+                        ctx.text("Sizes: exact when reported by the source, ~ when estimated, Unknown when unavailable. Estimates are replaced by the real file size on completion.",
+                                 width=ui.FILL, size=10, color=ui.Color.TEXT_SECONDARY)
+                    with ctx.scroll("media_results", height=260, width=ui.FILL, gap=5):
+                        for item in result["items"]:
+                            with ctx.id_scope(item["id"]), ctx.row(width=ui.FILL, gap=8, align=ui.Align.CENTER):
+                                with ctx.column(width=ui.GROW(1), gap=2):
+                                    ctx.text(item["name"] + (".mp3" if self.media_convert_mp3 else "." + item["ext"]), size=12, nowrap=True)
+                                    ctx.text(item["quality"] + " · " + media_size_label(item, convert_mp3=self.media_convert_mp3) + " · " + item["note"], size=10, color=ui.Color.TEXT_SECONDARY)
+                                if ctx.button("Download MP3" if self.media_convert_mp3 else "Download", size=ui.ControlSize.SM):
+                                    mp3_size = mp3_size_estimate(item)
+                                    self.perform("media.download", {"url": item.get("page_url") or item["url"],
+                                                 "format_id": item["id"], "name": item["name"], "category": item["category"],
+                                                 "quality": "audio" if self.media_convert_mp3 else "best",
+                                                 "ext": "mp3" if self.media_convert_mp3 else item["ext"],
+                                                 "size": mp3_size if self.media_convert_mp3 else item.get("size") or 0,
+                                                 "size_estimated": True if self.media_convert_mp3 else bool(item.get("size_estimated"))})
+                                    if not self.error:
+                                        self.notice = "MP3 conversion queued." if self.media_convert_mp3 else "Media added to the download list."
+                                        self.dialog = ""
+                with ctx.dialog_footer():
+                    if ctx.button("Close"):
+                        self.dialog = ""
+            if not dialog.open:
+                self.dialog = ""
+
+    def _proxy_options(self, ctx: ui.UI, form: dict) -> None:
+        form["proxy_enabled"] = ctx.switch("Use a proxy for downloads and media lookups", form["proxy_enabled"])
+        form["proxy_url"] = ctx.input("proxy_url", form["proxy_url"], label="Proxy URL",
+                                      placeholder="http://proxy.local:8080 or socks5://127.0.0.1:1080",
+                                      width=ui.FILL, max_bytes=2048, disabled=not form["proxy_enabled"])
+        form["proxy_username"] = ctx.input("proxy_username", form["proxy_username"], label="Username (optional)",
+                                           width=ui.FILL, max_bytes=256, disabled=not form["proxy_enabled"])
+        form["proxy_password"] = ctx.input("proxy_password", form["proxy_password"], label="Password (optional)",
+                                           password=True, width=ui.FILL, max_bytes=256, disabled=not form["proxy_enabled"])
+        form["proxy_remote_dns"] = ctx.checkbox("Resolve hostnames through the SOCKS5 proxy (recommended)",
+                                                form["proxy_remote_dns"], disabled=not form["proxy_enabled"])
+        ctx.text("Supports HTTP, HTTPS, SOCKS5, and SOCKS5H. An enabled proxy overrides system proxy environment variables and is used for direct downloads, yt-dlp, and spotDL.", width=ui.FILL, size=11)
+        ctx.text("Proxy credentials are stored in this local NDM state directory. Use a trusted proxy; HTTPS certificate verification stays enabled.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+
+    def _appearance_options(self, ctx: ui.UI, state: dict) -> None:
+        settings = state["settings"]
+        changes: dict = {}
+        overrides = dict(settings.get("colors", {}))
+        modes = ["light", "dark", "system"]
+        chosen = ctx.segmented("theme", ["Light", "Dark", "System"], modes.index(settings["theme"]))
+        if modes[chosen] != settings["theme"]:
+            changes["theme"] = modes[chosen]
+        with ctx.row(gap=8, align=ui.Align.CENTER):
+            ctx.text("Base accent", size=12)
+            self.custom_color = ctx.color_picker("accent", self.custom_color)
+            if ctx.changed:
+                changes["accent"] = hex_color(self.custom_color, keep_alpha=False)
+            if ctx.button("Reset palette"):
+                self.color_hex = {}
+                overrides.clear()
+                changes["colors"] = {}
+        with ctx.row(gap=8, wrap=True):
+            for accent in ACCENTS:
+                if ctx.button("##" + accent, color=accent, tooltip=accent):
+                    changes["accent"] = accent
+                    self.custom_color = ui.Color.hex(accent)
+        ctx.text("Custom palette — every color below overrides the base theme. Valid changes apply immediately.", size=11, width=ui.FILL)
+        groups = [
+            ("Surfaces & text", ["background", "surface", "surface_raised", "surface_muted", "foreground", "text_secondary", "text_muted"]),
+            ("Borders & interaction", ["border", "border_subtle", "border_strong", "hover", "active", "scrim", "focus_ring"]),
+            ("Accent & status", ["accent", "accent_strong", "accent_subtle", "accent_foreground", "success", "warning", "danger", "info"]),
+            ("Controls", ["control_on", "control_glyph", "control_track", "control_track_hover", "control_thumb", "control_thumb_on"]),
+            ("Chart series", [f"series_{i}" for i in range(1, 7)]),
+        ]
+        colors_changed = False
+        with ctx.scroll("custom_palette", height=235, width=ui.FILL, gap=6):
+            for title, keys in groups:
+                ctx.text(title, size=12, font=ui.FontRole.MEDIUM)
+                for key in keys:
+                    token = ui.Token[key.upper()]
+                    current = overrides.get(key)
+                    value = ui.Color.hex(current) if current else ctx.theme[token]
+                    label = key.replace("_", " ").capitalize()
+                    with ctx.id_scope(key), ctx.row(width=ui.FILL, gap=8, align=ui.Align.CENTER):
+                        ctx.text(label, size=11, width=145)
+                        picked = ctx.color_picker("picker", value)
+                        if ctx.changed:
+                            # Nexa's picker edits RGB only; keep any alpha the
+                            # user already set in the hex field instead of
+                            # silently making a translucent token opaque.
+                            picked_hex = hex_color(picked, keep_alpha=False)
+                            if value.a != 255:
+                                picked_hex += f"{value.a:02x}"
+                            overrides[key] = picked_hex
+                            self.color_hex[key] = picked_hex
+                            colors_changed = True
+                        draft = self.color_hex.get(key, current or hex_color(value))
+                        edited = ctx.input("hex", draft, width=115, max_bytes=9)
+                        if ctx.changed:
+                            self.color_hex[key] = edited
+                            try:
+                                normalized = normalize_color(edited)
+                            except ValueError:
+                                pass
+                            else:
+                                self.color_hex.pop(key, None)
+                                if normalized != current:
+                                    overrides[key] = normalized
+                                    colors_changed = True
+                        if ctx.button("Reset", size=ui.ControlSize.SM,
+                                      disabled=key not in overrides and key not in self.color_hex):
+                            overrides.pop(key, None)
+                            self.color_hex.pop(key, None)
+                            colors_changed = True
+        if colors_changed:
+            changes["colors"] = overrides
+        ctx.text(f"{len(overrides)} custom colors · hex values accept #RRGGBB or #RRGGBBAA", size=10, color=ui.Color.TEXT_SECONDARY)
+        # One IPC write per frame at most, and only when a widget actually
+        # changed. The old code compared stale hex drafts every frame and could
+        # hammer the daemon while merely scrolling through the palette.
+        if changes:
+            self.perform("settings", changes)
+
+    def _options_dialog(self, ctx: ui.UI, state: dict) -> None:
+        form = self.settings_form
+        with ctx.dialog("NDM Options", True, width=720) as dialog:
+            if dialog:
+                self.options_tab = ctx.tabs("options_tabs", ["Connection", "Proxy", "Save To", "Capture", "Spotify", "Appearance"], self.options_tab)
+                with ctx.scroll("options_body", width=ui.FILL, height=355, gap=13, pad=4):
+                    if self.options_tab == 0:
+                        form["max_concurrent"] = int(ctx.number("max_jobs", form["max_concurrent"], 1, 8, label="Maximum simultaneous downloads", width=ui.FILL))
+                        form["connections"] = int(ctx.number("default_connections", form["connections"], 1, 8, label="Default connections per file", width=ui.FILL))
+                        form["speed_limit"] = int(ctx.number("rate_limit", form["speed_limit"] / 1_000_000, 0, 100, step=.1, decimals=1, label="Download speed limit (MB/s; 0 = unlimited)", width=ui.FILL) * 1_000_000)
+                        form["resume_on_start"] = ctx.checkbox("Resume interrupted downloads when the daemon starts", form["resume_on_start"])
+                        form["notifications"] = ctx.checkbox("Notify when a download finishes", form["notifications"])
+                    elif self.options_tab == 1:
+                        self._proxy_options(ctx, form)
+                    elif self.options_tab == 2:
+                        form["download_dir"] = ctx.input("download_folder", form["download_dir"], label="Default download directory", width=ui.FILL)
+                        if ctx.button("Browse…", icon=ui.Icon.FOLDER):
+                            path = self.app.select_folder_dialog(title="Choose download folder")
+                            if path:
+                                form["download_dir"] = path
+                        form["music_dir"] = ctx.input("music_folder", form["music_dir"], label="Existing music folder", width=ui.FILL)
+                        if ctx.button("Browse music folder…", icon=ui.Icon.MUSIC):
+                            path = self.app.select_folder_dialog(title="Choose music folder")
+                            if path:
+                                form["music_dir"] = path
+                        ctx.text("Files are organized by category. Removing a completed queue entry keeps its file.", width=ui.FILL, size=11)
+                    elif self.options_tab == 3:
+                        form["auto_capture"] = ctx.switch("Enable automatic media capture", form["auto_capture"])
+                        form["clipboard_capture"] = ctx.checkbox("Capture copied direct media links while this window is open", form["clipboard_capture"])
+                        form["watch_inbox"] = ctx.checkbox("Watch the link inbox in the background", form["watch_inbox"])
+                        form["browser_integration"] = ctx.switch("Hand browser downloads to NDM", form["browser_integration"])
+                        form["browser_ask"] = ctx.checkbox("Ask before automatic browser file downloads (page grabs always ask)", form["browser_ask"])
+                        browsers = list(COOKIE_BROWSERS)
+                        labels = ["Off"] + [b.capitalize() for b in browsers[1:]]
+                        current = form.get("cookie_browser") or ("firefox" if form["firefox_cookies"] else "none")
+                        chosen = browsers[ctx.select("cookie_browser", labels, browsers.index(current),
+                                                     label="Use cookies from", width=ui.FILL)]
+                        form["cookie_browser"] = chosen
+                        form["firefox_cookies"] = chosen == "firefox"
+                        ctx.text("Read locally per operation; never stored by NDM. Chromium may need a keyring unlock.",
+                                 width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                        ctx.text("Browser setup: uv run ndm extension install --browser firefox (or chrome/chromium/brave/edge/all).",
+                                 width=ui.FILL, size=11)
+                        ctx.text("Then load extension/firefox or extension/chrome; full steps in extension/README.md.",
+                                 width=ui.FILL, size=11)
+                        domains = ctx.input("capture_domains", ", ".join(form["allowed_domains"]), label="Capture allowlist (comma-separated; empty = any)", width=ui.FILL)
+                        form["allowed_domains"] = [v.strip() for v in domains.split(",") if v.strip()]
+                        ctx.text("Inbox: " + state["daemon"]["inbox"], selectable=True, size=11, width=ui.FILL)
+                        ctx.text("Drop .txt/.url media links into the inbox. Inbox/clipboard capture does not need an extension.", width=ui.FILL, size=11)
+                    elif self.options_tab == 4:
+                        formats = ["mp3", "m4a", "flac", "opus", "ogg"]
+                        rates = ["auto", "128k", "192k", "256k", "320k", "disable"]
+                        form["spotify_format"] = formats[ctx.select("spotify_format", [v.upper() for v in formats], formats.index(form["spotify_format"]), label="Audio file format", width=ui.FILL)]
+                        form["spotify_bitrate"] = rates[ctx.select("spotify_bitrate", rates, rates.index(form["spotify_bitrate"]), label="Conversion bitrate (auto/disable use FFmpeg defaults)", width=ui.FILL)]
+                        taggers = ["ndm", "spotdl"]
+                        form["spotify_tagger"] = taggers[ctx.select("spotify_tagger", ["NDM (recommended)", "spotDL (legacy)"], taggers.index(form.get("spotify_tagger") or "ndm"), label="Tag writer", width=ui.FILL)]
+                        matchers = ["spotdl", "ndm", "ytdlp"]
+                        form["spotify_matcher"] = matchers[ctx.select("spotify_matcher", ["spotDL (default)", "NDM (experimental)", "yt-dlp (same as grabber)"], matchers.index(form.get("spotify_matcher") or "spotdl"), label="Source matcher", width=ui.FILL)]
+                        info = state["daemon"]["spotify"]
+                        ctx.text(f"spotDL {info['version'] or 'not installed'} · FFmpeg {'installed' if info['ffmpeg'] else 'missing'}", size=12)
+                        ctx.text("spotDL selects the YouTube Music match; NDM's yt-dlp pipeline downloads and converts it. No spotDL web UI or downloader gateway is used.", width=ui.FILL, size=11)
+                        ctx.text("The Capture tab's browser-cookie selector also applies to spotDL's YouTube Music search and NDM's matched-audio transfer.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                        ctx.text("Use only audio you own or have permission to save. Pausing a spotDL track is cooperative; conversion may finish before it stops.", width=ui.FILL, size=11, color=ui.Color.TEXT_SECONDARY)
+                    else:
+                        self._appearance_options(ctx, state)
+                self._error_in_dialog(ctx)
+                with ctx.dialog_footer():
+                    if ctx.button("Cancel"):
+                        self.dialog = ""
+                    if ctx.button("OK", icon=ui.Icon.CHECK, variant=ui.ButtonVariant.PRIMARY):
+                        self.save_options()
+            if not dialog.open:
+                self.dialog = ""
+
+    def _details_dialog(self, ctx: ui.UI, state: dict) -> None:
+        task = next((t for t in state["downloads"] if t["id"] == self.details_id), None)
+        with ctx.dialog("Download Properties", bool(task), width=650) as dialog:
+            if dialog and task:
+                rows = [("File name", task["name"]), ("Address", task["url"]), ("Saved to", task["path"]),
+                        ("Status", status_text(task)),
+                        ("Size", format_size(task["size"], estimated=bool(task.get("size_estimated")))),
+                        ("Downloaded", format_bytes(task["downloaded"])), ("Source", task.get("provider") or task["host"]),
+                        ("Connections", str(len(task["segments"]) or task["connections"])),
+                        ("Range resume", "Supported" if task["resumable"] else "Not used for this transfer")]
+                if task["source"] == "spotdl":
+                    rows.insert(2, ("Matched source", task.get("final_url") or "Not matched yet"))
+                    rows.insert(5, ("Transfer size", format_size(task.get("transfer_size") or 0,
+                                                                  estimated=bool(task.get("transfer_size_estimated")))))
+                    rows.append(("Output", f"{task.get('spotify_format', 'mp3').upper()} · {task.get('spotify_bitrate', '192k')}"))
+                for label, value in rows:
+                    with ctx.row(width=ui.FILL, gap=12):
+                        ctx.text(label + ":", size=11, color=ui.Color.TEXT_SECONDARY, width=105)
+                        ctx.text(value, size=11, selectable=True, width=ui.GROW(1))
+                ctx.progress(percent(task) / 100, show_value=True, width=ui.FILL)
+                if task["error"]:
+                    ctx.alert(task["error"], tone=ui.Tone.DANGER)
+                with ctx.dialog_footer():
+                    if ctx.button("Close"):
+                        self.dialog = ""
+                    if task["error"] and ctx.button("Diagnostics", icon=ui.Icon.FILE_TEXT):
+                        self.open_dialog("diagnostics")
+                        self.load_diagnostics()
+                    if task["status"] == "completed":
+                        if ctx.button("Show in Folder", icon=ui.Icon.FOLDER):
+                            self.perform("open", {"id": task["id"], "folder": True})
+                        if ctx.button("Open File", icon=ui.Icon.EXTERNAL_LINK, variant=ui.ButtonVariant.PRIMARY):
+                            self.perform("open", {"id": task["id"]})
+                    elif ctx.button("Stop" if task["status"] in {"queued", "downloading"} else "Resume", variant=ui.ButtonVariant.PRIMARY):
+                        self.perform("action", {"id": task["id"], "action": "pause" if task["status"] in {"queued", "downloading"} else "resume"})
+            if not dialog.open:
+                self.dialog = ""
+
+    def _library_dialog(self, ctx: ui.UI) -> None:
+        with ctx.dialog("Offline Audio Files", True, width=760) as dialog:
+            if dialog:
+                with ctx.row(gap=8):
+                    if ctx.button("Refresh", icon=ui.Icon.REFRESH_CW):
+                        self.load_library()
+                    if ctx.button("Export M3U Playlist", icon=ui.Icon.SAVE):
+                        path = self.app.save_file_dialog(title="Export playlist", filter_name="M3U playlist", filter_ext="m3u")
+                        if path:
+                            try:
+                                Path(path).write_text(self.call("playlist")["content"], encoding="utf-8")
+                            except (OSError, ValueError, RuntimeError) as exc:
+                                self.error = safe_error(exc, self.state.get("settings", {}))
+                self._error_in_dialog(ctx)
+                columns = [ui.TableColumn("File", width=ui.GROW(1)), ui.TableColumn("Size", width=90), ui.TableColumn("Folder", width=280)]
+                with ctx.table("local_audio", columns, height=330, compact=True, striped=True, selectable=True) as table:
+                    if table:
+                        library_band = None
+                        for index, track in enumerate(self.library):
+                            with ctx.id_scope(str(index)):
+                                row_clicked = table.row(index == self.library_selection)
+                                table.cell()
+                                name_clicked = ctx.button(
+                                    track["name"], variant=ui.ButtonVariant.GHOST,
+                                    size=ui.ControlSize.SM, icon=ui.Icon.MUSIC, full_width=True)
+                                if row_clicked or name_clicked:
+                                    self.library_selection = index
+                                    try:
+                                        os_open_path(track["path"])
+                                    except OSError as exc:
+                                        self.error = safe_error(exc, self.state.get("settings", {}))
+                                with self._row_popover(ctx, track["name"], band_top=library_band) as menu:
+                                    if menu:
+                                        self.library_selection = index
+                                        if ctx.menu_item("Play file", icon=ui.Icon.PLAY):
+                                            try:
+                                                os_open_path(track["path"])
+                                            except OSError as exc:
+                                                self.error = safe_error(exc, self.state.get("settings", {}))
+                                        if ctx.menu_item("Open containing folder", icon=ui.Icon.FOLDER):
+                                            self._open_containing_folder(track["path"])
+                                        ctx.menu_separator()
+                                        if ctx.menu_item("Copy file path", icon=ui.Icon.COPY):
+                                            self._copy_to_clipboard(ctx, track["path"], "Path")
+                                library_band = self._row_band_bottom
+                                table.cell_text(format_bytes(track["size"]))
+                                table.cell_text(track["folder"])
+                ctx.text("Click a file to open it in your desktop audio player. Files stay on this computer.", size=11, color=ui.Color.TEXT_SECONDARY)
+                with ctx.dialog_footer():
+                    if ctx.button("Close"):
+                        self.dialog = ""
+            if not dialog.open:
+                self.dialog = ""
+
+    def run(self) -> None:
+        settings = self.state["settings"]
+        with ui.App("NDM — Download Manager", width=1280, height=780, min_width=980, min_height=560,
+                    theme=ui.ThemeMode.DARK if settings["theme"] == "dark" else ui.ThemeMode.LIGHT) as app:
+            self.app = app
+            self.runner = ui.BackgroundRunner.for_app(app, max_workers=3)
+            threading.Thread(target=self._background, name="ndm-desktop-state", daemon=True).start()
+            try:
+                app.run(self.draw)
+            finally:
+                self.stop.set()
+                self.runner.close()
+                # Closing the window intentionally leaves the native daemon alive.
+
+
+def state_has_tasks(state: dict) -> bool:
+    return bool(state["downloads"])
+
+
+def os_open_path(path: str) -> None:
+    import subprocess
+    import sys
+    if sys.platform == "win32":
+        os.startfile(path)  # noqa: S606
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])

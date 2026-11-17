@@ -1,0 +1,38 @@
+{
+  "manifest_version": 2,
+  "name": "NDM Download Handoff",
+  "version": "1.0.0",
+  "description": "Hand Firefox downloads to NDM, which asks you in the app. Grabs YouTube and Spotify pages.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ndm@x017.github.io",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "storage",
+    "notifications",
+    "menus",
+    "tabs"
+  ],
+  "background": {
+    "scripts": [
+      "core.js",
+      "background.js"
+    ]
+  },
+  "browser_action": {
+    "default_title": "NDM Download Handoff",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
