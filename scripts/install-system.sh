@@ -23,7 +23,8 @@ if [[ -e /opt/ndm || -e /usr/local/bin/ndm ]]; then
     exit 1
 fi
 # Python's venv support may require the distro's python3-venv package.
-python3 -m venv /opt/ndm
+# Access distro-provided gi/AppIndicator bindings; pip cannot supply their native libraries.
+python3 -m venv --system-site-packages /opt/ndm
 /opt/ndm/bin/python -m pip install --upgrade pip
 /opt/ndm/bin/python -m pip install "$ROOT[tray]"
 install -d /usr/local/bin /usr/local/share/applications /usr/local/share/icons/hicolor/scalable/apps

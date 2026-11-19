@@ -1,12 +1,19 @@
 """Optional system tray supervisor; UI subprocesses never run as administrator."""
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
+
+from .daemon import is_running, start_detached
+from .ipc import request
+
+log = logging.getLogger("ndm.tray")
 
 
 def icon_image():
@@ -25,6 +32,27 @@ class TrayController:
         self.data_dir = data_dir
         self.desktop = None
         self.lock = threading.Lock()
+
+    def ensure_daemon(self):
+        if is_running(self.data_dir):
+            return
+        start_detached(self.data_dir)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if is_running(self.data_dir):
+                return
+            time.sleep(0.1)
+        raise RuntimeError("NDM daemon did not start. Check ndm logs and the data directory's daemon.log.")
+
+    def set_running(self, running):
+        self.ensure_daemon()
+        request(self.data_dir, "settings", {"engine_running": running}, timeout=5)
+
+    def status(self):
+        state = request(self.data_dir, "state", timeout=5)
+        stats = state["stats"]
+        mode = "Running" if state["settings"]["engine_running"] else "Paused"
+        return f"NDM — {mode}: {stats['active']} active, {stats['queued']} queued"
 
     def open_desktop(self, *_):
         with self.lock:
@@ -53,20 +81,51 @@ def run(data_dir: Path, *, open_window=True):
         ) from exc
     controller = TrayController(data_dir)
 
+    stopped = threading.Event()
+
+    def guarded(action):
+        def callback(icon, _item):
+            def work():
+                try:
+                    action()
+                except Exception as exc:
+                    log.exception("Tray action failed")
+                    try:
+                        icon.notify(str(exc), "NDM")
+                    except Exception:
+                        pass
+            threading.Thread(target=work, name="ndm-tray-action", daemon=True).start()
+        return callback
+
     def quit_tray(icon, _item):
+        stopped.set()
         icon.stop()
 
     icon = pystray.Icon("ndm", icon_image(), "NDM — Download Manager", menu=pystray.Menu(
-        pystray.MenuItem("Open NDM (use task switcher if already open)", controller.open_desktop, default=True),
-        pystray.MenuItem("Open Web UI (start ndm web separately)", controller.open_web),
+        pystray.MenuItem("Open NDM (use task switcher if already open)", guarded(controller.open_desktop), default=True),
+        pystray.MenuItem("Open Web UI (start ndm web separately)", guarded(controller.open_web)),
+        pystray.MenuItem("Pause all downloads", guarded(lambda: controller.set_running(False))),
+        pystray.MenuItem("Resume download engine", guarded(lambda: controller.set_running(True))),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit tray (keep downloads running)", quit_tray),
     ))
 
     def setup(icon):
         icon.visible = True
-        if open_window:
-            controller.open_desktop()
+        def monitor():
+            try:
+                controller.ensure_daemon()
+                if open_window:
+                    controller.open_desktop()
+            except Exception:
+                log.exception("Tray startup failed")
+            while not stopped.is_set():
+                try:
+                    icon.title = controller.status()
+                except Exception:
+                    icon.title = "NDM — daemon unavailable (see ndm logs)"
+                stopped.wait(3)
+        threading.Thread(target=monitor, name="ndm-tray-status", daemon=True).start()
 
     try:
         icon.run(setup=setup)
@@ -75,3 +134,5 @@ def run(data_dir: Path, *, open_window=True):
             "Could not start the system tray. Check your desktop's tray/AppIndicator "
             "support, or run ndm desktop without a tray."
         ) from exc
+    finally:
+        stopped.set()

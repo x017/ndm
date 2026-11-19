@@ -83,7 +83,7 @@ entry that starts the tray and desktop:
 
 ```bash
 # Debian/Ubuntu prerequisites (use equivalent packages on other distributions):
-sudo apt install python3-venv ffmpeg libayatana-appindicator3-1 gir1.2-ayatanaappindicator3-0.1
+sudo apt install python3-venv python3-gi python3-gi-cairo ffmpeg libayatana-appindicator3-1 gir1.2-ayatanaappindicator3-0.1
 sudo bash scripts/install-system.sh
 
 # Run as your normal user, NOT with sudo:
@@ -117,15 +117,27 @@ Closing a desktop launched by the tray leaves the tray and download daemon runni
 Use **Open NDM** to reopen it. If that window is already open, use your operating
 system's task switcher; the tray does not create another copy of its own child.
 **Quit tray** removes only the icon; downloads and an open window continue.
-Use `ndm stop` to stop the daemon. **Open Web UI** opens the default local web
+The tray starts/checks the daemon even with `--no-window`. Its tooltip shows
+active/queued counts and engine state. **Pause all downloads** and **Resume download
+engine** control the shared engine. Failed actions are logged and, where supported,
+shown as tray notifications. Use `ndm stop` to stop the daemon. **Open Web UI** opens the default local web
 address; run `ndm web` separately first.
 
 Tray support uses optional `pystray` and Pillow dependencies. Linux needs a tray
-host/AppIndicator implementation; GNOME may require the AppIndicator shell
+host/AppIndicator implementation and distro-provided PyGObject (`python3-gi`); GNOME may require the AppIndicator shell
 extension, and minimal Wayland sessions may have no tray host. X11 fallback
 support depends on the desktop. If no tray is available, use `ndm desktop`.
 macOS and Windows tray backends are provided by pystray but have not been verified
-here. The system-wide installer above is Linux-only.
+here. The system-wide installer above is Linux-only. It exposes system Python packages
+to its environment so distro `gi` bindings remain accessible. For a source checkout
+on Linux, use a system Python with `uv venv --system-site-packages` before syncing
+if your existing environment cannot import `gi`. If an older `/opt/ndm` environment
+was created without system packages, uninstall/reinstall using the updated script.
+
+The daemon owns scheduling, transfers, media workers, queue persistence, and the
+optional inbox watcher. It remains useful without a tray: closing a window does
+not cancel downloads. With an empty queue and capture disabled it is mostly idle;
+it does not automatically launch the web UI or monitor the desktop clipboard.
 
 ## Web UI
 
