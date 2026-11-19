@@ -75,6 +75,37 @@ ndm desktop
 > Use the branch containing the features you need. If your checkout predates the
 > web frontend, update that branch before running `ndm web`.
 
+## Guided setup (Linux)
+
+Run the interactive installer as your **normal user**:
+
+```bash
+python3 setup.py
+```
+
+The terminal wizard provides a numbered menu, distro-specific prerequisite
+commands (including Arch-based distributions), and a final review. Choose:
+
+- **Install scope:** your account, or all users through the system installer.
+- **Startup:** disabled, a tray icon at sign-in, or a systemd user daemon.
+- **Launch now:** optionally open the desktop and tray when setup finishes.
+
+Preview every planned command and file without installing anything:
+
+```bash
+python3 setup.py --dry-run
+```
+
+Do not run the wizard with `sudo`: it requests elevation only for the all-user
+installation step. It does not automatically install distro packages, remove old
+startup configuration, or overwrite existing application environments. Review
+existing startup entries before selecting a different mode. Interrupted installs
+are not rolled back. Per-user installs use `~/.local/share/ndm-app` and
+`~/.local/bin/ndm`; add `~/.local/bin` to `PATH` if needed.
+
+`setup.py` is an installation wizard, **not** a setuptools build script. Packaging
+continues to use `pyproject.toml`; use `uv build` or `pip install .` for builds.
+
 ## System-wide installation (Linux)
 
 Install the current checkout for all users in an isolated `/opt/ndm` Python
